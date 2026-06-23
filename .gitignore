@@ -1,0 +1,12 @@
+/target
+
+# 자격증명/백업물은 절대 커밋하지 않음 (앱은 ~/.config, ~/.local 에 저장)
+*.enc
+*.sql.gz
+backups/
+store.json
+
+# OS/IDE
+.DS_Store
+.idea/
+*.swp
