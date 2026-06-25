@@ -417,6 +417,622 @@ fn build_setdb_job(site: &Site, label: &str, domain_name: &str, use_root: bool) 
     })
 }
 
+// ===== eondcms 설치 (HestiaCP 멀티테넌트) =====
+use crate::model::{CmsInstall, CmsKind, EondInstall};
+
+/// 내장 nginx 프록시 템플릿 (HTTP). 도메인 무관(%placeholder% 사용), 포트만 8001 하드코딩 → 설치 시 sed.
+const EONDCMS_TPL: &str = r#"server {
+    listen      %ip%:%proxy_port%;
+    server_name %domain_idn% %alias_idn%;
+    error_log   /var/log/%web_system%/domains/%domain%.error.log error;
+    include %home%/%user%/conf/web/%domain%/nginx.forcessl.conf*;
+    location ~ /\.(?!well-known\/|file) { deny all; return 404; }
+    location /static/ { alias %home%/%user%/web/%domain%/pythonapp/static/; expires 30d; access_log off; }
+    location /_app/   { alias %home%/%user%/web/%domain%/pythonapp/web/build/_app/; expires 30d; access_log off; }
+    location /files/        { alias %home%/%user%/web/%domain%/public_html/files/;        expires 7d;  access_log off; }
+    location /modules/      { alias %home%/%user%/web/%domain%/public_html/modules/;      expires 7d;  access_log off; }
+    location /layouts/      { alias %home%/%user%/web/%domain%/public_html/layouts/;      expires 7d;  access_log off; }
+    location /m.layouts/    { alias %home%/%user%/web/%domain%/public_html/m.layouts/;    expires 7d;  access_log off; }
+    location /addons/       { alias %home%/%user%/web/%domain%/public_html/addons/;       expires 7d;  access_log off; }
+    location /widgets/      { alias %home%/%user%/web/%domain%/public_html/widgets/;      expires 7d;  access_log off; }
+    location /widgetstyles/ { alias %home%/%user%/web/%domain%/public_html/widgetstyles/; expires 7d;  access_log off; }
+    location /common/       { alias %home%/%user%/web/%domain%/public_html/common/;       expires 30d; access_log off; }
+    location / {
+        proxy_pass              http://127.0.0.1:8001;
+        proxy_http_version      1.1;
+        proxy_set_header        Host                    $host;
+        proxy_set_header        X-Real-IP               $remote_addr;
+        proxy_set_header        X-Forwarded-For         $proxy_add_x_forwarded_for;
+        proxy_set_header        X-Forwarded-Proto       $scheme;
+        proxy_set_header        Upgrade                 $http_upgrade;
+        proxy_set_header        Connection              "upgrade";
+        proxy_read_timeout      90s;
+        proxy_send_timeout      90s;
+        proxy_buffering         off;
+        client_max_body_size    50M;
+        access_log /var/log/%web_system%/domains/%domain%.log combined;
+    }
+    location /error/ { alias %home%/%user%/web/%domain%/document_errors/; }
+    include %home%/%user%/conf/web/%domain%/nginx.conf_*;
+}"#;
+
+/// 내장 nginx 프록시 템플릿 (HTTPS/SSL).
+const EONDCMS_STPL: &str = r#"server {
+    listen      %ip%:%proxy_ssl_port% ssl;
+    http2       on;
+    server_name %domain_idn% %alias_idn%;
+    ssl_certificate      %ssl_pem%;
+    ssl_certificate_key  %ssl_key%;
+    error_log   /var/log/%web_system%/domains/%domain%.error.log error;
+    location ~ /\.(?!well-known\/|file) { deny all; return 404; }
+    location /static/ { alias %home%/%user%/web/%domain%/pythonapp/static/; expires 30d; access_log off; }
+    location /_app/   { alias %home%/%user%/web/%domain%/pythonapp/web/build/_app/; expires 30d; access_log off; }
+    location /files/        { alias %home%/%user%/web/%domain%/public_html/files/;        expires 7d;  access_log off; }
+    location /modules/      { alias %home%/%user%/web/%domain%/public_html/modules/;      expires 7d;  access_log off; }
+    location /layouts/      { alias %home%/%user%/web/%domain%/public_html/layouts/;      expires 7d;  access_log off; }
+    location /m.layouts/    { alias %home%/%user%/web/%domain%/public_html/m.layouts/;    expires 7d;  access_log off; }
+    location /addons/       { alias %home%/%user%/web/%domain%/public_html/addons/;       expires 7d;  access_log off; }
+    location /widgets/      { alias %home%/%user%/web/%domain%/public_html/widgets/;      expires 7d;  access_log off; }
+    location /widgetstyles/ { alias %home%/%user%/web/%domain%/public_html/widgetstyles/; expires 7d;  access_log off; }
+    location /common/       { alias %home%/%user%/web/%domain%/public_html/common/;       expires 30d; access_log off; }
+    location / {
+        proxy_pass              http://127.0.0.1:8001;
+        proxy_http_version      1.1;
+        proxy_set_header        Host                    $host;
+        proxy_set_header        X-Real-IP               $remote_addr;
+        proxy_set_header        X-Forwarded-For         $proxy_add_x_forwarded_for;
+        proxy_set_header        X-Forwarded-Proto       $scheme;
+        proxy_set_header        Upgrade                 $http_upgrade;
+        proxy_set_header        Connection              "upgrade";
+        proxy_read_timeout      90s;
+        proxy_send_timeout      90s;
+        proxy_buffering         off;
+        client_max_body_size    50M;
+        access_log /var/log/%web_system%/domains/%domain%.log combined;
+    }
+    location /error/ { alias %home%/%user%/web/%domain%/document_errors/; }
+    include %home%/%user%/conf/web/%domain%/nginx.ssl.conf_*;
+}"#;
+
+/// eondcms 원격 실행 래퍼.
+/// sudo=true: `ssh user@host "sudo -S -p '' bash -s"` 에 (비번\n + 스크립트)를 stdin 파이프 → 전체 root 실행.
+/// sudo=false: 직접 root 로그인 가정, remote_cmd 로 실행.
+/// 반환: (로컬 실행 스크립트, SSHPASS, 추가 env)
+fn eondcms_exec(server: &Site, raw: &str, use_root: bool, sudo: bool) -> (String, String, Vec<(String, String)>) {
+    let pw = server.login_pw(use_root).to_string();
+    let u = sq(server.login_id(use_root));
+    let h = sq(server.ip.trim());
+    if sudo {
+        let script = format!(
+            "{{ printf '%s\\n' \"$HM_SUDOPW\"; cat <<'HM_EOF'\n{raw}\nHM_EOF\n}} | sshpass -e {ssh} {u}@{h} \"sudo -S -p '' bash -s\"",
+            ssh = ssh_e(server), u = u, h = h, raw = raw,
+        );
+        (script, pw.clone(), vec![("HM_SUDOPW".to_string(), pw)])
+    } else {
+        let script = format!(
+            "sshpass -e {ssh} {u}@{h} {rc}",
+            ssh = ssh_e(server), u = u, h = h, rc = remote_cmd(raw),
+        );
+        (script, pw, Vec::new())
+    }
+}
+
+fn eondcms_validate(server: &Site, eond: &EondInstall, use_root: bool) -> Result<(), String> {
+    if server.ip.trim().is_empty() { return Err("설치 대상 서버 IP가 비어 있습니다".into()); }
+    if !use_root { return Err("eondcms 설치는 root 권한 필요 — '루트로 실행'을 켜고 서버루트 계정을 입력하세요".into()); }
+    if server.login_id(use_root).is_empty() { return Err("서버 루트 로그인 아이디가 비어 있습니다".into()); }
+    if eond.hestia_user.trim().is_empty() { return Err("HestiaCP 유저가 비어 있습니다".into()); }
+    Ok(())
+}
+
+/// ① HestiaCP 리소스 생성 (유저/도메인/DB, 멱등)
+pub fn build_eondcms_resources(server: &Site, eond: &EondInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    eondcms_validate(server, eond, use_root)?;
+    let domain = to_ascii_domain(domain_name);
+    if eond.db_name.trim().is_empty() || eond.db_user.trim().is_empty() {
+        return Err("DB 이름/유저가 비어 있습니다".into());
+    }
+    let head = format!(
+        "set -e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin\"\nVBIN=/usr/local/hestia/bin\nVUSER={u}\nDOMAIN={d}\nPKG={pkg}\nEMAIL={em}\nUPASS={up}\nDBNAME={dbn}\nDBUSER={dbu}\nDBPASS={dbp}\n",
+        u = sq(eond.hestia_user.trim()), d = sq(&domain), pkg = sq(eond.package_or_default()),
+        em = sq(eond.hestia_email.trim()), up = sq(&eond.hestia_pass),
+        dbn = sq(eond.db_name.trim()), dbu = sq(eond.db_user.trim()), dbp = sq(&eond.db_pass),
+    );
+    // DBNAME/DBUSER 는 입력 그대로(전체 이름). v-add-database 만 HestiaCP 가 접두어를 붙이므로
+    // 이미 'VUSER_' 로 시작하면 그 부분을 떼서 전달(이중접두어 방지). 기존 DB면 v-list 로 skip.
+    let body = r#"FULLDB="$DBNAME"
+DBSHORT="${DBNAME#${VUSER}_}"
+DBUSHORT="${DBUSER#${VUSER}_}"
+echo "== [리소스] user=$VUSER domain=$DOMAIN db=$FULLDB =="
+$VBIN/v-list-user "$VUSER" >/dev/null 2>&1 || $VBIN/v-add-user "$VUSER" "$UPASS" "$EMAIL" "$PKG"
+$VBIN/v-list-web-domain "$VUSER" "$DOMAIN" >/dev/null 2>&1 || $VBIN/v-add-web-domain "$VUSER" "$DOMAIN"
+$VBIN/v-list-database "$VUSER" "$FULLDB" >/dev/null 2>&1 || $VBIN/v-add-database "$VUSER" "$DBSHORT" "$DBUSHORT" "$DBPASS" mysql
+echo "리소스 OK (DB=$FULLDB)"; ls -ld "/home/$VUSER/web/$DOMAIN" 2>/dev/null || true"#;
+    let remote = format!("{head}{body}");
+    let (script, sshpass, env) = eondcms_exec(server, &remote, use_root, eond.sudo);
+    Ok(Job {
+        title: format!("eondcms ① 리소스 생성 : {domain_name}"),
+        script,
+        sshpass,
+        env,
+        note: "HestiaCP 유저/도메인/DB 생성(이미 있으면 건너뜀)".into(),
+    })
+}
+
+/// ② 코드 업로드 (dev → 서버 $APPDIR, rsync push). root 로 올리고 ③에서 chown.
+pub fn build_eondcms_upload(server: &Site, eond: &EondInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    eondcms_validate(server, eond, use_root)?;
+    if eond.code_local.trim().is_empty() { return Err("코드 소스 경로(code_local)가 비어 있습니다".into()); }
+    let domain = to_ascii_domain(domain_name);
+    // tong 같은 sudo 유저는 남의 홈(/home/<유저>)에 못 쓰므로 /tmp 스테이징에 올리고 ③에서 root 가 복사
+    let staging = format!("/tmp/hm-eond-{}", store::sanitize(&domain));
+    let src = eond.code_local.trim().trim_end_matches('/');
+    // 소스의 .rsyncignore(검증된 제외: mobile/·venv/·node_modules·data/ 등) 우선 + 안전망 제외.
+    // --delete --delete-excluded 로 스테이징을 필터링된 소스와 정확히 일치(이전에 잘못 올라간 것 자동 정리).
+    let script = format!(
+        "SRC={src}\nEF=\"\"\n[ -f \"$SRC/.rsyncignore\" ] && EF=\"--exclude-from=$SRC/.rsyncignore\" && echo '[.rsyncignore 적용]'\n\
+         sshpass -e rsync -az --mkpath --delete --delete-excluded --info=stats1 $EF \
+         --exclude='.git/' --exclude='.venv/' --exclude='venv/' --exclude='node_modules/' --exclude='web/node_modules/' \
+         --exclude='mobile/' --exclude='__pycache__/' --exclude='*.pyc' --exclude='logs/' --exclude='backup/' --exclude='data/' \
+         -e {sshopt} \"$SRC/\" {user}@{host}:{staging}/",
+        src = sq(src), sshopt = sq(&ssh_e(server)),
+        user = sq(server.login_id(use_root)), host = sq(server.ip.trim()), staging = sq(&staging),
+    );
+    Ok(Job {
+        title: format!("eondcms ② 코드 업로드 : {domain_name}"),
+        script,
+        sshpass: server.login_pw(use_root).to_string(),
+        env: Vec::new(),
+        note: format!("{src}/ → {staging}/ (.rsyncignore 적용, mobile/venv/node_modules 제외). ③에서 $APPDIR 복사"),
+    })
+}
+
+/// ③ 설치 마무리 (venv/.env/alembic/systemd/SSL/nginx). 멱등.
+pub fn build_eondcms_finalize(server: &Site, eond: &EondInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    eondcms_validate(server, eond, use_root)?;
+    if eond.port.trim().is_empty() { return Err("포트가 비어 있습니다 (수동 입력)".into()); }
+    if eond.db_name.trim().is_empty() { return Err("DB 이름이 비어 있습니다".into()); }
+    let domain = to_ascii_domain(domain_name);
+    let staging = format!("/tmp/hm-eond-{}", store::sanitize(&domain));
+    let head = format!(
+        "set -e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/local/mysql/bin\"\nVBIN=/usr/local/hestia/bin\nTPLDIR=/usr/local/hestia/data/templates/web/nginx\nVUSER={u}\nDOMAIN={d}\nPORT={p}\nSTAGING={st}\nDBNAME={dbn}\nDBUSER={dbu}\nDBPASS={dbp}\nTPREFIX={tp}\nADMINU={au}\nADMINP={ap}\n",
+        u = sq(eond.hestia_user.trim()), d = sq(&domain), p = sq(eond.port.trim()), st = sq(&staging),
+        dbn = sq(eond.db_name.trim()), dbu = sq(eond.db_user.trim()), dbp = sq(&eond.db_pass),
+        tp = sq(eond.table_prefix_or_default()), au = sq(eond.admin_user_or_default()), ap = sq(&eond.admin_pass),
+    );
+    let body1 = r#"APPDIR=/home/$VUSER/web/$DOMAIN/pythonapp
+SERVICE=eondcms-$VUSER
+FULLDB="$DBNAME"
+FULLDBU="$DBUSER"
+echo "== [마무리] $DOMAIN 포트 $PORT =="
+if ss -ltn 2>/dev/null | grep -q ":$PORT "; then echo "✗ 포트 $PORT 사용 중 — 다른 포트로"; exit 1; fi
+if [ -d "$STAGING" ]; then echo "스테이징 → $APPDIR 복사"; mkdir -p "$APPDIR"; cp -a "$STAGING/." "$APPDIR/"; fi
+if [ ! -f "$APPDIR/app/main.py" ]; then echo "✗ 코드 없음: $APPDIR (먼저 ② 코드 업로드)"; exit 1; fi
+if [ ! -d "$APPDIR/web/build" ]; then echo "※ web/build 없음 — 정적이 깨질 수 있음(로컬 npm run build 후 재업로드 권장)"; fi
+chown -R "$VUSER:$VUSER" "$APPDIR"
+sudo -u "$VUSER" mkdir -p "$APPDIR/logs"
+echo "-- venv/poetry --"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && python3.11 -m venv .venv && .venv/bin/pip install -q -U pip poetry && .venv/bin/poetry config virtualenvs.create false --local && .venv/bin/poetry install --no-root --only main"
+if [ ! -f "$APPDIR/.env" ]; then
+  SECRET=$(openssl rand -hex 32)
+  FERNET=$(sudo -u "$VUSER" "$APPDIR/.venv/bin/python" -c 'from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())')
+  cat > "$APPDIR/.env" <<ENVEOF
+ENV=production
+DATABASE_URL=mysql+aiomysql://$FULLDBU:$DBPASS@127.0.0.1:3306/$FULLDB?charset=utf8mb4
+SECRET_KEY=$SECRET
+FERNET_KEY=$FERNET
+ALGORITHM=HS256
+TABLE_PREFIX=$TPREFIX
+ADMIN_USERNAME=$ADMINU
+ADMIN_PASSWORD=$ADMINP
+ALLOWED_ORIGINS=["https://$DOMAIN"]
+ENVEOF
+  chown "$VUSER:$VUSER" "$APPDIR/.env"; chmod 600 "$APPDIR/.env"; echo ".env 생성"
+else echo ".env 유지(기존 키 보존)"; fi
+# TABLE_PREFIX 는 비밀이 아니므로 항상 설정값과 동기화 (seed 접두어 불일치=테이블없음 방지)
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && if grep -q '^TABLE_PREFIX=' .env; then sed -i 's/^TABLE_PREFIX=.*/TABLE_PREFIX=$TPREFIX/' .env; else echo 'TABLE_PREFIX=$TPREFIX' >> .env; fi"
+echo "TABLE_PREFIX=$TPREFIX 동기화(.env)"
+echo "-- Rhymix 베이스 시드 (접두어 무관 멱등) --"
+MQ="MYSQL_PWD='$DBPASS' mysql -h 127.0.0.1 -P 3306 -u '$FULLDBU' '$FULLDB' -N"
+EXIST=$(sudo -u "$VUSER" bash -lc "$MQ -e \"SHOW TABLES LIKE '%_document_categories'\"" 2>/dev/null | head -1)
+if [ -n "$EXIST" ]; then
+  echo "Rhymix 테이블 이미 존재($EXIST) — 적재 건너뜀(데이터 보호)"
+elif [ -f "$APPDIR/rhymix_base.sql" ]; then
+  echo "rhymix_base.sql 적재 → $FULLDB"
+  sudo -u "$VUSER" bash -lc "MYSQL_PWD='$DBPASS' mysql -h 127.0.0.1 -P 3306 -u '$FULLDBU' '$FULLDB' < '$APPDIR/rhymix_base.sql'" && echo "Rhymix 베이스 적재 완료"
+else
+  echo "rhymix_base.sql 없음 — Rhymix 베이스 없이 진행 (빈 DB면 eondcms 부팅 실패 가능)"
+fi
+# 실제 적재된 Rhymix 접두어를 자동 감지 → .env 강제 동기화 (입력칸 오타 무시)
+DET=$(sudo -u "$VUSER" bash -lc "$MQ -e \"SHOW TABLES LIKE '%_document_categories'\"" 2>/dev/null | head -1 | sed 's/document_categories$//')
+if [ -n "$DET" ]; then
+  echo "Rhymix 접두어 자동감지: $DET → .env TABLE_PREFIX 반영"
+  sudo -u "$VUSER" bash -lc "cd '$APPDIR' && if grep -q '^TABLE_PREFIX=' .env; then sed -i 's/^TABLE_PREFIX=.*/TABLE_PREFIX=$DET/' .env; else echo 'TABLE_PREFIX=$DET' >> .env; fi"
+  TPREFIX="$DET"
+fi
+echo "-- eond_ 스키마(완성본) 적재: eond_ 데이터 없을 때만 (DROP 데이터손실 방지) --"
+if [ -f "$APPDIR/eond_schema.sql" ]; then
+  HASC=$(sudo -u "$VUSER" bash -lc "$MQ -e \"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='$FULLDB' AND table_name='eond_projects' AND column_name='deleted_at'\"" 2>/dev/null | head -1)
+  ROWS=$(sudo -u "$VUSER" bash -lc "$MQ -e \"SELECT COUNT(*) FROM eond_projects\"" 2>/dev/null | head -1)
+  if [ "${HASC:-0}" != "0" ]; then
+    echo "eond_ 스키마 이미 완성(deleted_at 존재) — 건너뜀"
+  elif [ -n "$ROWS" ] && [ "$ROWS" != "0" ]; then
+    echo "※ eond_ 데이터 존재(eond_projects=$ROWS) + 스키마 불완전 → 적재 스킵(데이터 보호). 수동 보강 필요"
+  else
+    echo "eond_ 비어있고 불완전 → eond_schema.sql 적재(DROP+CREATE, 누락 보강)"
+    sudo -u "$VUSER" bash -lc "MYSQL_PWD='$DBPASS' mysql -h 127.0.0.1 -P 3306 -u '$FULLDBU' '$FULLDB' < '$APPDIR/eond_schema.sql'" && echo "eond_schema.sql 적재 완료"
+  fi
+else echo "eond_schema.sql 없음 — create_all 로만 진행(불완전 가능: 대시보드 500 위험)"; fi
+echo "-- DB 초기화: ① 모델 테이블 create_all 먼저 --"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && .venv/bin/python -c 'import asyncio; from app.db_bootstrap import setup_eond_tables; asyncio.run(setup_eond_tables())'" \
+  || echo "※ 부트스트랩 일부 경고(Rhymix rx_ 백필 등) — 빈 DB에선 정상, eond_ 테이블 생성은 진행됨"
+echo "-- ② alembic stamp head (모델=최신 기준으로 표시) --"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && .venv/bin/alembic stamp head" && echo "stamp head OK"
+echo "-- eond_projects 존재 확인 --"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && .venv/bin/alembic current" 2>/dev/null || true
+echo "-- 관리자 비번 세팅 (.env ADMIN_PASSWORD → <prefix>member, seed의 *LOCKED* 해소) --"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && .venv/bin/python -c \"import re,sqlalchemy as sa; from app.config import settings; from app.routers.auth import _hash_password_bcrypt as H; e=sa.create_engine(re.sub('[+]aiomysql','+pymysql',settings.database_url)); c=e.connect(); r=c.execute(sa.text('UPDATE '+settings.table_prefix+'member SET password=:p WHERE user_id=:u'),{'p':H(settings.admin_password),'u':settings.admin_username}); c.commit(); print('admin 비번 세팅 행수:', r.rowcount, settings.admin_username)\"" \
+  || echo "※ 관리자 비번 세팅 실패 — 수동 필요(아래 안내)"
+echo "-- systemd --"
+cat > "/etc/systemd/system/$SERVICE.service" <<UNITEOF
+[Unit]
+Description=eondcms FastAPI ($VUSER / $DOMAIN)
+After=network.target mysql.service
+[Service]
+Type=simple
+User=$VUSER
+Group=$VUSER
+WorkingDirectory=$APPDIR
+EnvironmentFile=$APPDIR/.env
+ExecStart=$APPDIR/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port $PORT --workers 2 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:$APPDIR/logs/server.log
+StandardError=append:$APPDIR/logs/server.err.log
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+systemctl daemon-reload
+systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+systemctl restart "$SERVICE"
+echo "서비스 재시작됨(새 .env/포트/코드 반영). 기동 대기(최대 30초)..."
+HC=000
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 3
+  HC=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || true)
+  if [ "$HC" != "000" ]; then break; fi
+done
+echo "uvicorn 헬스체크: $HC (200/302=정상, 500=앱 부팅됨/런타임오류, 000=미기동)"
+if [ "$HC" = "000" ]; then
+  echo "※ uvicorn 미응답 — systemd 상태 & 최근 로그:"
+  systemctl --no-pager -l status "$SERVICE" 2>/dev/null | head -12
+  journalctl -u "$SERVICE" -n 40 --no-pager 2>/dev/null
+  echo "-- server.err.log --"; tail -n 40 "$APPDIR/logs/server.err.log" 2>/dev/null
+fi
+echo "-- SSL (proxy-tpl 보다 먼저) --"
+$VBIN/v-add-letsencrypt-domain "$VUSER" "$DOMAIN" || echo "※ SSL 발급 보류 — DNS A레코드가 이 서버를 가리키는지 확인"
+echo "-- nginx 템플릿 (포트 치환) --"
+"#;
+    let body2 = r#"sed -i "s/8001/$PORT/g" "$TPLDIR/eondcms-$PORT.tpl" "$TPLDIR/eondcms-$PORT.stpl"
+chown root:root "$TPLDIR/eondcms-$PORT.tpl" "$TPLDIR/eondcms-$PORT.stpl"
+chmod 644 "$TPLDIR/eondcms-$PORT.tpl" "$TPLDIR/eondcms-$PORT.stpl"
+$VBIN/v-change-web-domain-proxy-tpl "$VUSER" "$DOMAIN" "eondcms-$PORT"
+echo "-- 최종 확인 --"
+curl -sI "https://$DOMAIN" 2>/dev/null | head -1 || true
+echo "== eondcms 설치 완료: https://$DOMAIN (관리자 $ADMINU) =="
+"#;
+    let remote = eondcms_finalize_remote(&head, body1, body2);
+    let (script, sshpass, env) = eondcms_exec(server, &remote, use_root, eond.sudo);
+    Ok(Job {
+        title: format!("eondcms ③ 설치 마무리 : {domain_name}"),
+        script,
+        sshpass,
+        env,
+        note: "스테이징→앱 복사 + venv/.env/alembic/systemd/SSL/nginx 설정".into(),
+    })
+}
+
+/// 🔄 코드 업데이트 (이미 설치된 인스턴스): 스테이징→앱 복사 + 의존성 + DB동기화 + 재시작.
+/// 설치의 무거운 단계(v-*·SSL·nginx)는 생략. 흐름: ② 코드 업로드 → 🔄 업데이트.
+pub fn build_eondcms_update(server: &Site, eond: &EondInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    eondcms_validate(server, eond, use_root)?;
+    if eond.port.trim().is_empty() { return Err("포트가 비어 있습니다 (설치 시 사용한 포트)".into()); }
+    let domain = to_ascii_domain(domain_name);
+    let staging = format!("/tmp/hm-eond-{}", store::sanitize(&domain));
+    let head = format!(
+        "set -e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/local/mysql/bin\"\nVUSER={u}\nDOMAIN={d}\nPORT={p}\nSTAGING={st}\nDBNAME={dbn}\nDBUSER={dbu}\nDBPASS={dbp}\n",
+        u = sq(eond.hestia_user.trim()), d = sq(&domain), p = sq(eond.port.trim()), st = sq(&staging),
+        dbn = sq(eond.db_name.trim()), dbu = sq(eond.db_user.trim()), dbp = sq(&eond.db_pass),
+    );
+    let body = r#"APPDIR=/home/$VUSER/web/$DOMAIN/pythonapp
+SERVICE=eondcms-$VUSER
+FULLDB="$DBNAME"
+FULLDBU="$DBUSER"
+MQ="MYSQL_PWD='$DBPASS' mysql -h 127.0.0.1 -P 3306 -u '$FULLDBU' '$FULLDB' -N"
+echo "== [eondcms 업데이트] $DOMAIN =="
+if [ -d "$STAGING" ]; then echo "스테이징 → $APPDIR 복사"; cp -a "$STAGING/." "$APPDIR/"; else echo "※ 스테이징 없음 — 먼저 ② 코드 업로드"; fi
+if [ ! -f "$APPDIR/app/main.py" ]; then echo "✗ 코드 없음: $APPDIR"; exit 1; fi
+chown -R "$VUSER:$VUSER" "$APPDIR"
+echo "-- 의존성(poetry) --"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && { [ -d .venv ] || python3.11 -m venv .venv; } && .venv/bin/pip install -q -U poetry && .venv/bin/poetry install --no-root --only main"
+echo "-- eond_ 스키마(완성본) 적재: eond_ 데이터 없을 때만 (DROP 데이터손실 방지) --"
+if [ -f "$APPDIR/eond_schema.sql" ] && [ -n "$DBNAME" ]; then
+  HASC=$(sudo -u "$VUSER" bash -lc "$MQ -e \"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='$FULLDB' AND table_name='eond_projects' AND column_name='deleted_at'\"" 2>/dev/null | head -1)
+  ROWS=$(sudo -u "$VUSER" bash -lc "$MQ -e \"SELECT COUNT(*) FROM eond_projects\"" 2>/dev/null | head -1)
+  if [ "${HASC:-0}" != "0" ]; then
+    echo "eond_ 스키마 이미 완성(deleted_at 존재) — 건너뜀"
+  elif [ -n "$ROWS" ] && [ "$ROWS" != "0" ]; then
+    echo "※ eond_ 데이터 존재(eond_projects=$ROWS) + 스키마 불완전 → 적재 스킵(데이터 보호). 수동 보강 필요"
+  else
+    echo "eond_ 비어있고 불완전 → eond_schema.sql 적재(DROP+CREATE, 누락 보강)"
+    sudo -u "$VUSER" bash -lc "MYSQL_PWD='$DBPASS' mysql -h 127.0.0.1 -P 3306 -u '$FULLDBU' '$FULLDB' < '$APPDIR/eond_schema.sql'" && echo "eond_schema.sql 적재 완료"
+  fi
+else echo "eond_schema.sql 없음 또는 DB정보 비어있음 — 스키마 보강 생략"; fi
+echo "-- DB 동기화(create_all + 부트스트랩 ALTER) --"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && .venv/bin/python -c 'import asyncio; from app.db_bootstrap import setup_eond_tables; asyncio.run(setup_eond_tables())'" || echo "※ 부트스트랩 경고(무시 가능)"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && .venv/bin/alembic stamp head" 2>/dev/null || true
+echo "-- 서비스 재시작 --"
+systemctl restart "$SERVICE"
+echo "기동 대기(최대 30초)..."
+HC=000
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 3
+  HC=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || true)
+  if [ "$HC" != "000" ]; then break; fi
+done
+echo "uvicorn 헬스체크: $HC (200/302=정상)"
+if [ "$HC" = "000" ]; then echo "※ 미응답 — 로그:"; journalctl -u "$SERVICE" -n 30 --no-pager 2>/dev/null; tail -n 30 "$APPDIR/logs/server.err.log" 2>/dev/null; fi
+echo "== eondcms 업데이트 완료: $DOMAIN =="
+"#;
+    let remote = format!("{head}{body}");
+    let (script, sshpass, env) = eondcms_exec(server, &remote, use_root, eond.sudo);
+    Ok(Job {
+        title: format!("eondcms 🔄 업데이트 : {domain_name}"),
+        script,
+        sshpass,
+        env,
+        note: "코드 반영 + 의존성 + DB동기화 + 재시작 (v-*/SSL/nginx 생략)".into(),
+    })
+}
+
+// ===== 일반 CMS 설치 (WordPress / Rhymix / 그누보드) =====
+
+fn cms_validate(server: &Site, c: &CmsInstall, use_root: bool, need_admin: bool) -> Result<(), String> {
+    if server.ip.trim().is_empty() { return Err("설치 대상 서버 IP가 비어 있습니다".into()); }
+    if !use_root { return Err("CMS 설치는 root 권한 필요 — '루트로 실행'을 켜고 서버루트 계정을 입력하세요".into()); }
+    if server.login_id(use_root).is_empty() { return Err("서버 루트 로그인 아이디가 비어 있습니다".into()); }
+    if c.hestia_user.trim().is_empty() { return Err("HestiaCP 유저가 비어 있습니다".into()); }
+    if c.db_name.trim().is_empty() || c.db_user.trim().is_empty() || c.db_pass.is_empty() {
+        return Err("DB 정보(전체이름/유저/비번)가 필요합니다".into());
+    }
+    if need_admin && (c.admin_pass.is_empty() || c.admin_email.trim().is_empty()) {
+        return Err("관리자 비번/이메일이 필요합니다 (WordPress)".into());
+    }
+    Ok(())
+}
+
+/// CMS 설치 (종류별 분기)
+pub fn build_cms_install(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    match c.kind {
+        CmsKind::WordPress => build_wp_install(server, c, domain_name, use_root),
+        CmsKind::Rhymix => build_git_cms_install(server, c, domain_name, use_root, &RHYMIX),
+        CmsKind::Gnuboard => build_git_cms_install(server, c, domain_name, use_root, &GNUBOARD),
+    }
+}
+
+/// CMS 업데이트 (종류별 분기)
+pub fn build_cms_update(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    match c.kind {
+        CmsKind::WordPress => build_wp_update(server, c, domain_name, use_root),
+        CmsKind::Rhymix => build_git_cms_update(server, c, domain_name, use_root, &RHYMIX),
+        CmsKind::Gnuboard => build_git_cms_update(server, c, domain_name, use_root, &GNUBOARD),
+    }
+}
+
+/// git 기반 PHP CMS(Rhymix/그누보드) 설치 스펙
+struct GitCms {
+    name: &'static str,
+    repo: &'static str,
+    /// 쓰기 권한 필요한 디렉토리 (webroot 상대)
+    writable_dir: &'static str,
+    /// 권한 (그누보드 data 는 707)
+    writable_mode: &'static str,
+    /// 설치 마법사 경로
+    installer_path: &'static str,
+}
+
+const RHYMIX: GitCms = GitCms {
+    name: "Rhymix",
+    repo: "https://github.com/rhymix/rhymix.git",
+    writable_dir: "files",
+    writable_mode: "u+rwX",
+    installer_path: "/",
+};
+const GNUBOARD: GitCms = GitCms {
+    name: "그누보드",
+    repo: "https://github.com/gnuboard/gnuboard5.git",
+    writable_dir: "data",
+    writable_mode: "707",
+    installer_path: "/install/",
+};
+
+/// Rhymix/그누보드 설치 — v-add-* + git clone + 권한 + DB + SSL (+ 브라우저 마법사 안내)
+fn build_git_cms_install(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool, g: &GitCms) -> Result<Job, String> {
+    cms_validate(server, c, use_root, false)?;
+    let domain = to_ascii_domain(domain_name);
+    let head = format!(
+        "set -e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin\"\nVBIN=/usr/local/hestia/bin\nVUSER={u}\nDOMAIN={d}\nPKG={pkg}\nEMAIL={em}\nUPASS={up}\nDBNAME={dbn}\nDBUSER={dbu}\nDBPASS={dbp}\nCMSNAME={cn}\nREPO={repo}\nWDIR={wd}\nWMODE={wm}\nINSTPATH={ip}\n",
+        u = sq(c.hestia_user.trim()), d = sq(&domain), pkg = sq(c.package_or_default()),
+        em = sq(c.hestia_email.trim()), up = sq(&c.hestia_pass),
+        dbn = sq(c.db_name.trim()), dbu = sq(c.db_user.trim()), dbp = sq(&c.db_pass),
+        cn = sq(g.name), repo = sq(g.repo), wd = sq(g.writable_dir), wm = sq(g.writable_mode), ip = sq(g.installer_path),
+    );
+    let body = r#"FULLDB="$DBNAME"
+DBSHORT="${DBNAME#${VUSER}_}"
+DBUSHORT="${DBUSER#${VUSER}_}"
+WEBROOT=/home/$VUSER/web/$DOMAIN/public_html
+echo "== [$CMSNAME 설치] $DOMAIN (db=$FULLDB) =="
+$VBIN/v-list-user "$VUSER" >/dev/null 2>&1 || { if [ -n "$UPASS" ]; then $VBIN/v-add-user "$VUSER" "$UPASS" "$EMAIL" "$PKG"; else echo "✗ 유저 없음 + 비번 없음 — 유저부터 생성 필요"; exit 1; fi; }
+$VBIN/v-list-web-domain "$VUSER" "$DOMAIN" >/dev/null 2>&1 || $VBIN/v-add-web-domain "$VUSER" "$DOMAIN"
+$VBIN/v-list-database "$VUSER" "$FULLDB" >/dev/null 2>&1 || $VBIN/v-add-database "$VUSER" "$DBSHORT" "$DBUSHORT" "$DBPASS" mysql
+echo "리소스 OK"
+if [ -f "$WEBROOT/index.php" ] && [ -d "$WEBROOT/.git" ]; then
+  echo "※ 이미 $CMSNAME 코드 존재(.git) — 클론 건너뜀(데이터 보호)"
+else
+  echo "-- $CMSNAME 코어 git clone --"
+  find "$WEBROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+  sudo -u "$VUSER" git clone --depth 1 "$REPO" "$WEBROOT"
+fi
+mkdir -p "$WEBROOT/$WDIR"
+chown -R "$VUSER:$VUSER" "$WEBROOT"
+chmod -R "$WMODE" "$WEBROOT/$WDIR"
+echo "-- SSL --"
+$VBIN/v-add-letsencrypt-domain "$VUSER" "$DOMAIN" || echo "※ SSL 발급 보류 — DNS A레코드가 이 서버를 가리키는지 확인"
+echo "== $CMSNAME 코드/DB 준비 완료 =="
+echo "▶ 마지막 단계(브라우저): https://$DOMAIN$INSTPATH 접속 → 설치 마법사"
+echo "   DB 호스트=127.0.0.1  DB이름=$FULLDB  유저=$DBUSER  비번=(입력한 DB비번)  포트=3306"
+echo "   그리고 관리자 계정을 마법사에서 생성하세요. (헤드리스 자동화는 공식 CLI 없어 이 단계만 수동)"
+"#;
+    let raw = format!("{head}{body}");
+    let (script, sshpass, env) = eondcms_exec(server, &raw, use_root, c.sudo);
+    Ok(Job {
+        title: format!("{} 설치 : {domain_name}", g.name),
+        script,
+        sshpass,
+        env,
+        note: "v-add-* + git clone + 권한 + DB + SSL (마법사는 브라우저)".into(),
+    })
+}
+
+/// Rhymix/그누보드 업데이트 — git pull (코어 갱신)
+fn build_git_cms_update(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool, g: &GitCms) -> Result<Job, String> {
+    cms_validate(server, c, use_root, false)?;
+    let domain = to_ascii_domain(domain_name);
+    let head = format!(
+        "set -e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin\"\nVUSER={u}\nDOMAIN={d}\nCMSNAME={cn}\n",
+        u = sq(c.hestia_user.trim()), d = sq(&domain), cn = sq(g.name),
+    );
+    let body = r#"WEBROOT=/home/$VUSER/web/$DOMAIN/public_html
+echo "== [$CMSNAME 업데이트] $DOMAIN =="
+if [ ! -d "$WEBROOT/.git" ]; then echo "✗ git 체크아웃 아님: $WEBROOT — git clone 설치본만 자동 업데이트 가능(수동 교체 필요)"; exit 1; fi
+sudo -u "$VUSER" git -C "$WEBROOT" pull --ff-only
+chown -R "$VUSER:$VUSER" "$WEBROOT"
+echo "현재 커밋: $(sudo -u "$VUSER" git -C "$WEBROOT" rev-parse --short HEAD 2>/dev/null)"
+echo "== $CMSNAME 업데이트 완료: $DOMAIN =="
+echo "▶ DB 스키마 변경이 있으면 브라우저 관리자에서 마무리될 수 있습니다."
+"#;
+    let raw = format!("{head}{body}");
+    let (script, sshpass, env) = eondcms_exec(server, &raw, use_root, c.sudo);
+    Ok(Job {
+        title: format!("{} 업데이트 : {domain_name}", g.name),
+        script,
+        sshpass,
+        env,
+        note: "git pull 코어 갱신".into(),
+    })
+}
+
+/// WordPress 설치 — v-add-* + wp-cli(core download/config/install) + SSL
+fn build_wp_install(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    cms_validate(server, c, use_root, true)?;
+    let domain = to_ascii_domain(domain_name);
+    let head = format!(
+        "set -e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin\"\nVBIN=/usr/local/hestia/bin\nVUSER={u}\nDOMAIN={d}\nPKG={pkg}\nEMAIL={em}\nUPASS={up}\nDBNAME={dbn}\nDBUSER={dbu}\nDBPASS={dbp}\nADMINU={au}\nADMINP={ap}\nADMINE={ae}\nTITLE={ti}\nLOCALE={lo}\nWPVER={ver}\n",
+        u = sq(c.hestia_user.trim()), d = sq(&domain), pkg = sq(c.package_or_default()),
+        em = sq(c.hestia_email.trim()), up = sq(&c.hestia_pass),
+        dbn = sq(c.db_name.trim()), dbu = sq(c.db_user.trim()), dbp = sq(&c.db_pass),
+        au = sq(c.admin_user_or_default()), ap = sq(&c.admin_pass), ae = sq(c.admin_email.trim()),
+        ti = sq(c.site_title_or_default()), lo = sq(c.locale_or_default()), ver = sq(c.version_or_default()),
+    );
+    let body = r#"FULLDB="$DBNAME"
+DBSHORT="${DBNAME#${VUSER}_}"
+DBUSHORT="${DBUSER#${VUSER}_}"
+WEBROOT=/home/$VUSER/web/$DOMAIN/public_html
+echo "== [WordPress 설치] $DOMAIN (db=$FULLDB) =="
+$VBIN/v-list-user "$VUSER" >/dev/null 2>&1 || { if [ -n "$UPASS" ]; then $VBIN/v-add-user "$VUSER" "$UPASS" "$EMAIL" "$PKG"; else echo "✗ 유저 없음 + 비번 없음 — 유저부터 생성 필요"; exit 1; fi; }
+$VBIN/v-list-web-domain "$VUSER" "$DOMAIN" >/dev/null 2>&1 || $VBIN/v-add-web-domain "$VUSER" "$DOMAIN"
+$VBIN/v-list-database "$VUSER" "$FULLDB" >/dev/null 2>&1 || $VBIN/v-add-database "$VUSER" "$DBSHORT" "$DBUSHORT" "$DBPASS" mysql
+echo "리소스 OK"
+WPCLI=/usr/local/bin/wp
+if ! [ -x "$WPCLI" ]; then echo "wp-cli 설치"; curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$WPCLI" && chmod +x "$WPCLI"; fi
+mkdir -p "$WEBROOT"; chown -R "$VUSER:$VUSER" "$WEBROOT"
+WP="sudo -u $VUSER $WPCLI --path=$WEBROOT"
+if [ "$WPVER" = latest ]; then VEROPT=""; else VEROPT="--version=$WPVER"; fi
+echo "-- 코어 다운로드/설정/설치 ($LOCALE, $WPVER) --"
+if $WP core is-installed 2>/dev/null; then
+  echo "※ 이미 WordPress 설치됨 — 코어/설치 건너뜀(데이터 보호)"
+else
+  [ -f "$WEBROOT/wp-load.php" ] || $WP core download --locale="$LOCALE" $VEROPT
+  [ -f "$WEBROOT/wp-config.php" ] || $WP config create --dbname="$FULLDB" --dbuser="$DBUSER" --dbpass="$DBPASS" --dbhost=127.0.0.1 --locale="$LOCALE" --skip-check
+  $WP core install --url="https://$DOMAIN" --title="$TITLE" --admin_user="$ADMINU" --admin_password="$ADMINP" --admin_email="$ADMINE" --skip-email
+fi
+$WP language core install "$LOCALE" --activate 2>/dev/null || true
+chown -R "$VUSER:$VUSER" "$WEBROOT"
+echo "-- SSL --"
+$VBIN/v-add-letsencrypt-domain "$VUSER" "$DOMAIN" || echo "※ SSL 발급 보류 — DNS A레코드가 이 서버를 가리키는지 확인"
+echo "-- 확인 --"
+curl -sI "https://$DOMAIN" 2>/dev/null | head -1 || true
+echo "== WordPress 설치 완료: https://$DOMAIN (관리자 $ADMINU → /wp-admin) =="
+"#;
+    let raw = format!("{head}{body}");
+    let (script, sshpass, env) = eondcms_exec(server, &raw, use_root, c.sudo);
+    Ok(Job {
+        title: format!("WordPress 설치 : {domain_name}"),
+        script,
+        sshpass,
+        env,
+        note: "v-add-* + wp-cli core download/config/install + SSL".into(),
+    })
+}
+
+/// WordPress 업데이트 — wp-cli core/plugin/theme/language update
+fn build_wp_update(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    cms_validate(server, c, use_root, false)?;
+    let domain = to_ascii_domain(domain_name);
+    let head = format!(
+        "set -e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin\"\nVUSER={u}\nDOMAIN={d}\n",
+        u = sq(c.hestia_user.trim()), d = sq(&domain),
+    );
+    let body = r#"WEBROOT=/home/$VUSER/web/$DOMAIN/public_html
+WPCLI=/usr/local/bin/wp
+if ! [ -x "$WPCLI" ]; then echo "wp-cli 설치"; curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$WPCLI" && chmod +x "$WPCLI"; fi
+if [ ! -f "$WEBROOT/wp-load.php" ]; then echo "✗ WordPress 미설치: $WEBROOT (먼저 설치)"; exit 1; fi
+WP="sudo -u $VUSER $WPCLI --path=$WEBROOT"
+echo "== [WordPress 업데이트] $DOMAIN =="
+$WP core update
+$WP core update-db || true
+$WP plugin update --all || true
+$WP theme update --all || true
+$WP language core update || true
+echo -n "현재 버전: "; $WP core version || true
+echo "== WordPress 업데이트 완료: $DOMAIN =="
+"#;
+    let raw = format!("{head}{body}");
+    let (script, sshpass, env) = eondcms_exec(server, &raw, use_root, c.sudo);
+    Ok(Job {
+        title: format!("WordPress 업데이트 : {domain_name}"),
+        script,
+        sshpass,
+        env,
+        note: "wp-cli core/plugin/theme/language update".into(),
+    })
+}
+
+/// finalize 원시 remote 스크립트 조립 (head + body1 + 내장 nginx 템플릿 heredoc + body2).
+/// 따옴표/heredoc 검증(`bash -n`)을 위해 분리.
+fn eondcms_finalize_remote(head: &str, body1: &str, body2: &str) -> String {
+    let mut remote = String::from(head);
+    remote.push_str(body1);
+    remote.push_str("cat > \"$TPLDIR/eondcms-$PORT.tpl\" <<'TPLEOF'\n");
+    remote.push_str(EONDCMS_TPL);
+    remote.push_str("\nTPLEOF\n");
+    remote.push_str("cat > \"$TPLDIR/eondcms-$PORT.stpl\" <<'STPLEOF'\n");
+    remote.push_str(EONDCMS_STPL);
+    remote.push_str("\nSTPLEOF\n");
+    remote.push_str(body2);
+    remote
+}
+
 /// SSH 접속 테스트 작업 생성: 로그인 성공 여부 + 원격 도구 가용성 확인
 fn build_test_job(site: &Site, label: &str, domain_name: &str, use_root: bool) -> Result<Job, String> {
     validate_site_ssh(site, use_root)?;
@@ -444,6 +1060,9 @@ fn build_test_job(site: &Site, label: &str, domain_name: &str, use_root: bool) -
                       grep -iE \"DB_NAME|DB_USER|DB_PASSWORD|DB_HOST|db_database|db_userid|db_password|db_hostname|G5_MYSQL|mysql_host|mysql_user|mysql_password|mysql_db|master\" \"$base/$f\" 2>/dev/null; \
                     fi; done; done; \
                 [ \"$hit\" = 0 ] && echo 'CMS 설정파일 못 찾음 (wp/rhymix/xe/그누보드)'; \
+                echo '-- 포트(8000~8099) 사용현황 / 추천 빈 포트 --'; \
+                ss -ltn 2>/dev/null | grep -oE ':80[0-9][0-9]' | sort -u | tr '\\n' ' '; echo; \
+                for p in $(seq 8002 8099); do ss -ltn 2>/dev/null | grep -q \":$p \" || { echo \"추천 빈 포트: $p\"; break; }; done; \
                 echo '(탐색 끝)'";
     let script = format!(
         "sshpass -e {ssh} {user}@{host} {remote}",
@@ -1010,6 +1629,116 @@ mod tests {
         assert_eq!(d.user.as_deref(), Some("g4user"));
         assert_eq!(d.name.as_deref(), Some("g4db"));
         assert_eq!(d.cms.as_deref(), Some("그누보드4"));
+    }
+
+    #[test]
+    fn eondcms_jobs_valid_bash() {
+        let mut server = sample_site();
+        server.root_id = "tong".into();
+        server.root_pw = "tongpw".into();
+        // sudo=false(직접 root), sudo=true(tong+sudo bash -s) 둘 다 구문 검증
+        for sudo in [false, true] {
+            let e = EondInstall {
+                sudo,
+                hestia_user: "jokbo".into(),
+                hestia_pass: "upass".into(),
+                hestia_email: "a@b.c".into(),
+                port: "8002".into(),
+                db_name: "eondcms".into(),
+                db_user: "eondcms".into(),
+                db_pass: "db'p ass".into(),
+                admin_pass: "adminpw".into(),
+                code_local: "/home/dell/dev/eondcms".into(),
+                ..Default::default()
+            };
+            let jobs = [
+                build_eondcms_resources(&server, &e, "예시도메인.com", true).unwrap(),
+                build_eondcms_upload(&server, &e, "예시도메인.com", true).unwrap(),
+                build_eondcms_finalize(&server, &e, "예시도메인.com", true).unwrap(),
+                build_eondcms_update(&server, &e, "예시도메인.com", true).unwrap(),
+            ];
+            for job in jobs {
+                let out = std::process::Command::new("bash")
+                    .args(["-n", "-c", &job.script])
+                    .output()
+                    .expect("bash");
+                assert!(
+                    out.status.success(),
+                    "bash 구문 오류 (sudo={sudo}, {}): {}",
+                    job.title,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eondcms_install_needs_root() {
+        let server = sample_site(); // root 없음
+        let e = EondInstall { hestia_user: "jokbo".into(), ..Default::default() };
+        assert!(build_eondcms_resources(&server, &e, "ex.com", false).is_err());
+    }
+
+    #[test]
+    fn wordpress_jobs_valid_bash() {
+        let mut server = sample_site();
+        server.root_id = "tong".into();
+        server.root_pw = "tongpw".into();
+        for sudo in [false, true] {
+            let c = CmsInstall {
+                kind: CmsKind::WordPress,
+                sudo,
+                hestia_user: "wpuser".into(),
+                hestia_pass: "upass".into(),
+                hestia_email: "a@b.c".into(),
+                db_name: "wpuser_wp".into(),
+                db_user: "wpuser_wp".into(),
+                db_pass: "db'p ass".into(),
+                admin_user: "admin".into(),
+                admin_pass: "adminpw".into(),
+                admin_email: "admin@b.c".into(),
+                site_title: "My Site".into(),
+                ..Default::default()
+            };
+            let rhymix = CmsInstall { kind: CmsKind::Rhymix, ..c.clone() };
+            let gnu = CmsInstall { kind: CmsKind::Gnuboard, ..c.clone() };
+            for job in [
+                build_cms_install(&server, &c, "예시도메인.com", true).unwrap(),
+                build_cms_update(&server, &c, "예시도메인.com", true).unwrap(),
+                build_cms_install(&server, &rhymix, "예시도메인.com", true).unwrap(),
+                build_cms_update(&server, &rhymix, "예시도메인.com", true).unwrap(),
+                build_cms_install(&server, &gnu, "예시도메인.com", true).unwrap(),
+                build_cms_update(&server, &gnu, "예시도메인.com", true).unwrap(),
+            ] {
+                let out = std::process::Command::new("bash")
+                    .args(["-n", "-c", &job.script])
+                    .output()
+                    .expect("bash");
+                assert!(
+                    out.status.success(),
+                    "bash 구문 오류 (sudo={sudo}, {}): {}",
+                    job.title,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cms_install_needs_root_and_wp_admin() {
+        let mut server = sample_site();
+        server.root_id = "tong".into();
+        server.root_pw = "tongpw".into();
+        // root 꺼짐 → 에러
+        let c = CmsInstall { hestia_user: "u".into(), db_name: "u_wp".into(), db_user: "u_wp".into(), db_pass: "p".into(), ..Default::default() };
+        assert!(build_cms_install(&sample_site(), &c, "ex.com", false).is_err());
+        // WordPress 설치인데 admin 이메일/비번 없음 → 에러
+        assert!(build_cms_install(&server, &c, "ex.com", true).is_err());
+        // Rhymix/그누보드는 admin 불필요(마법사) — DB만 있으면 Ok
+        let r = CmsInstall { kind: CmsKind::Rhymix, hestia_user: "u".into(), db_name: "u_d".into(), db_user: "u_d".into(), db_pass: "p".into(), ..Default::default() };
+        assert!(build_cms_install(&server, &r, "ex.com", true).is_ok());
+        let gn = CmsInstall { kind: CmsKind::Gnuboard, hestia_user: "u".into(), db_name: "u_d".into(), db_user: "u_d".into(), db_pass: "p".into(), ..Default::default() };
+        assert!(build_cms_install(&server, &gn, "ex.com", true).is_ok());
     }
 
     #[test]

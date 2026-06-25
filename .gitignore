@@ -10,3 +10,6 @@ store.json
 .DS_Store
 .idea/
 *.swp
+
+# 대용량 패키지 아티팩트
+*.zip

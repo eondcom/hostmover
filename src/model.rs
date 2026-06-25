@@ -46,6 +46,152 @@ pub struct Domain {
     /// ④ CMS 접속정보
     #[serde(default)]
     pub cms: CmsAccess,
+    /// eondcms 설치 파라미터 (HestiaCP 멀티테넌트)
+    #[serde(default)]
+    pub eond: EondInstall,
+    /// 일반 CMS(WordPress/Rhymix/그누보드) 설치 파라미터
+    #[serde(default)]
+    pub cms_install: CmsInstall,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// eondcms 신규 설치(HestiaCP) 파라미터. 설치 스크립트 생성에 사용.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct EondInstall {
+    /// 설치 대상: true=현재(ASIS) 서버, false=신규(TOBE) 서버
+    #[serde(default)]
+    pub use_asis: bool,
+    /// root 직접 로그인 불가 → sudo 경유 (ssh user 접속 후 sudo -S bash -s). 기본 켜짐.
+    #[serde(default = "default_true")]
+    pub sudo: bool,
+    /// HestiaCP 유저 (예: jokbo)
+    #[serde(default)]
+    pub hestia_user: String,
+    /// v-add-user 용 비밀번호
+    #[serde(default)]
+    pub hestia_pass: String,
+    /// v-add-user 용 이메일
+    #[serde(default)]
+    pub hestia_email: String,
+    /// HestiaCP 패키지 (기본 default)
+    #[serde(default)]
+    pub package: String,
+    /// uvicorn 포트 (127.0.0.1, 인스턴스 고유, 수동 입력)
+    #[serde(default)]
+    pub port: String,
+    /// DB 짧은 이름 (HestiaCP가 user_ 접두어 자동 추가)
+    #[serde(default)]
+    pub db_name: String,
+    /// DB 짧은 유저명 (HestiaCP가 user_ 접두어 자동 추가)
+    #[serde(default)]
+    pub db_user: String,
+    #[serde(default)]
+    pub db_pass: String,
+    /// Rhymix/XE 테이블 접두어 (기본 xe_)
+    #[serde(default)]
+    pub table_prefix: String,
+    #[serde(default)]
+    pub admin_user: String,
+    #[serde(default)]
+    pub admin_pass: String,
+    /// rsync 소스: dev 머신의 eondcms pythonapp 경로
+    #[serde(default)]
+    pub code_local: String,
+}
+
+impl EondInstall {
+    pub fn package_or_default(&self) -> &str {
+        if self.package.trim().is_empty() { "default" } else { self.package.trim() }
+    }
+    pub fn table_prefix_or_default(&self) -> &str {
+        if self.table_prefix.trim().is_empty() { "xe_" } else { self.table_prefix.trim() }
+    }
+    pub fn admin_user_or_default(&self) -> &str {
+        if self.admin_user.trim().is_empty() { "admin" } else { self.admin_user.trim() }
+    }
+}
+
+/// CMS 종류 (WordPress/Rhymix/그누보드)
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum CmsKind {
+    #[default]
+    WordPress,
+    Rhymix,
+    Gnuboard,
+}
+
+impl CmsKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CmsKind::WordPress => "WordPress",
+            CmsKind::Rhymix => "Rhymix",
+            CmsKind::Gnuboard => "그누보드",
+        }
+    }
+}
+
+/// 일반 CMS(WordPress/Rhymix/그누보드) 설치·업데이트 파라미터 (HestiaCP).
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct CmsInstall {
+    #[serde(default)]
+    pub kind: CmsKind,
+    /// 설치 대상: true=현재(ASIS), false=신규(TOBE)
+    #[serde(default)]
+    pub use_asis: bool,
+    #[serde(default = "default_true")]
+    pub sudo: bool,
+    #[serde(default)]
+    pub hestia_user: String,
+    #[serde(default)]
+    pub hestia_pass: String,
+    #[serde(default)]
+    pub hestia_email: String,
+    #[serde(default)]
+    pub package: String,
+    /// DB 전체이름/유저 (입력 그대로 사용, HestiaCP는 user_ 접두어)
+    #[serde(default)]
+    pub db_name: String,
+    #[serde(default)]
+    pub db_user: String,
+    #[serde(default)]
+    pub db_pass: String,
+    #[serde(default)]
+    pub admin_user: String,
+    #[serde(default)]
+    pub admin_pass: String,
+    /// WordPress 관리자 이메일 (필수)
+    #[serde(default)]
+    pub admin_email: String,
+    /// 사이트 제목 (WordPress)
+    #[serde(default)]
+    pub site_title: String,
+    /// 언어 (기본 ko_KR)
+    #[serde(default)]
+    pub locale: String,
+    /// 버전 (기본 latest)
+    #[serde(default)]
+    pub version: String,
+}
+
+impl CmsInstall {
+    pub fn package_or_default(&self) -> &str {
+        if self.package.trim().is_empty() { "default" } else { self.package.trim() }
+    }
+    pub fn admin_user_or_default(&self) -> &str {
+        if self.admin_user.trim().is_empty() { "admin" } else { self.admin_user.trim() }
+    }
+    pub fn locale_or_default(&self) -> &str {
+        if self.locale.trim().is_empty() { "ko_KR" } else { self.locale.trim() }
+    }
+    pub fn version_or_default(&self) -> &str {
+        if self.version.trim().is_empty() { "latest" } else { self.version.trim() }
+    }
+    pub fn site_title_or_default(&self) -> &str {
+        if self.site_title.trim().is_empty() { "My Site" } else { self.site_title.trim() }
+    }
 }
 
 /// ① 도메인 접속정보
