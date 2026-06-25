@@ -1,6 +1,7 @@
 use crate::model::{CmsAccess, CmsKind, Customer, Domain, DomainAccess, Site, Store};
 use crate::ops::{self, LogMsg, OpKind};
 use crate::store;
+use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 /// 묶음 이전 종류
@@ -94,7 +95,8 @@ pub struct App {
     use_root: bool,
 
     new_customer: String,
-    new_domain: String,
+    /// 고객별 "새 도메인" 입력 버퍼 (고객id → 입력중 문자열). 공유 입력 버그 방지.
+    new_domain: HashMap<u64, String>,
 
     log: Vec<String>,
     running: bool,
@@ -128,7 +130,7 @@ impl App {
             show_lock_pw: false,
             use_root: false,
             new_customer: String::new(),
-            new_domain: String::new(),
+            new_domain: HashMap::new(),
             log: Vec::new(),
             running: false,
             confirm: None,
@@ -439,8 +441,9 @@ impl App {
                 let mut delete_customer: Option<usize> = None;
                 for ci in 0..self.store.customers.len() {
                     let cust_name = self.store.customers[ci].name.clone();
+                    let cust_id = self.store.customers[ci].id;
                     let header = egui::CollapsingHeader::new(format!("🏢 {cust_name}"))
-                        .id_salt(("cust", self.store.customers[ci].id))
+                        .id_salt(("cust", cust_id))
                         .default_open(true);
                     header.show(ui, |ui| {
                         let dlen = self.store.customers[ci].domains.len();
@@ -453,12 +456,22 @@ impl App {
                             }
                         }
                         ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut self.new_domain).hint_text("새 도메인").desired_width(120.0).margin(FIELD_MARGIN));
-                            if ui.button("+ 도메인").clicked() && !self.new_domain.trim().is_empty() {
+                            // 고객별 독립 버퍼 (공유 입력 버그 방지)
+                            let buf = self.new_domain.entry(cust_id).or_default();
+                            ui.add(egui::TextEdit::singleline(buf).hint_text("새 도메인").desired_width(120.0).margin(FIELD_MARGIN));
+                            let add = ui.button("+ 도메인").clicked() && !buf.trim().is_empty();
+                            let name = if add {
+                                let n = buf.trim().to_string();
+                                buf.clear();
+                                n
+                            } else {
+                                String::new()
+                            };
+                            if add {
                                 let id = self.store.alloc_id();
                                 self.store.customers[ci].domains.push(Domain {
                                     id,
-                                    name: self.new_domain.trim().to_string(),
+                                    name,
                                     memo: String::new(),
                                     access: DomainAccess::default(),
                                     asis: Site::default(),
@@ -467,7 +480,6 @@ impl App {
                                     eond: Default::default(),
                                     cms_install: Default::default(),
                                 });
-                                self.new_domain.clear();
                                 self.dirty = true;
                                 self.save();
                             }
@@ -542,6 +554,8 @@ impl App {
 
             let domain = &mut self.store.customers[ci].domains[di];
             let domain_name = domain.name.clone();
+            // 도메인마다 위젯 ID를 분리해 편집 상태(커서/IME)가 도메인 간 공유되는 버그 방지
+            let did = domain.id;
 
             let mut tab = self.tab;
 
@@ -586,6 +600,7 @@ impl App {
             ui.add_space(2.0);
 
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+              ui.push_id(("domain", did), |ui| {
                 match tab {
                     // ───────── 정보 입력 (좌우 배치로 세로 길이 축소) ─────────
                     Tab::Info => {
@@ -833,6 +848,7 @@ impl App {
                         });
                     }
                 }
+              });
             });
 
             // 탭 전환 시: CMS/eondcms 설치 탭은 루트 권한이 필수 → 자동 체크, 벗어나면 해제
