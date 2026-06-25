@@ -1,6 +1,7 @@
 use crate::model::{ActivityLog, CmsAccess, CmsKind, Customer, Domain, DomainAccess, Site, Store};
 use crate::ops::{self, LogMsg, OpKind};
 use crate::store;
+use egui_phosphor::regular as ph;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -97,6 +98,24 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+// 디자인 토큰 (색)
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x3B, 0x82, 0xF6);
+const C_GREEN: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x9E, 0x5B);
+const C_RED: egui::Color32 = egui::Color32::from_rgb(0xC4, 0x5A, 0x5A);
+
+/// 주(primary) 액션 버튼 — 액센트 채움 + 흰 글씨
+fn btn_primary(label: impl Into<String>) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong()).fill(ACCENT)
+}
+/// 긍정(go) 버튼 — 녹색 채움
+fn btn_go(label: impl Into<String>) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong()).fill(C_GREEN)
+}
+/// 위험(danger) 버튼 — 빨강 채움
+fn btn_danger(label: impl Into<String>) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(C_RED)
+}
+
 /// 채움색 + 테두리를 가진 섹션 카드 (배경과 또렷이 구분)
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::group(ui.style())
@@ -161,6 +180,10 @@ pub struct App {
     pending_delete: Option<DelTarget>,
     /// 실행 중인 작업 (도메인id, 제목) — 완료 시 해당 도메인 기록에 추가
     running_job: Option<(u64, String)>,
+    /// 설정 창 표시
+    show_settings: bool,
+    /// 사이트 불러오기 요청 (고객 인덱스)
+    pending_import_sites: Option<usize>,
 
     log: Vec<String>,
     running: bool,
@@ -200,6 +223,8 @@ impl App {
             show_trash: false,
             pending_delete: None,
             running_job: None,
+            show_settings: false,
+            pending_import_sites: None,
             log: Vec::new(),
             running: false,
             confirm: None,
@@ -238,6 +263,150 @@ impl App {
             }
         }
         None
+    }
+
+    fn hestia_test(&mut self) {
+        match ops::hestia_check(&self.store.settings) {
+            Ok(n) => {
+                self.last_ok = Some(true);
+                self.status = format!("HestiaCP 연결 OK — 유저 {n}명");
+                self.log.push(format!("HestiaCP 연결 성공 (유저 {n}명)"));
+            }
+            Err(e) => {
+                self.last_ok = Some(false);
+                self.status = format!("HestiaCP 연결 실패: {e}");
+                self.log.push(format!("HestiaCP 연결 실패: {e}"));
+            }
+        }
+    }
+
+    /// HestiaCP 유저 → 고객으로 불러오기 (이름 중복 제외)
+    fn hestia_import_users(&mut self) {
+        match ops::hestia_list_users(&self.store.settings) {
+            Ok(users) => {
+                let mut added = 0;
+                for u in users {
+                    let exists = self.store.customers.iter().any(|c| c.deleted_at.is_none() && c.name == u);
+                    if !exists {
+                        let id = self.store.alloc_id();
+                        self.store.customers.push(Customer {
+                            id,
+                            name: u,
+                            memo: String::new(),
+                            domains: Vec::new(),
+                            deleted_at: None,
+                        });
+                        added += 1;
+                    }
+                }
+                self.last_ok = Some(true);
+                self.status = format!("고객(유저) {added}명 불러옴");
+                self.log.push(format!("HestiaCP 고객 불러오기: {added}명 추가"));
+                self.dirty = true;
+                self.save();
+            }
+            Err(e) => {
+                self.last_ok = Some(false);
+                self.status = format!("고객 불러오기 실패: {e}");
+                self.log.push(format!("고객 불러오기 실패: {e}"));
+            }
+        }
+    }
+
+    /// 고객(=HestiaCP 유저)의 웹도메인 → 도메인으로 불러오기 (IP/hestia유저 자동 채움)
+    fn hestia_import_sites(&mut self, ci: usize) {
+        let user = match self.store.customers.get(ci) {
+            Some(c) => c.name.clone(),
+            None => return,
+        };
+        match ops::hestia_list_web_domains(&self.store.settings, &user) {
+            Ok(items) => {
+                let mut added = 0;
+                for (dom, ip) in items {
+                    let exists = self.store.customers[ci].domains.iter().any(|d| d.deleted_at.is_none() && d.name == dom);
+                    if exists {
+                        continue;
+                    }
+                    let id = self.store.alloc_id();
+                    let mut nd = Domain {
+                        id,
+                        name: dom,
+                        memo: String::new(),
+                        access: DomainAccess::default(),
+                        asis: Site::default(),
+                        tobe: Site::default(),
+                        cms: CmsAccess::default(),
+                        eond: Default::default(),
+                        cms_install: Default::default(),
+                        deleted_at: None,
+                        history: Vec::new(),
+                    };
+                    nd.tobe.ip = ip;
+                    nd.eond.hestia_user = user.clone();
+                    nd.cms_install.hestia_user = user.clone();
+                    self.store.customers[ci].domains.push(nd);
+                    added += 1;
+                }
+                self.last_ok = Some(true);
+                self.status = format!("{user}: 사이트 {added}개 불러옴");
+                self.log.push(format!("HestiaCP 사이트 불러오기 [{user}]: {added}개 추가"));
+                self.dirty = true;
+                self.save();
+            }
+            Err(e) => {
+                self.last_ok = Some(false);
+                self.status = format!("사이트 불러오기 실패: {e}");
+                self.log.push(format!("사이트 불러오기 실패 [{user}]: {e}"));
+            }
+        }
+    }
+
+    /// ⚙ 설정 창 (HestiaCP 연동)
+    fn settings_modal(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        let show_pw = self.show_pw;
+        let mut do_test = false;
+        let mut do_import_users = false;
+        egui::Window::new("⚙ 설정 — HestiaCP 연동")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let s = &mut self.store.settings;
+                egui::Grid::new("settings_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    grid_label(ui, "호스트");
+                    ui.add(egui::TextEdit::singleline(&mut s.hestia_host).hint_text("HestiaCP IP/도메인").desired_width(230.0).margin(FIELD_MARGIN));
+                    ui.end_row();
+                    grid_label(ui, "포트");
+                    ui.add(egui::TextEdit::singleline(&mut s.hestia_port).hint_text("8083").desired_width(230.0).margin(FIELD_MARGIN));
+                    ui.end_row();
+                    grid_label(ui, "API 해시");
+                    ui.add(egui::TextEdit::singleline(&mut s.hestia_hash).password(!show_pw).hint_text("관리자 > 서버설정 > API 접근키").desired_width(230.0).margin(FIELD_MARGIN));
+                    ui.end_row();
+                    grid_label(ui, "SSL 검증");
+                    ui.checkbox(&mut s.ssl_verify, "자체서명 인증서면 끄기");
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(format!("{}  연결 테스트", ph::PLUGS_CONNECTED)).clicked() {
+                        do_test = true;
+                    }
+                    if ui.add(btn_primary(format!("{}  고객 불러오기", ph::USERS))).clicked() {
+                        do_import_users = true;
+                    }
+                });
+                ui.label(egui::RichText::new("사이트 불러오기는 좌측 고객 옆 📥 버튼으로 (고객별).").weak());
+                ui.label(egui::RichText::new("불러온 도메인은 신규(TOBE) IP + HestiaCP 유저가 자동 입력됩니다.").weak());
+            });
+        self.show_settings = open;
+        if do_test {
+            self.hestia_test();
+        }
+        if do_import_users {
+            self.hestia_import_users();
+        }
     }
 
     fn drain_logs(&mut self) {
@@ -396,9 +565,15 @@ impl eframe::App for App {
         if self.pending_delete.is_some() {
             self.delete_modal(ctx);
         }
+        if self.show_settings {
+            self.settings_modal(ctx);
+        }
 
         self.top_bar(ctx);
         self.left_panel(ctx);
+        if let Some(ci) = self.pending_import_sites.take() {
+            self.hestia_import_sites(ci);
+        }
         self.bottom_log(ctx);
         self.central(ctx);
 
@@ -492,11 +667,12 @@ impl App {
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        let frame = egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 9));
+        egui::TopBottomPanel::top("top").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Hostmover");
                 ui.separator();
-                if ui.button("💾 지금 저장").clicked() {
+                if ui.button(format!("{}  저장", ph::FLOPPY_DISK)).clicked() {
                     self.save();
                 }
                 ui.weak(if self.dirty { "자동저장 대기…" } else { "자동저장됨 ✓" });
@@ -504,6 +680,10 @@ impl App {
                 ui.checkbox(&mut self.show_pw, "비밀번호 표시");
                 ui.checkbox(&mut self.use_root, "루트로 실행")
                     .on_hover_text("켜면 서버루트 계정(있으면)으로 SSH 접속. 명령어 보기에도 반영됨");
+                ui.separator();
+                if ui.button(format!("{}  설정", ph::GEAR)).on_hover_text("HestiaCP 연동 (고객/사이트 불러오기)").clicked() {
+                    self.show_settings = !self.show_settings;
+                }
                 ui.separator();
                 if self.running {
                     ui.spinner();
@@ -583,15 +763,24 @@ impl App {
             let name = self.store.customers[ci].name.clone();
             let collapsed = self.collapsed.contains(&cust_id);
             ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(if collapsed { "▶" } else { "▼" }).small().frame(false)).clicked() {
+                let caret = if collapsed { ph::CARET_RIGHT } else { ph::CARET_DOWN };
+                if ui.add(egui::Button::new(egui::RichText::new(caret).size(15.0)).frame(false)).clicked() {
                     if collapsed { self.collapsed.remove(&cust_id); } else { self.collapsed.insert(cust_id); }
                 }
-                ui.label(egui::RichText::new(format!("🏢 {name}")).strong());
+                ui.label(egui::RichText::new(format!("{}  {name}", ph::BUILDINGS)).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("🗑").on_hover_text("이 고객 삭제(휴지통)").clicked() {
+                    let icon = |ui: &mut egui::Ui, t: &str, col: Option<egui::Color32>, hint: &str| {
+                        let mut rt = egui::RichText::new(t).size(17.0);
+                        if let Some(c) = col { rt = rt.color(c); }
+                        ui.add(egui::Button::new(rt).frame(false)).on_hover_text(hint).clicked()
+                    };
+                    if icon(ui, ph::TRASH, Some(egui::Color32::from_rgb(206, 112, 112)), "이 고객 삭제(휴지통)") {
                         self.pending_delete = Some(DelTarget::Customer(ci));
                     }
-                    if ui.small_button("➕").on_hover_text("새 도메인 추가").clicked() {
+                    if icon(ui, ph::DOWNLOAD_SIMPLE, None, "HestiaCP 사이트 불러오기") {
+                        self.pending_import_sites = Some(ci);
+                    }
+                    if icon(ui, ph::PLUS, None, "새 도메인 추가") {
                         if self.add_open.contains(&cust_id) { self.add_open.remove(&cust_id); } else { self.add_open.insert(cust_id); }
                     }
                 });
@@ -600,17 +789,7 @@ impl App {
                 continue;
             }
             ui.indent(("c", cust_id), |ui| {
-                let dlen = self.store.customers[ci].domains.len();
-                for di in 0..dlen {
-                    if self.store.customers[ci].domains[di].deleted_at.is_some() {
-                        continue;
-                    }
-                    let dname = self.store.customers[ci].domains[di].name.clone();
-                    let selected = self.sel_customer == Some(ci) && self.sel_domain == Some(di);
-                    if ui.selectable_label(selected, format!("🌐 {dname}")).clicked() {
-                        select = Some((ci, di));
-                    }
-                }
+                // 새 도메인 입력칸은 목록 상단에
                 if self.add_open.contains(&cust_id) {
                     ui.horizontal(|ui| {
                         let buf = self.new_domain.entry(cust_id).or_default();
@@ -626,7 +805,7 @@ impl App {
                         };
                         if add {
                             let id = self.store.alloc_id();
-                            self.store.customers[ci].domains.push(Domain {
+                            self.store.customers[ci].domains.insert(0, Domain {
                                 id,
                                 name,
                                 memo: String::new(),
@@ -639,10 +818,23 @@ impl App {
                                 deleted_at: None,
                                 history: Vec::new(),
                             });
+                            self.sel_customer = Some(ci);
+                            self.sel_domain = Some(0);
                             self.dirty = true;
                             self.save();
                         }
                     });
+                }
+                let dlen = self.store.customers[ci].domains.len();
+                for di in 0..dlen {
+                    if self.store.customers[ci].domains[di].deleted_at.is_some() {
+                        continue;
+                    }
+                    let dname = self.store.customers[ci].domains[di].name.clone();
+                    let selected = self.sel_customer == Some(ci) && self.sel_domain == Some(di);
+                    if ui.selectable_label(selected, format!("{}  {dname}", ph::GLOBE)).clicked() {
+                        select = Some((ci, di));
+                    }
                 }
             });
         }
@@ -664,7 +856,7 @@ impl App {
                 any = true;
                 let name = self.store.customers[ci].name.clone();
                 ui.horizontal(|ui| {
-                    ui.label(format!("🏢 {name}"));
+                    ui.label(format!("{}  {name}", ph::BUILDINGS));
                     ui.weak(format!("{}일", remaining_days(ts)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("완전삭제").clicked() { purge = Some(DelTarget::Customer(ci)); }
@@ -678,7 +870,7 @@ impl App {
                         let cn = self.store.customers[ci].name.clone();
                         let dn = self.store.customers[ci].domains[di].name.clone();
                         ui.horizontal(|ui| {
-                            ui.label(format!("🌐 {dn}"));
+                            ui.label(format!("{}  {dn}", ph::GLOBE));
                             ui.weak(format!("{cn} · {}일", remaining_days(ts)));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button("완전삭제").clicked() { purge = Some(DelTarget::Domain(ci, di)); }
@@ -770,7 +962,7 @@ impl App {
                 ui.colored_label(egui::Color32::from_rgb(220, 140, 60), "30일 후 완전삭제됩니다. 그 전엔 휴지통에서 복원 가능.");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("휴지통으로 이동").clicked() {
+                    if ui.add(btn_danger(format!("{}  휴지통으로 이동", ph::TRASH))).clicked() {
                         let now = now_unix();
                         match target {
                             DelTarget::Customer(ci) => {
@@ -794,24 +986,31 @@ impl App {
     }
 
     fn bottom_log(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("log").resizable(true).default_height(170.0).show(ctx, |ui| {
+        let frame = egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 10));
+        egui::TopBottomPanel::bottom("log").resizable(true).default_height(186.0).frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("작업 로그");
-                if ui.small_button("전체 복사").on_hover_text("작업 로그 전체를 클립보드로 복사").clicked() {
-                    ui.ctx().copy_text(self.log.join("\n"));
-                    self.status = "로그 복사됨".into();
-                }
-                if ui.small_button("지우기").clicked() {
-                    self.log.clear();
-                }
+                ui.strong("작업 로그");
+                ui.weak(format!("({}줄)", self.log.len()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(format!("{}  지우기", ph::ERASER)).clicked() {
+                        self.log.clear();
+                    }
+                    if ui.button(format!("{}  전체 복사", ph::COPY)).on_hover_text("작업 로그 전체를 클립보드로 복사").clicked() {
+                        ui.ctx().copy_text(self.log.join("\n"));
+                        self.status = "로그 복사됨".into();
+                    }
+                });
             });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
             egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
                 for line in &self.log {
                     let txt = egui::RichText::new(line).monospace();
                     if is_success_line(line) {
-                        ui.label(txt.color(egui::Color32::from_rgb(60, 190, 100)).strong());
+                        ui.label(txt.color(egui::Color32::from_rgb(74, 200, 120)).strong());
                     } else if is_error_line(line) {
-                        ui.label(txt.color(egui::Color32::from_rgb(230, 95, 95)));
+                        ui.label(txt.color(egui::Color32::from_rgb(236, 110, 110)));
                     } else {
                         ui.label(txt);
                     }
@@ -821,7 +1020,8 @@ impl App {
     }
 
     fn central(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let (ci, di) = match (self.sel_customer, self.sel_domain) {
                 (Some(c), Some(d))
                     if c < self.store.customers.len()
@@ -861,29 +1061,29 @@ impl App {
 
             // ── 헤더 (항상 표시) ──
             ui.horizontal(|ui| {
-                ui.heading(format!("🌐 {}", domain.name));
+                ui.heading(format!("{}  {}", ph::GLOBE, domain.name));
                 if let Some(p) = puny_if_different(&domain.name) {
                     ui.add(egui::Label::new(egui::RichText::new(&p).monospace().weak()).selectable(true))
                         .on_hover_text("퓨니코드 (드래그 복사)");
                 }
                 ui.label(egui::RichText::new(format!("· {customer_name}")).weak());
-                if ui.button("🌐 DNS").on_hover_text("whatsmydns.net 에서 A 레코드 전세계 전파 조회").clicked() {
+                if ui.button(format!("{}  DNS", ph::GLOBE_HEMISPHERE_WEST)).on_hover_text("whatsmydns.net 에서 A 레코드 전세계 전파 조회").clicked() {
                     let host = to_punycode(&domain.name).unwrap_or_else(|| domain.name.trim().to_string());
                     if !host.is_empty() {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://www.whatsmydns.net/#A/{host}")));
                     }
                 }
-                if ui.button("🔎 드라이런").on_hover_text("실행하지 않고 입력값/작업 준비상태를 점검").clicked() {
+                if ui.button(format!("{}  드라이런", ph::MAGNIFYING_GLASS)).on_hover_text("실행하지 않고 입력값/작업 준비상태를 점검").clicked() {
                     dryrun = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🗑 삭제").on_hover_text("이 도메인을 휴지통으로 (확인 후)").clicked() {
+                    if ui.button(format!("{}  삭제", ph::TRASH)).on_hover_text("이 도메인을 휴지통으로 (확인 후)").clicked() {
                         delete_domain = true;
                     }
                 });
             });
             // ── 탭 바 ──
-            ui.add_space(4.0);
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
                 for (t, label) in [
                     (Tab::Info, "  정보  "),
@@ -897,8 +1097,9 @@ impl App {
                     }
                 }
             });
+            ui.add_space(6.0);
             ui.separator();
-            ui.add_space(2.0);
+            ui.add_space(10.0);
 
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
               ui.push_id(("domain", did), |ui| {
@@ -972,16 +1173,16 @@ impl App {
                                 ui.label(egui::RichText::new("백업: 현재→로컬 / 복원: 로컬→신규").weak());
                                 ui.add_space(4.0);
                                 for (label, kind) in [
-                                    ("⬇ DB 백업", OpKind::DbBackup),
-                                    ("⬇ 파일 백업", OpKind::FileBackup),
-                                    ("⬆ DB 복원", OpKind::DbRestore),
-                                    ("⬆ 파일 복원", OpKind::FileRestore),
+                                    (format!("{}  DB 백업", ph::ARROW_LINE_DOWN), OpKind::DbBackup),
+                                    (format!("{}  파일 백업", ph::ARROW_LINE_DOWN), OpKind::FileBackup),
+                                    (format!("{}  DB 복원", ph::ARROW_LINE_UP), OpKind::DbRestore),
+                                    (format!("{}  파일 복원", ph::ARROW_LINE_UP), OpKind::FileRestore),
                                 ] {
                                     ui.horizontal(|ui| {
-                                        if ui.add_enabled(!running, egui::Button::new(label).min_size(egui::vec2(118.0, 0.0))).clicked() {
+                                        if ui.add_enabled(!running, egui::Button::new(&label).min_size(egui::vec2(132.0, 0.0))).clicked() {
                                             request = Some((Req::Op(kind), customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
                                         }
-                                        if ui.button("📋").on_hover_text("명령어만 보기/복사").clicked() {
+                                        if ui.button(ph::FILE_TEXT).on_hover_text("명령어만 보기/복사").clicked() {
                                             view_request = Some((kind, customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
                                         }
                                     });
@@ -993,32 +1194,30 @@ impl App {
                                     ui.label(egui::RichText::new("※ 공간 부족 시 '파일만' → 확보 후 '디비만'").weak());
                                     ui.add_space(4.0);
                                     ui.horizontal_wrapped(|ui| {
-                                        let full = egui::Button::new("🚀 전체 이전").fill(egui::Color32::from_rgb(34, 110, 64));
-                                        if ui.add_enabled(!running, full).clicked() {
+                                        if ui.add_enabled(!running, btn_go(format!("{}  전체 이전", ph::ROCKET_LAUNCH))).clicked() {
                                             request = Some((Req::Migrate(MigrateKind::Full), customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
                                         }
-                                        if ui.add_enabled(!running, egui::Button::new("📁 파일만")).clicked() {
+                                        if ui.add_enabled(!running, egui::Button::new(format!("{}  파일만", ph::FOLDER))).clicked() {
                                             request = Some((Req::Migrate(MigrateKind::FilesOnly), customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
                                         }
-                                        if ui.add_enabled(!running, egui::Button::new("🗄 디비만")).clicked() {
+                                        if ui.add_enabled(!running, egui::Button::new(format!("{}  디비만", ph::DATABASE))).clicked() {
                                             request = Some((Req::Migrate(MigrateKind::DbOnly), customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
                                         }
                                     });
                                 });
                                 ui.add_space(6.0);
                                 card(ui, |ui| {
-                                    ui.strong("⚡ 직접 이전 (디스크 미사용)");
+                                    ui.strong(format!("{}  직접 이전 (디스크 미사용)", ph::LIGHTNING));
                                     ui.label(egui::RichText::new("로컬 저장 없이 신규로 스트리밍").weak());
                                     ui.add_space(4.0);
                                     ui.horizontal_wrapped(|ui| {
-                                        if ui.add_enabled(!running, egui::Button::new("⚡ DB 직접")).clicked() {
+                                        if ui.add_enabled(!running, egui::Button::new(format!("{}  DB 직접", ph::LIGHTNING))).clicked() {
                                             request = Some((Req::Op(OpKind::DbDirect), customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
                                         }
-                                        if ui.add_enabled(!running, egui::Button::new("⚡ 파일 직접")).clicked() {
+                                        if ui.add_enabled(!running, egui::Button::new(format!("{}  파일 직접", ph::LIGHTNING))).clicked() {
                                             request = Some((Req::Op(OpKind::FileDirect), customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
                                         }
-                                        let all = egui::Button::new("⚡ 전체 직접").fill(egui::Color32::from_rgb(46, 70, 120));
-                                        if ui.add_enabled(!running, all).clicked() {
+                                        if ui.add_enabled(!running, btn_primary(format!("{}  전체 직접", ph::LIGHTNING))).clicked() {
                                             request = Some((Req::Migrate(MigrateKind::Direct), customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
                                         }
                                     });
@@ -1071,17 +1270,16 @@ impl App {
                             ui.label(egui::RichText::new(hint).weak());
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                if ui.add_enabled(!running, egui::Button::new("설치").min_size(egui::vec2(140.0, 0.0))).clicked() {
+                                if ui.add_enabled(!running, btn_primary(format!("{}  설치", ph::DOWNLOAD)).min_size(egui::vec2(132.0, 0.0))).clicked() {
                                     cms_step = Some((1, true));
                                 }
-                                if ui.button("📋").on_hover_text("설치 명령어 보기").clicked() {
+                                if ui.button(ph::FILE_TEXT).on_hover_text("설치 명령어 보기").clicked() {
                                     cms_step = Some((1, false));
                                 }
-                                let upd = egui::Button::new("🔄 업데이트").min_size(egui::vec2(140.0, 0.0)).fill(egui::Color32::from_rgb(46, 70, 120));
-                                if ui.add_enabled(!running, upd).clicked() {
+                                if ui.add_enabled(!running, egui::Button::new(format!("{}  업데이트", ph::ARROWS_CLOCKWISE)).min_size(egui::vec2(132.0, 0.0))).clicked() {
                                     cms_step = Some((2, true));
                                 }
-                                if ui.button("📋 ").on_hover_text("업데이트 명령어 보기").clicked() {
+                                if ui.add(egui::Button::new(ph::FILE_TEXT).frame(true)).on_hover_text("업데이트 명령어 보기").clicked() {
                                     cms_step = Some((2, false));
                                 }
                             });
@@ -1123,10 +1321,16 @@ impl App {
                             ui.add_space(4.0);
                             for (n, label) in [(1u8, "① 리소스 생성"), (2, "② 코드 업로드"), (3, "③ 설치 마무리")] {
                                 ui.horizontal(|ui| {
-                                    if ui.add_enabled(!running, egui::Button::new(label).min_size(egui::vec2(140.0, 0.0))).clicked() {
+                                    let b = egui::Button::new(label).min_size(egui::vec2(150.0, 0.0));
+                                    let resp = if n == 3 {
+                                        ui.add_enabled(!running, btn_primary(label).min_size(egui::vec2(150.0, 0.0)))
+                                    } else {
+                                        ui.add_enabled(!running, b)
+                                    };
+                                    if resp.clicked() {
                                         eond_step = Some((n, true));
                                     }
-                                    if ui.button("📋").on_hover_text("명령어 보기").clicked() {
+                                    if ui.button(ph::FILE_TEXT).on_hover_text("명령어 보기").clicked() {
                                         eond_step = Some((n, false));
                                     }
                                 });
@@ -1135,14 +1339,13 @@ impl App {
                         ui.add_space(6.0);
                         card(ui, |ui| {
                             ui.strong("코드 업데이트 (이미 설치된 인스턴스)");
-                            ui.label(egui::RichText::new("② 코드 업로드 → 🔄 업데이트 (v-*/SSL/nginx 생략, 재시작 포함)").weak());
+                            ui.label(egui::RichText::new(format!("② 코드 업로드 → {} 업데이트 (v-*/SSL/nginx 생략, 재시작 포함)", ph::ARROWS_CLOCKWISE)).weak());
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                let btn = egui::Button::new("🔄 업데이트").min_size(egui::vec2(140.0, 0.0)).fill(egui::Color32::from_rgb(46, 70, 120));
-                                if ui.add_enabled(!running, btn).clicked() {
+                                if ui.add_enabled(!running, egui::Button::new(format!("{}  업데이트", ph::ARROWS_CLOCKWISE)).min_size(egui::vec2(150.0, 0.0))).clicked() {
                                     eond_step = Some((4, true));
                                 }
-                                if ui.button("📋").on_hover_text("명령어 보기").clicked() {
+                                if ui.button(ph::FILE_TEXT).on_hover_text("명령어 보기").clicked() {
                                     eond_step = Some((4, false));
                                 }
                             });
@@ -1344,7 +1547,7 @@ impl App {
                 ui.colored_label(egui::Color32::from_rgb(220, 140, 60), format!("대상을 덮어씁니다: {target}"));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("실행").clicked() {
+                    if ui.add(btn_primary(format!("{}  실행", ph::PLAY))).clicked() {
                         if let Some(a) = self.confirm.take() {
                             self.start_action(a, ctx);
                         }
@@ -1367,7 +1570,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.label("실제 실행되는 쉘 명령입니다. 복사해서 직접 실행할 수도 있습니다.");
                 ui.horizontal(|ui| {
-                    if ui.button("전체 복사").clicked() {
+                    if ui.button(format!("{}  전체 복사", ph::COPY)).clicked() {
                         ui.ctx().copy_text(cv.command.clone());
                     }
                     if ui.button("닫기").clicked() {
@@ -1406,7 +1609,7 @@ impl App {
                 ui.colored_label(egui::Color32::from_rgb(220, 140, 60), "대상 서버 상태를 변경합니다.");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("실행").clicked() {
+                    if ui.add(btn_primary(format!("{}  실행", ph::PLAY))).clicked() {
                         if let Some(job) = self.eond_confirm.take() {
                             self.running = true;
                             self.last_ok = None;
@@ -1594,15 +1797,15 @@ fn site_fields(ui: &mut egui::Ui, s: &mut Site, show_pw: bool) -> bool {
 fn site_actions(ui: &mut egui::Ui, enabled: bool) -> SiteActions {
     let mut act = SiteActions::default();
     ui.horizontal_wrapped(|ui| {
-        if ui.add_enabled(enabled, egui::Button::new("🔌 접속 테스트"))
+        if ui.add_enabled(enabled, egui::Button::new(format!("{}  접속 테스트", ph::PLUGS_CONNECTED)))
             .on_hover_text("SSH 로그인 성공 여부 + 원격 도구(mysqldump/rsync/tar) 확인").clicked() { act.test = true; }
-        if ui.add_enabled(enabled, egui::Button::new("🔒 인증서 확인"))
+        if ui.add_enabled(enabled, egui::Button::new(format!("{}  인증서 확인", ph::LOCK_KEY)))
             .on_hover_text("IP:443 에 SNI=도메인으로 접속해 SSL 인증서 설치/유효 확인").clicked() { act.cert = true; }
-        if ui.add_enabled(enabled, egui::Button::new("🩺 사이트 점검"))
+        if ui.add_enabled(enabled, egui::Button::new(format!("{}  사이트 점검", ph::HEARTBEAT)))
             .on_hover_text("SSH 로 PHP 버전/웹루트 권한/에러로그 확인 (500 등 진단)").clicked() { act.verify = true; }
-        if ui.add_enabled(enabled, egui::Button::new("🔧 htaccess 수정"))
+        if ui.add_enabled(enabled, egui::Button::new(format!("{}  htaccess 수정", ph::WRENCH)))
             .on_hover_text("PHP-FPM 서버에서 500 유발하는 .htaccess php_flag/php_value 줄을 백업 후 주석처리").clicked() { act.fix_htaccess = true; }
-        if ui.add_enabled(enabled, egui::Button::new("🛠 DB정보 반영"))
+        if ui.add_enabled(enabled, egui::Button::new(format!("{}  DB정보 반영", ph::DATABASE)))
             .on_hover_text("설정파일(wp-config 등) DB접속정보를 이 사이트의 DB칸 값으로 교체 (백업 후)").clicked() { act.set_db = true; }
     });
     act

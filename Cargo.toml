@@ -12,6 +12,7 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 rand = "0.8"
 idna = "1"
+egui-phosphor = "0.9"
 
 [profile.release]
 opt-level = 2

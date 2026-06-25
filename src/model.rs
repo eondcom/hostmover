@@ -7,6 +7,29 @@ pub struct Store {
     pub next_id: u64,
     #[serde(default)]
     pub customers: Vec<Customer>,
+    #[serde(default)]
+    pub settings: Settings,
+}
+
+/// 앱 설정 (HestiaCP 연동 등). 암호화 저장.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct Settings {
+    #[serde(default)]
+    pub hestia_host: String,
+    #[serde(default)]
+    pub hestia_port: String,
+    /// HestiaCP API 접근 해시 (관리자 > 서버설정 > API)
+    #[serde(default)]
+    pub hestia_hash: String,
+    /// SSL 인증서 검증 (자체서명이면 끄기)
+    #[serde(default)]
+    pub ssl_verify: bool,
+}
+
+impl Settings {
+    pub fn port_or_default(&self) -> &str {
+        if self.hestia_port.trim().is_empty() { "8083" } else { self.hestia_port.trim() }
+    }
 }
 
 impl Store {

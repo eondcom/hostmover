@@ -31,6 +31,8 @@ fn setup_fonts(ctx: &egui::Context) {
     fonts
         .families
         .insert(egui::FontFamily::Name("bold".into()), vec!["ko_bold".to_owned(), "ko".to_owned()]);
+    // Phosphor 아이콘 폰트(일관된 전문 아이콘 세트)를 폴백으로 추가
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
 }
 

@@ -795,6 +795,89 @@ echo "== eondcms 업데이트 완료: $DOMAIN =="
     })
 }
 
+// ===== HestiaCP API 연동 (고객/사이트 불러오기) =====
+use crate::model::Settings;
+
+/// HestiaCP API 호출 스크립트 생성. 해시는 -K(stdin) 설정으로 전달해 argv 노출 방지.
+fn hestia_api_job(s: &Settings, cmd: &str, args: &[&str]) -> (String, Vec<(String, String)>) {
+    let kflag = if s.ssl_verify { "" } else { "-k " };
+    let url = format!("https://{}:{}/api/", s.hestia_host.trim(), s.port_or_default());
+    let mut data = format!("--data-urlencode {} --data-urlencode {}", sq("returncode=no"), sq(&format!("cmd={cmd}")));
+    for (i, a) in args.iter().enumerate() {
+        data += &format!(" --data-urlencode {}", sq(&format!("arg{}={}", i + 1, a)));
+    }
+    let script = format!(
+        "curl -sS {kflag}--max-time 30 -X POST {url} {data} -K - <<HM_CFG\ndata-urlencode = \"hash=$HM_HHASH\"\nHM_CFG",
+        kflag = kflag, url = sq(&url), data = data,
+    );
+    (script, vec![("HM_HHASH".to_string(), s.hestia_hash.clone())])
+}
+
+fn run_capture(script: &str, env: &[(String, String)]) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c").arg(script);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().map_err(|e| format!("실행 실패: {e}"))?;
+    if !out.status.success() {
+        let code = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim();
+        let hint = match code.as_str() {
+            "6" => " (호스트 DNS 조회 실패)",
+            "7" => " (연결 거부 — 포트/방화벽 확인)",
+            "28" => " (타임아웃)",
+            "35" | "60" => " (SSL 오류 — SSL검증 끄거나 인증서 확인)",
+            _ => "",
+        };
+        return Err(format!("curl exit {code}{hint}: {err}"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn parse_json(out: &str) -> Result<serde_json::Value, String> {
+    let t = out.trim();
+    if t.is_empty() {
+        return Err("빈 응답 (호스트/포트/해시 확인)".into());
+    }
+    serde_json::from_str(t).map_err(|e| {
+        let head: String = t.chars().take(160).collect();
+        format!("JSON 파싱 실패({e}). 응답: {head}")
+    })
+}
+
+/// 연결 확인 — 유저 수 반환
+pub fn hestia_check(s: &Settings) -> Result<usize, String> {
+    if s.hestia_host.trim().is_empty() || s.hestia_hash.trim().is_empty() {
+        return Err("호스트와 API 해시를 입력하세요".into());
+    }
+    Ok(hestia_list_users(s)?.len())
+}
+
+/// 전체 유저(고객) 목록
+pub fn hestia_list_users(s: &Settings) -> Result<Vec<String>, String> {
+    let (script, env) = hestia_api_job(s, "v-list-users", &["json"]);
+    let out = run_capture(&script, &env)?;
+    let v = parse_json(&out)?;
+    let obj = v.as_object().ok_or("유저 목록 형식 오류 (인증 실패일 수 있음)")?;
+    Ok(obj.keys().cloned().collect())
+}
+
+/// 특정 유저의 웹도메인 목록 (도메인, IP)
+pub fn hestia_list_web_domains(s: &Settings, user: &str) -> Result<Vec<(String, String)>, String> {
+    let (script, env) = hestia_api_job(s, "v-list-web-domains", &[user, "json"]);
+    let out = run_capture(&script, &env)?;
+    let v = parse_json(&out)?;
+    let obj = v.as_object().ok_or("도메인 목록 형식 오류")?;
+    let mut res = Vec::new();
+    for (dom, fields) in obj {
+        let ip = fields.get("IP").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        res.push((dom.clone(), ip));
+    }
+    Ok(res)
+}
+
 // ===== 일반 CMS 설치 (WordPress / Rhymix / 그누보드) =====
 
 fn cms_validate(server: &Site, c: &CmsInstall, use_root: bool, need_admin: bool) -> Result<(), String> {
