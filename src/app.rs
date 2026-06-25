@@ -1,4 +1,4 @@
-use crate::model::{CmsAccess, CmsKind, Customer, Domain, DomainAccess, Site, Store};
+use crate::model::{ActivityLog, CmsAccess, CmsKind, Customer, Domain, DomainAccess, Site, Store};
 use crate::ops::{self, LogMsg, OpKind};
 use crate::store;
 use std::collections::HashMap;
@@ -41,6 +41,28 @@ enum Tab {
     Migrate,
     Cms,
     Eond,
+    History,
+}
+
+/// 휴지통 보관 기간 (30일)
+const TRASH_RETENTION_SECS: i64 = 30 * 24 * 3600;
+
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// 삭제 시각으로부터 완전삭제까지 남은 일수
+fn remaining_days(deleted_at: i64) -> i64 {
+    let elapsed = now_unix() - deleted_at;
+    ((TRASH_RETENTION_SECS - elapsed) / (24 * 3600)).max(0)
+}
+
+/// 삭제 확인 대상
+#[derive(Clone, Copy)]
+enum DelTarget {
+    Customer(usize),
+    Domain(usize, usize),
 }
 
 /// 락 화면 입력/버튼 공통 치수
@@ -51,6 +73,38 @@ const LOCK_PAD: egui::Vec2 = egui::vec2(14.0, 9.0);
 const FIELD_MARGIN: egui::Vec2 = egui::vec2(8.0, 9.0);
 /// 그리드 라벨 칸 고정 폭 — 입력칸 시작점을 섹션 간 정렬
 const LABEL_W: f32 = 116.0;
+
+/// unix초 → "YYYY-MM-DD HH:MM" (KST, +9h)
+fn fmt_kst(ts: i64) -> String {
+    let t = ts + 9 * 3600;
+    let days = t.div_euclid(86400);
+    let secs = t.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, (secs % 3600) / 60)
+}
+
+/// days(에포크 기준) → (년,월,일). Howard Hinnant 알고리즘.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 채움색 + 테두리를 가진 섹션 카드 (배경과 또렷이 구분)
+fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().faint_bg_color)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, add)
+        .inner
+}
 
 /// 고정 폭 라벨 셀 (그리드 정렬용)
 fn grid_label(ui: &mut egui::Ui, text: &str) {
@@ -97,6 +151,16 @@ pub struct App {
     new_customer: String,
     /// 고객별 "새 도메인" 입력 버퍼 (고객id → 입력중 문자열). 공유 입력 버그 방지.
     new_domain: HashMap<u64, String>,
+    /// ➕ 로 새 도메인 입력칸을 펼친 고객 id 집합
+    add_open: std::collections::HashSet<u64>,
+    /// 접힌 고객 id 집합 (기본 펼침)
+    collapsed: std::collections::HashSet<u64>,
+    /// 휴지통 보기 모드
+    show_trash: bool,
+    /// 삭제 확인 모달 대상
+    pending_delete: Option<DelTarget>,
+    /// 실행 중인 작업 (도메인id, 제목) — 완료 시 해당 도메인 기록에 추가
+    running_job: Option<(u64, String)>,
 
     log: Vec<String>,
     running: bool,
@@ -131,6 +195,11 @@ impl App {
             use_root: false,
             new_customer: String::new(),
             new_domain: HashMap::new(),
+            add_open: std::collections::HashSet::new(),
+            collapsed: std::collections::HashSet::new(),
+            show_trash: false,
+            pending_delete: None,
+            running_job: None,
             log: Vec::new(),
             running: false,
             confirm: None,
@@ -152,6 +221,25 @@ impl App {
         }
     }
 
+    /// 현재 선택된 도메인의 id
+    fn current_domain_id(&self) -> Option<u64> {
+        let c = self.sel_customer?;
+        let d = self.sel_domain?;
+        self.store.customers.get(c)?.domains.get(d).map(|dom| dom.id)
+    }
+
+    /// id 로 도메인 가변 참조 검색
+    fn find_domain_mut(&mut self, id: u64) -> Option<&mut Domain> {
+        for c in &mut self.store.customers {
+            for d in &mut c.domains {
+                if d.id == id {
+                    return Some(d);
+                }
+            }
+        }
+        None
+    }
+
     fn drain_logs(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -166,6 +254,18 @@ impl App {
                     self.running = false;
                     self.last_ok = Some(ok);
                     self.status = if ok { "성공".into() } else { "실패 (로그 확인)".into() };
+                    // 작업 기록을 해당 도메인 이력에 추가
+                    if let Some((dom_id, title)) = self.running_job.take() {
+                        if let Some(dom) = self.find_domain_mut(dom_id) {
+                            dom.history.push(ActivityLog { at: now_unix(), title, ok });
+                            if dom.history.len() > 300 {
+                                let cut = dom.history.len() - 300;
+                                dom.history.drain(0..cut);
+                            }
+                            self.dirty = true;
+                            self.save();
+                        }
+                    }
                 }
                 LogMsg::Detected { is_tobe, db } => {
                     self.apply_detected(is_tobe, db);
@@ -227,6 +327,16 @@ impl App {
                 Ok(job) => {
                     self.running = true;
                     self.status = "작업 실행 중...".into();
+                    // 진단(테스트/인증서/점검)은 기록하지 않음, 나머지(백업/복원/직접/수정)는 기록
+                    let record = !matches!(
+                        kind,
+                        OpKind::TestAsis | OpKind::TestTobe | OpKind::CertAsis | OpKind::CertTobe | OpKind::VerifyAsis | OpKind::VerifyTobe
+                    );
+                    self.running_job = if record {
+                        self.current_domain_id().map(|id| (id, job.title.clone()))
+                    } else {
+                        None
+                    };
                     let ctx2 = ctx.clone();
                     let repaint = move || ctx2.request_repaint();
                     match kind {
@@ -243,6 +353,13 @@ impl App {
             Req::Migrate(kind) => {
                 self.running = true;
                 self.status = "묶음 이전 실행 중...".into();
+                let title = match kind {
+                    MigrateKind::Full => "전체 이전",
+                    MigrateKind::FilesOnly => "파일만 이전",
+                    MigrateKind::DbOnly => "디비만 이전",
+                    MigrateKind::Direct => "전체 직접 이전",
+                };
+                self.running_job = self.current_domain_id().map(|id| (id, title.to_string()));
                 let ctx2 = ctx.clone();
                 let steps = match kind {
                     MigrateKind::Full => {
@@ -275,6 +392,9 @@ impl eframe::App for App {
         }
         if self.eond_confirm.is_some() {
             self.eond_confirm_modal(ctx);
+        }
+        if self.pending_delete.is_some() {
+            self.delete_modal(ctx);
         }
 
         self.top_bar(ctx);
@@ -356,6 +476,7 @@ impl App {
                                 self.store = s;
                                 self.master_pw = std::mem::take(&mut self.password);
                                 self.locked = false;
+                                self.purge_old_trash();
                             }
                             Err(e) => self.auth_error = e,
                         }
@@ -418,7 +539,7 @@ impl App {
     }
 
     fn left_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("tree").resizable(true).default_width(240.0).show(ctx, |ui| {
+        egui::SidePanel::left("tree").resizable(true).default_width(252.0).show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.new_customer).hint_text("새 고객명").desired_width(140.0).margin(FIELD_MARGIN));
@@ -429,75 +550,247 @@ impl App {
                         name: self.new_customer.trim().to_string(),
                         memo: String::new(),
                         domains: Vec::new(),
+                        deleted_at: None,
                     });
                     self.new_customer.clear();
                     self.dirty = true;
                     self.save();
                 }
             });
+            let tn = self.trash_count();
+            if ui.selectable_label(self.show_trash, format!("🗑 휴지통 ({tn})")).clicked() {
+                self.show_trash = !self.show_trash;
+            }
             ui.separator();
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut delete_customer: Option<usize> = None;
-                for ci in 0..self.store.customers.len() {
-                    let cust_name = self.store.customers[ci].name.clone();
-                    let cust_id = self.store.customers[ci].id;
-                    let header = egui::CollapsingHeader::new(format!("🏢 {cust_name}"))
-                        .id_salt(("cust", cust_id))
-                        .default_open(true);
-                    header.show(ui, |ui| {
-                        let dlen = self.store.customers[ci].domains.len();
-                        for di in 0..dlen {
-                            let dname = self.store.customers[ci].domains[di].name.clone();
-                            let selected = self.sel_customer == Some(ci) && self.sel_domain == Some(di);
-                            if ui.selectable_label(selected, format!("🌐 {dname}")).clicked() {
-                                self.sel_customer = Some(ci);
-                                self.sel_domain = Some(di);
-                            }
-                        }
-                        ui.horizontal(|ui| {
-                            // 고객별 독립 버퍼 (공유 입력 버그 방지)
-                            let buf = self.new_domain.entry(cust_id).or_default();
-                            ui.add(egui::TextEdit::singleline(buf).hint_text("새 도메인").desired_width(120.0).margin(FIELD_MARGIN));
-                            let add = ui.button("+ 도메인").clicked() && !buf.trim().is_empty();
-                            let name = if add {
-                                let n = buf.trim().to_string();
-                                buf.clear();
-                                n
-                            } else {
-                                String::new()
-                            };
-                            if add {
-                                let id = self.store.alloc_id();
-                                self.store.customers[ci].domains.push(Domain {
-                                    id,
-                                    name,
-                                    memo: String::new(),
-                                    access: DomainAccess::default(),
-                                    asis: Site::default(),
-                                    tobe: Site::default(),
-                                    cms: CmsAccess::default(),
-                                    eond: Default::default(),
-                                    cms_install: Default::default(),
-                                });
-                                self.dirty = true;
-                                self.save();
-                            }
-                        });
-                        if ui.small_button("🗑 이 고객 삭제").clicked() {
-                            delete_customer = Some(ci);
-                        }
-                    });
-                }
-                if let Some(ci) = delete_customer {
-                    self.store.customers.remove(ci);
-                    self.sel_customer = None;
-                    self.sel_domain = None;
-                    self.dirty = true;
-                    self.save();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                if self.show_trash {
+                    self.trash_view(ui);
+                } else {
+                    self.tree_view(ui);
                 }
             });
         });
+    }
+
+    /// 고객→도메인 트리 (삭제되지 않은 것만)
+    fn tree_view(&mut self, ui: &mut egui::Ui) {
+        let mut select: Option<(usize, usize)> = None;
+        for ci in 0..self.store.customers.len() {
+            if self.store.customers[ci].deleted_at.is_some() {
+                continue;
+            }
+            let cust_id = self.store.customers[ci].id;
+            let name = self.store.customers[ci].name.clone();
+            let collapsed = self.collapsed.contains(&cust_id);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(if collapsed { "▶" } else { "▼" }).small().frame(false)).clicked() {
+                    if collapsed { self.collapsed.remove(&cust_id); } else { self.collapsed.insert(cust_id); }
+                }
+                ui.label(egui::RichText::new(format!("🏢 {name}")).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("🗑").on_hover_text("이 고객 삭제(휴지통)").clicked() {
+                        self.pending_delete = Some(DelTarget::Customer(ci));
+                    }
+                    if ui.small_button("➕").on_hover_text("새 도메인 추가").clicked() {
+                        if self.add_open.contains(&cust_id) { self.add_open.remove(&cust_id); } else { self.add_open.insert(cust_id); }
+                    }
+                });
+            });
+            if collapsed {
+                continue;
+            }
+            ui.indent(("c", cust_id), |ui| {
+                let dlen = self.store.customers[ci].domains.len();
+                for di in 0..dlen {
+                    if self.store.customers[ci].domains[di].deleted_at.is_some() {
+                        continue;
+                    }
+                    let dname = self.store.customers[ci].domains[di].name.clone();
+                    let selected = self.sel_customer == Some(ci) && self.sel_domain == Some(di);
+                    if ui.selectable_label(selected, format!("🌐 {dname}")).clicked() {
+                        select = Some((ci, di));
+                    }
+                }
+                if self.add_open.contains(&cust_id) {
+                    ui.horizontal(|ui| {
+                        let buf = self.new_domain.entry(cust_id).or_default();
+                        let resp = ui.add(egui::TextEdit::singleline(buf).hint_text("새 도메인").desired_width(120.0).margin(FIELD_MARGIN));
+                        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let add = (ui.button("추가").clicked() || enter) && !buf.trim().is_empty();
+                        let name = if add {
+                            let n = buf.trim().to_string();
+                            buf.clear();
+                            n
+                        } else {
+                            String::new()
+                        };
+                        if add {
+                            let id = self.store.alloc_id();
+                            self.store.customers[ci].domains.push(Domain {
+                                id,
+                                name,
+                                memo: String::new(),
+                                access: DomainAccess::default(),
+                                asis: Site::default(),
+                                tobe: Site::default(),
+                                cms: CmsAccess::default(),
+                                eond: Default::default(),
+                                cms_install: Default::default(),
+                                deleted_at: None,
+                                history: Vec::new(),
+                            });
+                            self.dirty = true;
+                            self.save();
+                        }
+                    });
+                }
+            });
+        }
+        if let Some((ci, di)) = select {
+            self.sel_customer = Some(ci);
+            self.sel_domain = Some(di);
+        }
+    }
+
+    /// 휴지통: 삭제된 고객/도메인 + 복원/완전삭제 + 남은 일수
+    fn trash_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("삭제 항목 — 30일 후 자동 완전삭제").weak());
+        ui.add_space(4.0);
+        let mut restore: Option<DelTarget> = None;
+        let mut purge: Option<DelTarget> = None;
+        let mut any = false;
+        for ci in 0..self.store.customers.len() {
+            if let Some(ts) = self.store.customers[ci].deleted_at {
+                any = true;
+                let name = self.store.customers[ci].name.clone();
+                ui.horizontal(|ui| {
+                    ui.label(format!("🏢 {name}"));
+                    ui.weak(format!("{}일", remaining_days(ts)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("완전삭제").clicked() { purge = Some(DelTarget::Customer(ci)); }
+                        if ui.small_button("복원").clicked() { restore = Some(DelTarget::Customer(ci)); }
+                    });
+                });
+            } else {
+                for di in 0..self.store.customers[ci].domains.len() {
+                    if let Some(ts) = self.store.customers[ci].domains[di].deleted_at {
+                        any = true;
+                        let cn = self.store.customers[ci].name.clone();
+                        let dn = self.store.customers[ci].domains[di].name.clone();
+                        ui.horizontal(|ui| {
+                            ui.label(format!("🌐 {dn}"));
+                            ui.weak(format!("{cn} · {}일", remaining_days(ts)));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("완전삭제").clicked() { purge = Some(DelTarget::Domain(ci, di)); }
+                                if ui.small_button("복원").clicked() { restore = Some(DelTarget::Domain(ci, di)); }
+                            });
+                        });
+                    }
+                }
+            }
+        }
+        if !any {
+            ui.weak("(비어 있음)");
+        }
+        if let Some(t) = restore {
+            match t {
+                DelTarget::Customer(ci) => self.store.customers[ci].deleted_at = None,
+                DelTarget::Domain(ci, di) => self.store.customers[ci].domains[di].deleted_at = None,
+            }
+            self.dirty = true;
+            self.save();
+        }
+        if let Some(t) = purge {
+            match t {
+                DelTarget::Customer(ci) => { self.store.customers.remove(ci); }
+                DelTarget::Domain(ci, di) => { self.store.customers[ci].domains.remove(di); }
+            }
+            self.sel_customer = None;
+            self.sel_domain = None;
+            self.dirty = true;
+            self.save();
+        }
+    }
+
+    fn trash_count(&self) -> usize {
+        let mut n = 0;
+        for c in &self.store.customers {
+            if c.deleted_at.is_some() {
+                n += 1;
+            } else {
+                n += c.domains.iter().filter(|d| d.deleted_at.is_some()).count();
+            }
+        }
+        n
+    }
+
+    /// 30일 지난 휴지통 항목 완전삭제 (잠금 해제 시 1회)
+    fn purge_old_trash(&mut self) {
+        let cutoff = now_unix() - TRASH_RETENTION_SECS;
+        let mut changed = false;
+        for c in &mut self.store.customers {
+            let before = c.domains.len();
+            c.domains.retain(|d| d.deleted_at.map_or(true, |t| t > cutoff));
+            if c.domains.len() != before {
+                changed = true;
+            }
+        }
+        let before = self.store.customers.len();
+        self.store.customers.retain(|c| c.deleted_at.map_or(true, |t| t > cutoff));
+        if self.store.customers.len() != before {
+            changed = true;
+        }
+        if changed {
+            self.sel_customer = None;
+            self.sel_domain = None;
+            self.dirty = true;
+            self.save();
+        }
+    }
+
+    /// 삭제 확인 모달 (휴지통으로 이동)
+    fn delete_modal(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.pending_delete else { return };
+        let (title, msg) = match target {
+            DelTarget::Customer(ci) => {
+                let name = self.store.customers.get(ci).map(|c| c.name.clone()).unwrap_or_default();
+                ("고객 삭제", format!("고객 '{name}' 와 하위 도메인 전체를 휴지통으로 이동합니다."))
+            }
+            DelTarget::Domain(ci, di) => {
+                let name = self.store.customers.get(ci).and_then(|c| c.domains.get(di)).map(|d| d.name.clone()).unwrap_or_default();
+                ("도메인 삭제", format!("도메인 '{name}' 을 휴지통으로 이동합니다."))
+            }
+        };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(msg);
+                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), "30일 후 완전삭제됩니다. 그 전엔 휴지통에서 복원 가능.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("휴지통으로 이동").clicked() {
+                        let now = now_unix();
+                        match target {
+                            DelTarget::Customer(ci) => {
+                                if let Some(c) = self.store.customers.get_mut(ci) { c.deleted_at = Some(now); }
+                                if self.sel_customer == Some(ci) { self.sel_customer = None; self.sel_domain = None; }
+                            }
+                            DelTarget::Domain(ci, di) => {
+                                if let Some(d) = self.store.customers.get_mut(ci).and_then(|c| c.domains.get_mut(di)) { d.deleted_at = Some(now); }
+                                if self.sel_customer == Some(ci) && self.sel_domain == Some(di) { self.sel_domain = None; }
+                            }
+                        }
+                        self.pending_delete = None;
+                        self.dirty = true;
+                        self.save();
+                    }
+                    if ui.button("취소").clicked() {
+                        self.pending_delete = None;
+                    }
+                });
+            });
     }
 
     fn bottom_log(&mut self, ctx: &egui::Context) {
@@ -530,7 +823,14 @@ impl App {
     fn central(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             let (ci, di) = match (self.sel_customer, self.sel_domain) {
-                (Some(c), Some(d)) if c < self.store.customers.len() && d < self.store.customers[c].domains.len() => (c, d),
+                (Some(c), Some(d))
+                    if c < self.store.customers.len()
+                        && d < self.store.customers[c].domains.len()
+                        && self.store.customers[c].deleted_at.is_none()
+                        && self.store.customers[c].domains[d].deleted_at.is_none() =>
+                {
+                    (c, d)
+                }
                 _ => {
                     ui.centered_and_justified(|ui| {
                         ui.label("좌측에서 도메인을 선택하거나 새로 추가하세요");
@@ -577,7 +877,7 @@ impl App {
                     dryrun = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🗑 삭제").clicked() {
+                    if ui.button("🗑 삭제").on_hover_text("이 도메인을 휴지통으로 (확인 후)").clicked() {
                         delete_domain = true;
                     }
                 });
@@ -590,6 +890,7 @@ impl App {
                     (Tab::Migrate, "  사이트이전  "),
                     (Tab::Cms, "  CMS설치  "),
                     (Tab::Eond, "  eondcms  "),
+                    (Tab::History, "  기록  "),
                 ] {
                     if ui.selectable_label(tab == t, label).clicked() {
                         tab = t;
@@ -611,11 +912,11 @@ impl App {
                         ui.add_space(6.0);
                         // ① 도메인 접속 / ④ CMS 좌우
                         ui.columns(2, |cols| {
-                            cols[0].group(|ui| {
+                            card(&mut cols[0], |ui| {
                                 ui.strong("① 도메인 접속정보 (네임서버 수동)");
                                 changed |= access_editor(ui, &mut domain.access, show_pw);
                             });
-                            cols[1].group(|ui| {
+                            card(&mut cols[1], |ui| {
                                 ui.strong("④ CMS 접속정보");
                                 changed |= cms_editor(ui, &mut domain.cms, show_pw);
                             });
@@ -623,11 +924,11 @@ impl App {
                         ui.add_space(6.0);
                         // ② 현재 / ③ 신규 좌우
                         ui.columns(2, |cols| {
-                            cols[0].group(|ui| {
+                            card(&mut cols[0], |ui| {
                                 ui.strong("② 현재 사이트 (ASIS)");
                                 changed |= site_fields(ui, &mut domain.asis, show_pw);
                             });
-                            cols[1].group(|ui| {
+                            card(&mut cols[1], |ui| {
                                 ui.strong("③ 신규 사이트 (TOBE)");
                                 changed |= site_fields(ui, &mut domain.tobe, show_pw);
                             });
@@ -636,10 +937,10 @@ impl App {
                     // ───────── 이전·진단 (통합, 좌우 배치) ─────────
                     Tab::Migrate => {
                         // 진단·수정 — 사이트별 액션 (좌우)
-                        ui.group(|ui| {
+                        card(ui, |ui| {
                             ui.strong("🩺 진단·수정");
                             ui.columns(2, |cols| {
-                                cols[0].group(|ui| {
+                                card(&mut cols[0], |ui| {
                                     ui.strong("② 현재 (ASIS)");
                                     let a = site_actions(ui, !running);
                                     let mk = |k| Some((Req::Op(k), customer_name.clone(), domain_name.clone(), domain.asis.clone(), domain.tobe.clone()));
@@ -649,7 +950,7 @@ impl App {
                                     if a.fix_htaccess { request = mk(OpKind::FixHtaccessAsis); }
                                     if a.set_db { request = mk(OpKind::SetDbAsis); }
                                 });
-                                cols[1].group(|ui| {
+                                card(&mut cols[1], |ui| {
                                     ui.strong("③ 신규 (TOBE)");
                                     let a = site_actions(ui, !running);
                                     let mk = |k| Some((Req::Op(k), customer_name.clone(), domain_name.clone(), domain.asis.clone(), domain.tobe.clone()));
@@ -666,7 +967,7 @@ impl App {
                         let tobe = domain.tobe.clone();
                         // 마이그레이션 — 좌(개별) / 우(묶음 + 직접)
                         ui.columns(2, |cols| {
-                            cols[0].group(|ui| {
+                            card(&mut cols[0], |ui| {
                                 ui.strong("개별 작업");
                                 ui.label(egui::RichText::new("백업: 현재→로컬 / 복원: 로컬→신규").weak());
                                 ui.add_space(4.0);
@@ -687,7 +988,7 @@ impl App {
                                 }
                             });
                             cols[1].vertical(|ui| {
-                                ui.group(|ui| {
+                                card(ui, |ui| {
                                     ui.strong("묶음 이전 (현재 → 신규)");
                                     ui.label(egui::RichText::new("※ 공간 부족 시 '파일만' → 확보 후 '디비만'").weak());
                                     ui.add_space(4.0);
@@ -705,7 +1006,7 @@ impl App {
                                     });
                                 });
                                 ui.add_space(6.0);
-                                ui.group(|ui| {
+                                card(ui, |ui| {
                                     ui.strong("⚡ 직접 이전 (디스크 미사용)");
                                     ui.label(egui::RichText::new("로컬 저장 없이 신규로 스트리밍").weak());
                                     ui.add_space(4.0);
@@ -730,7 +1031,7 @@ impl App {
                         let asis_ip = if domain.asis.ip.trim().is_empty() { "(IP 빔)".to_string() } else { domain.asis.ip.trim().to_string() };
                         let tobe_ip = if domain.tobe.ip.trim().is_empty() { "(IP 빔)".to_string() } else { domain.tobe.ip.trim().to_string() };
                         let c = &mut domain.cms_install;
-                        ui.group(|ui| {
+                        card(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.strong("CMS:");
                                 changed |= ui.radio_value(&mut c.kind, CmsKind::WordPress, "WordPress").changed();
@@ -760,7 +1061,7 @@ impl App {
                             });
                         });
                         ui.add_space(6.0);
-                        ui.group(|ui| {
+                        card(ui, |ui| {
                             ui.strong(format!("{}  ('루트로 실행' 필수)", c.kind.label()));
                             let hint = match c.kind {
                                 CmsKind::WordPress => "설치: wp-cli 코어+DB+관리자(완전 자동)  /  업데이트: 코어·플러그인·테마·언어",
@@ -791,7 +1092,7 @@ impl App {
                         let asis_ip = if domain.asis.ip.trim().is_empty() { "(IP 빔)".to_string() } else { domain.asis.ip.trim().to_string() };
                         let tobe_ip = if domain.tobe.ip.trim().is_empty() { "(IP 빔)".to_string() } else { domain.tobe.ip.trim().to_string() };
                         let e = &mut domain.eond;
-                        ui.group(|ui| {
+                        card(ui, |ui| {
                             ui.strong("eondcms 설치 (HestiaCP)");
                             ui.horizontal(|ui| {
                                 ui.label("대상 서버:");
@@ -817,7 +1118,7 @@ impl App {
                             });
                         });
                         ui.add_space(6.0);
-                        ui.group(|ui| {
+                        card(ui, |ui| {
                             ui.strong("신규 설치  ·  순서: ① → ② → ③  ('루트로 실행' 필수)");
                             ui.add_space(4.0);
                             for (n, label) in [(1u8, "① 리소스 생성"), (2, "② 코드 업로드"), (3, "③ 설치 마무리")] {
@@ -832,7 +1133,7 @@ impl App {
                             }
                         });
                         ui.add_space(6.0);
-                        ui.group(|ui| {
+                        card(ui, |ui| {
                             ui.strong("코드 업데이트 (이미 설치된 인스턴스)");
                             ui.label(egui::RichText::new("② 코드 업로드 → 🔄 업데이트 (v-*/SSL/nginx 생략, 재시작 포함)").weak());
                             ui.add_space(4.0);
@@ -847,6 +1148,59 @@ impl App {
                             });
                         });
                     }
+                    // ───────── 작업 기록 ─────────
+                    Tab::History => {
+                        let h = &domain.history;
+                        card(ui, |ui| {
+                            ui.strong("작업 요약");
+                            ui.add_space(2.0);
+                            let last_ok = |needles: &[&str]| -> Option<String> {
+                                h.iter().rev().find(|e| e.ok && needles.iter().all(|n| e.title.contains(n))).map(|e| fmt_kst(e.at))
+                            };
+                            let upd_cnt = |needle: &str| h.iter().filter(|e| e.ok && e.title.contains(needle) && e.title.contains("업데이트")).count();
+                            let row = |ui: &mut egui::Ui, label: &str, when: Option<String>, extra: String| {
+                                ui.horizontal(|ui| {
+                                    ui.allocate_ui_with_layout(egui::vec2(96.0, ui.spacing().interact_size.y), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        ui.label(label);
+                                    });
+                                    match when {
+                                        Some(d) => {
+                                            ui.colored_label(egui::Color32::from_rgb(60, 190, 100), format!("✓ {d}"));
+                                            if !extra.is_empty() { ui.weak(extra); }
+                                        }
+                                        None => { ui.weak("— 안 함"); }
+                                    }
+                                });
+                            };
+                            let upd = |n: usize| if n > 0 { format!("· 업데이트 {n}회") } else { String::new() };
+                            let mig = h.iter().rev().find(|e| e.ok && e.title.contains("이전")).map(|e| fmt_kst(e.at));
+                            row(ui, "사이트 이전", mig, String::new());
+                            row(ui, "eondcms", last_ok(&["eondcms", "마무리"]), upd(upd_cnt("eondcms")));
+                            row(ui, "WordPress", last_ok(&["WordPress 설치"]), upd(upd_cnt("WordPress")));
+                            row(ui, "Rhymix", last_ok(&["Rhymix 설치"]), upd(upd_cnt("Rhymix")));
+                            row(ui, "그누보드", last_ok(&["그누보드 설치"]), upd(upd_cnt("그누보드")));
+                        });
+                        ui.add_space(6.0);
+                        card(ui, |ui| {
+                            ui.strong(format!("전체 기록 ({}건)", h.len()));
+                            ui.add_space(2.0);
+                            if h.is_empty() {
+                                ui.weak("아직 작업 기록이 없습니다. (백업·이전·설치·업데이트 완료 시 기록됨)");
+                            } else {
+                                for e in h.iter().rev() {
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::Label::new(egui::RichText::new(fmt_kst(e.at)).monospace().weak()));
+                                        if e.ok {
+                                            ui.colored_label(egui::Color32::from_rgb(60, 190, 100), "✓");
+                                        } else {
+                                            ui.colored_label(egui::Color32::from_rgb(230, 95, 95), "✗");
+                                        }
+                                        ui.label(&e.title);
+                                    });
+                                }
+                            }
+                        });
+                    }
                 }
               });
             });
@@ -858,10 +1212,8 @@ impl App {
             self.tab = tab;
 
             if delete_domain {
-                self.store.customers[ci].domains.remove(di);
-                self.sel_domain = None;
-                self.dirty = true;
-                self.save();
+                // 즉시 삭제하지 않고 확인 모달 → 휴지통 이동
+                self.pending_delete = Some(DelTarget::Domain(ci, di));
             } else if changed {
                 self.dirty = true;
                 self.last_edit = ctx.input(|i| i.time);
@@ -1058,7 +1410,8 @@ impl App {
                         if let Some(job) = self.eond_confirm.take() {
                             self.running = true;
                             self.last_ok = None;
-                            self.status = "eondcms 작업 실행 중...".into();
+                            self.status = "설치 작업 실행 중...".into();
+                            self.running_job = self.current_domain_id().map(|id| (id, job.title.clone()));
                             let ctx2 = ctx.clone();
                             ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
                         }

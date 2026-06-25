@@ -25,6 +25,20 @@ pub struct Customer {
     pub memo: String,
     #[serde(default)]
     pub domains: Vec<Domain>,
+    /// 소프트삭제 시각(unix초). Some 이면 휴지통, 30일 후 완전삭제.
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
+}
+
+/// 도메인 작업 기록 1건 (이전/설치/업데이트 등)
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ActivityLog {
+    /// 시각 (unix 초)
+    pub at: i64,
+    /// 작업 제목 (예: "WordPress 설치", "전체 이전", "eondcms 🔄 업데이트")
+    pub title: String,
+    /// 성공 여부
+    pub ok: bool,
 }
 
 /// 도메인 = 이전(마이그레이션) 단위 (예: chailow.com)
@@ -52,6 +66,12 @@ pub struct Domain {
     /// 일반 CMS(WordPress/Rhymix/그누보드) 설치 파라미터
     #[serde(default)]
     pub cms_install: CmsInstall,
+    /// 소프트삭제 시각(unix초). Some 이면 휴지통, 30일 후 완전삭제.
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
+    /// 작업 기록 (이전/설치/업데이트 이력)
+    #[serde(default)]
+    pub history: Vec<ActivityLog>,
 }
 
 fn default_true() -> bool {

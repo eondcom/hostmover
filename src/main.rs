@@ -38,14 +38,14 @@ fn setup_fonts(ctx: &egui::Context) {
 fn setup_theme(ctx: &egui::Context) {
     use egui::{Color32, CornerRadius, FontFamily, FontId, Margin, Stroke, TextStyle};
     let rgb = Color32::from_rgb;
-    let bg = rgb(0x0A, 0x0A, 0x0B); // 최상위 배경 (블랙)
-    let panel = rgb(0x11, 0x11, 0x13); // 패널
-    let surface = rgb(0x17, 0x17, 0x1A); // 카드/입력 배경
-    let surface2 = rgb(0x24, 0x24, 0x28); // 버튼/호버 베이스
-    let border = rgb(0x30, 0x30, 0x35);
-    let accent = rgb(0x3B, 0x82, 0xF6); // 블루 포인트 (배경은 블랙 유지)
-    let text = rgb(0xE7, 0xE7, 0xEA);
-    let muted = rgb(0x8A, 0x8A, 0x93);
+    let bg = rgb(0x0E, 0x14, 0x22); // 최상위 배경 (네이비 다크, 완전 검정 아님)
+    let panel = rgb(0x14, 0x1C, 0x2E); // 패널
+    let surface = rgb(0x1F, 0x2A, 0x44); // 카드/입력 배경 (패널보다 밝게 → 섹션 구분)
+    let surface2 = rgb(0x29, 0x37, 0x55); // 버튼/호버 베이스
+    let border = rgb(0x39, 0x4A, 0x6D); // 또렷한 경계
+    let accent = rgb(0x3B, 0x82, 0xF6); // 블루 포인트
+    let text = rgb(0xE5, 0xEB, 0xF5);
+    let muted = rgb(0x93, 0xA1, 0xBC);
 
     let bold = FontFamily::Name("bold".into());
     let mut style = (*ctx.style()).clone();
