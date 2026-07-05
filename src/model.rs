@@ -9,6 +9,57 @@ pub struct Store {
     pub customers: Vec<Customer>,
     #[serde(default)]
     pub settings: Settings,
+    /// 마지막 전체 사이트 스캔 캐시 (다음 실행 시 즉시 표시)
+    #[serde(default)]
+    pub scan_cache: Vec<CachedSite>,
+    /// 스캔 캐시 시각 (unix초)
+    #[serde(default)]
+    pub scan_cache_at: i64,
+    /// 마지막 화면 상태 (재시작 시 복원)
+    #[serde(default)]
+    pub ui: UiState,
+}
+
+/// 재시작 시 복원할 마지막 화면 위치 (인덱스 대신 id 로 저장해 정렬/추가에도 안정적)
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
+pub struct UiState {
+    /// "domain" | "settings" | "allsites" | "account"
+    #[serde(default)]
+    pub view: String,
+    /// 마지막 선택 고객 id (0=없음)
+    #[serde(default)]
+    pub customer_id: u64,
+    /// 마지막 선택 도메인 id (0=없음)
+    #[serde(default)]
+    pub domain_id: u64,
+    /// 도메인 화면 탭: "info"|"migrate"|"cms"|"eond"|"history"
+    #[serde(default)]
+    pub tab: String,
+    /// 설정 화면 탭: "connect"|"ssh"|"bulk"|"moddel"|"disk"|"backup"
+    #[serde(default)]
+    pub settings_tab: String,
+}
+
+/// 스캔 결과 캐시 항목
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct CachedSite {
+    #[serde(default)]
+    pub account: String,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub version: String,
+    /// 최신/업데이트 상태
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub git: bool,
+    #[serde(default)]
+    pub file_bytes: u64,
+    #[serde(default)]
+    pub db_bytes: u64,
 }
 
 /// 앱 설정 (HestiaCP 연동 등). 암호화 저장.
@@ -24,6 +75,24 @@ pub struct Settings {
     /// SSL 인증서 검증 (자체서명이면 끄기)
     #[serde(default)]
     pub ssl_verify: bool,
+    /// 일괄 작업용 서버 SSH 호스트 (비우면 hestia_host 사용)
+    #[serde(default)]
+    pub ssh_host: String,
+    /// SSH 유저 — root 직접 로그인 대신 sudo 권한 계정(예: tong)
+    #[serde(default)]
+    pub ssh_user: String,
+    /// 위 유저의 비밀번호 (SSH + sudo 공용)
+    #[serde(default)]
+    pub ssh_pass: String,
+    /// SSH 포트 (비우면 22)
+    #[serde(default)]
+    pub ssh_port: String,
+    /// Rhymix 모듈/레이아웃 업로드 소스 (로컬 PC의 dev/rx 경로 — 하위에 modules/ layouts/ 포함)
+    #[serde(default)]
+    pub rx_source_local: String,
+    /// WordPress 플러그인 소스 (로컬 PC의 dev/wp 경로 — 하위에 wp-content/plugins/ 포함)
+    #[serde(default)]
+    pub wp_source_local: String,
 }
 
 impl Settings {
@@ -102,10 +171,10 @@ fn default_true() -> bool {
 }
 
 /// eondcms 신규 설치(HestiaCP) 파라미터. 설치 스크립트 생성에 사용.
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct EondInstall {
-    /// 설치 대상: true=현재(ASIS) 서버, false=신규(TOBE) 서버
-    #[serde(default)]
+    /// 설치 대상: true=현재(ASIS) 서버, false=신규(TOBE) 서버. 기본 현재.
+    #[serde(default = "default_true")]
     pub use_asis: bool,
     /// root 직접 로그인 불가 → sudo 경유 (ssh user 접속 후 sudo -S bash -s). 기본 켜짐.
     #[serde(default = "default_true")]
@@ -145,6 +214,27 @@ pub struct EondInstall {
     pub code_local: String,
 }
 
+impl Default for EondInstall {
+    fn default() -> Self {
+        Self {
+            use_asis: true,
+            sudo: true,
+            hestia_user: String::new(),
+            hestia_pass: String::new(),
+            hestia_email: String::new(),
+            package: String::new(),
+            port: String::new(),
+            db_name: String::new(),
+            db_user: String::new(),
+            db_pass: String::new(),
+            table_prefix: String::new(),
+            admin_user: String::new(),
+            admin_pass: String::new(),
+            code_local: String::new(),
+        }
+    }
+}
+
 impl EondInstall {
     pub fn package_or_default(&self) -> &str {
         if self.package.trim().is_empty() { "default" } else { self.package.trim() }
@@ -177,12 +267,12 @@ impl CmsKind {
 }
 
 /// 일반 CMS(WordPress/Rhymix/그누보드) 설치·업데이트 파라미터 (HestiaCP).
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CmsInstall {
     #[serde(default)]
     pub kind: CmsKind,
-    /// 설치 대상: true=현재(ASIS), false=신규(TOBE)
-    #[serde(default)]
+    /// 설치 대상: true=현재(ASIS), false=신규(TOBE). 기본 현재.
+    #[serde(default = "default_true")]
     pub use_asis: bool,
     #[serde(default = "default_true")]
     pub sudo: bool,
@@ -217,6 +307,37 @@ pub struct CmsInstall {
     /// 버전 (기본 latest)
     #[serde(default)]
     pub version: String,
+    /// Rhymix 업로드: 설치할 모듈 이름들(쉼표 구분)
+    #[serde(default)]
+    pub rx_modules: String,
+    /// Rhymix 업로드: 설치할 레이아웃 이름들(쉼표 구분)
+    #[serde(default)]
+    pub rx_layouts: String,
+}
+
+impl Default for CmsInstall {
+    fn default() -> Self {
+        Self {
+            kind: CmsKind::default(),
+            use_asis: true,
+            sudo: true,
+            hestia_user: String::new(),
+            hestia_pass: String::new(),
+            hestia_email: String::new(),
+            package: String::new(),
+            db_name: String::new(),
+            db_user: String::new(),
+            db_pass: String::new(),
+            admin_user: String::new(),
+            admin_pass: String::new(),
+            admin_email: String::new(),
+            site_title: String::new(),
+            locale: String::new(),
+            version: String::new(),
+            rx_modules: String::new(),
+            rx_layouts: String::new(),
+        }
+    }
 }
 
 impl CmsInstall {

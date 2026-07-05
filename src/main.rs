@@ -4,15 +4,26 @@ mod model;
 mod ops;
 mod store;
 
+// 한글 폰트 후보 경로. Linux 경로를 먼저, macOS 경로를 뒤에 둔다.
+// first_readable 가 존재하는 첫 파일만 고르므로 두 OS 모두에서 안전하다.
+// (macOS 는 AppleSDGothicNeo 가 기본 내장이라 별도 설치 없이 한글이 렌더된다.)
 const KO_REGULAR: &[&str] = &[
     "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+    // macOS
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/Library/Fonts/NanumGothic.ttf",
+    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
 ];
 const KO_BOLD: &[&str] = &[
     "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    // macOS (AppleSDGothicNeo.ttc 안에 볼드 웨이트 포함; 단일 페이스만 로드돼도 무방)
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/Library/Fonts/NanumGothicBold.ttf",
+    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
 ];
 
 fn first_readable(paths: &[&str]) -> Option<Vec<u8>> {
@@ -120,7 +131,34 @@ fn setup_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// macOS 에서 Finder(.app)로 실행하면 PATH 가 `/usr/bin:/bin:/usr/sbin:/sbin` 뿐이라
+/// Homebrew 로 설치한 sshpass·rsync(3.x)·mysqldump 를 찾지 못한다. 자식 프로세스(bash)가
+/// 상속하도록 프로세스 PATH 앞쪽에 Homebrew 경로를 보강한다. (Linux 에선 no-op)
+#[cfg(target_os = "macos")]
+fn augment_path_for_macos() {
+    let extra = [
+        "/opt/homebrew/bin", // Apple Silicon
+        "/opt/homebrew/sbin",
+        "/usr/local/bin", // Intel Homebrew
+        "/usr/local/sbin",
+        "/opt/homebrew/opt/mysql-client/bin", // mysqldump/mysql (keg-only)
+        "/usr/local/opt/mysql-client/bin",
+    ];
+    let cur = std::env::var("PATH").unwrap_or_default();
+    let mut parts: Vec<&str> = extra.to_vec();
+    for p in cur.split(':') {
+        if !p.is_empty() && !extra.contains(&p) {
+            parts.push(p);
+        }
+    }
+    std::env::set_var("PATH", parts.join(":"));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn augment_path_for_macos() {}
+
 fn main() -> Result<(), eframe::Error> {
+    augment_path_for_macos();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 800.0])

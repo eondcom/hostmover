@@ -63,10 +63,43 @@
 
 ## 빌드 / 실행
 
+### Linux
+
 ```bash
 cargo build --release
 ./target/release/hostmover
 ```
+
+### macOS
+
+> egui 앱은 사실상 크로스컴파일이 안 되므로 **macOS 에서 직접 빌드**해야 한다.
+
+```bash
+# 1) 의존 CLI 설치 (Homebrew)
+brew install sshpass rsync mysql-client
+#   ※ sshpass 는 정식 brew 포뮬러가 없을 수 있다:
+#      brew install hudochenkov/sshpass/sshpass
+
+# 2) 빌드 & 실행 (개발용)
+cargo run --release
+
+# 3) 배포용 .app 번들 만들기
+./build-macos.sh            # 현재 아키텍처용 dist/Hostmover.app
+./build-macos.sh --universal --dmg   # 유니버설(arm64+x86_64) + dist/Hostmover.dmg
+open dist/Hostmover.app
+```
+
+처음 실행 시 Gatekeeper 가 막으면 **우클릭 → 열기**, 또는
+`xattr -dr com.apple.quarantine dist/Hostmover.app`.
+
+macOS 메모:
+- `.app` 을 Finder 에서 실행하면 PATH 에 Homebrew 경로가 없어 `sshpass`/`rsync`/
+  `mysqldump` 를 못 찾을 수 있다. 앱이 시작 시 `/opt/homebrew/bin`·`/usr/local/bin`
+  등을 PATH 앞에 자동 보강하므로 일반적으로 그대로 동작한다.
+- 한글 폰트는 macOS 기본 내장 **AppleSDGothicNeo** 를 자동 로드한다(별도 설치 불필요).
+- 시스템 rsync(2.6.9)는 `--mkpath`/`--info=stats1` 미지원이라 **Homebrew rsync(3.x)**
+  를 쓴다(위 PATH 보강으로 우선 적용됨).
+- 저장 경로는 Linux 와 동일: 설정 `~/.config/hostmover/`, 백업 `~/.local/share/hostmover/`.
 
 ## 테스트
 
