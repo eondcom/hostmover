@@ -1,4 +1,4 @@
-use crate::model::{ActivityLog, CachedSite, CmsAccess, CmsKind, Customer, Domain, DomainAccess, Site, Store};
+use crate::model::{ActivityLog, CachedSite, CmsAccess, CmsKind, Customer, CustomerNote, Domain, DomainAccess, Site, Store};
 use crate::ops::{self, LogMsg, OpKind};
 use crate::store;
 use egui_phosphor::regular as ph;
@@ -72,6 +72,7 @@ enum SettingsTab {
 enum AcctTab {
     Sites,
     Modules,
+    Notes,
 }
 
 /// 계정/전체 사이트 스캔 행
@@ -84,6 +85,10 @@ struct AcctSiteRow {
     git: bool,
     file_bytes: u64,
     db_bytes: u64,
+    /// HestiaCP 웹도메인 생성일 (YYYY-MM-DD, 미조회 시 빈 문자열)
+    created: String,
+    /// public_html 소유/권한 "소유자:chmod" (예: "rokmc:755", 미조회 시 빈 문자열)
+    perm: String,
     /// DNS A 레코드 (DNS 체크 시 채움)
     a_record: String,
     /// HestiaCP 도메인 alias (None=미조회). 보이면 자동 조회.
@@ -95,7 +100,7 @@ struct AcctSiteRow {
 
 impl AcctSiteRow {
     fn new(account: String, domain: String, kind: String, version: String, status: String, git: bool, file_bytes: u64, db_bytes: u64) -> Self {
-        AcctSiteRow { account, domain, kind, version, status, git, file_bytes, db_bytes, a_record: String::new(), aliases: None, alias_req: false, sel: false }
+        AcctSiteRow { account, domain, kind, version, status, git, file_bytes, db_bytes, created: String::new(), perm: String::new(), a_record: String::new(), aliases: None, alias_req: false, sel: false }
     }
 }
 
@@ -111,6 +116,10 @@ enum ScanMsg {
     Dns { results: Vec<(String, String)> },
     /// 도메인 alias 일괄 조회 결과 (계정, 도메인, alias목록)
     AliasesBatch { results: Vec<(String, String, Vec<String>)> },
+    /// 계정 웹도메인 생성일 조회 결과 (계정, [(도메인, YYYY-MM-DD)])
+    SiteDates { account: String, dates: Vec<(String, String)> },
+    /// 사이트 public_html 소유/권한 조회 결과 ([(계정, 도메인, "소유자:chmod")])
+    SitePerms { perms: Vec<(String, String, String)> },
     /// WordPress 플러그인/테마 버전 비교 스캔 결과 (도메인 id, 종류, 행들)
     WpPlugins { domain_id: u64, kind: ops::WpAssetKind, res: Result<Vec<ops::WpPluginRow>, String> },
 }
@@ -381,6 +390,12 @@ pub struct App {
     acct_mod_domain: String,
     /// 계정 모듈 화면 상태 메시지
     acct_mods_status: String,
+    /// 고객 메모 탭: 새 메모 입력 버퍼
+    acct_note_input: String,
+    /// 생성일(HestiaCP DATE)을 이미 조회한 계정 집합(세션 중 중복조회 방지)
+    site_dates_req: std::collections::HashSet<String>,
+    /// 퍼미션(소유/권한)을 이미 조회한 계정 집합(중복조회 방지, ""=전체)
+    site_perms_req: std::collections::HashSet<String>,
     /// 사이트 불러오기 요청 (고객 인덱스)
     pending_import_sites: Option<usize>,
 
@@ -461,6 +476,9 @@ impl App {
             acct_mods_for: None,
             acct_mod_domain: String::new(),
             acct_mods_status: String::new(),
+            acct_note_input: String::new(),
+            site_dates_req: std::collections::HashSet::new(),
+            site_perms_req: std::collections::HashSet::new(),
             pending_import_sites: None,
             log: Vec::new(),
             running: false,
@@ -605,6 +623,7 @@ impl App {
                             id,
                             name: u,
                             memo: String::new(),
+                            notes: Vec::new(),
                             domains: Vec::new(),
                             deleted_at: None,
                         });
@@ -652,6 +671,7 @@ impl App {
                         cms_install: Default::default(),
                         deleted_at: None,
                         history: Vec::new(),
+                        working: false,
                     };
                     nd.tobe.ip = ip;
                     // HestiaCP 유저 = vhost FTP 계정 → 정보 탭(신규 서버)의 FTP ID로도 채움
@@ -1198,6 +1218,16 @@ impl App {
         });
     }
 
+    /// 읽기전용 진단 Job(권한 점검 등)을 로그로 스트리밍 실행 (확인 모달 없이 바로).
+    fn run_diagnostic(&mut self, job: ops::Job, ctx: &egui::Context) {
+        if self.running { return; }
+        self.running = true;
+        self.running_job = None; // 진단은 도메인 기록에 남기지 않음
+        self.status = format!("{} 실행 중...", job.title);
+        let ctx2 = ctx.clone();
+        ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
+    }
+
     /// 🧩 계정 관리 페이지 — 사이트(공유 캐시 필터) / 모듈(선택 삭제)
     fn account_modules_page(&mut self, ctx: &egui::Context, ci: usize) {
         let acct = match self.store.customers.get(ci) {
@@ -1219,6 +1249,8 @@ impl App {
         let mut do_dns = false;
         let mut do_scan_sel = false;
         let mut do_backup_sel = false;
+        let mut do_perm = false;
+        let mut do_permfix = false;
         let mut alias_loads: Vec<(String, String)> = Vec::new();
         let mut sel_all_sites: Option<bool> = None;
         let mut select_all = None;
@@ -1235,7 +1267,13 @@ impl App {
             ui.label(egui::RichText::new("사이트 데이터는 전체 사이트 스캔 캐시를 공유합니다. (설정 > 서버 SSH 필요)").weak());
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                for (t, label) in [(AcctTab::Sites, "  사이트 (CMS·버전·업데이트)  "), (AcctTab::Modules, "  모듈 (선택 삭제)  ")] {
+                let note_cnt = self.store.customers.get(ci).map(|c| c.notes.len()).unwrap_or(0);
+                let notes_label = if note_cnt > 0 { format!("  📝 메모 ({note_cnt})  ") } else { "  📝 메모  ".to_string() };
+                for (t, label) in [
+                    (AcctTab::Sites, "  사이트 (CMS·버전·업데이트)  ".to_string()),
+                    (AcctTab::Modules, "  모듈 (선택 삭제)  ".to_string()),
+                    (AcctTab::Notes, notes_label),
+                ] {
                     if ui.selectable_label(self.acct_tab == t, label).clicked() { self.acct_tab = t; }
                 }
             });
@@ -1246,6 +1284,8 @@ impl App {
                 AcctTab::Sites => {
                     ui.horizontal(|ui| {
                         if ui.add_enabled(!running && !scanning, btn_primary(format!("{}  이 계정 스캔", ph::ARROWS_CLOCKWISE))).on_hover_text("이 계정만 다시 스캔해 공유 캐시 갱신").clicked() { do_scan = true; }
+                        if ui.add_enabled(!running, egui::Button::new("🔐  권한 점검")).on_hover_text("이 계정의 모든 사이트 public_html 소유/권한 일괄 점검 (CMS 무관, 'access denied' 원인)").clicked() { do_perm = true; }
+                        if ui.add_enabled(!running, egui::Button::new("🔧  권한 수정")).on_hover_text("이 계정의 모든 사이트 public_html 을 해당 계정 소유로 chown -R + 755 (확인 후 실행)").clicked() { do_permfix = true; }
                         if scanning { ui.spinner(); ui.label("스캔 중…"); }
                         if has_rows {
                             if ui.button("전체 선택").clicked() { sel_all_sites = Some(true); }
@@ -1324,6 +1364,65 @@ impl App {
                         });
                     }
                 }
+                AcctTab::Notes => {
+                    ui.label(egui::RichText::new("이 고객의 추가요청·작업사항을 그때그때 기록합니다. (작성 시각 자동 저장, 최신이 위)").weak());
+                    ui.add_space(6.0);
+                    // ── 새 메모 입력 ──
+                    let mut add_note = false;
+                    let resp = ui.add(egui::TextEdit::multiline(&mut self.acct_note_input)
+                        .desired_rows(2).desired_width(600.0)
+                        .hint_text("예: 2/14 상단 배너 교체 요청 / 결제모듈 점검 필요"));
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command) { add_note = true; }
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!self.acct_note_input.trim().is_empty(), btn_primary(format!("{}  메모 추가", ph::PLUS))).clicked() { add_note = true; }
+                        ui.label(egui::RichText::new("Ctrl+Enter 로도 추가").weak());
+                    });
+                    if add_note {
+                        let text = self.acct_note_input.trim().to_string();
+                        if !text.is_empty() {
+                            if let Some(c) = self.store.customers.get_mut(ci) {
+                                c.notes.insert(0, CustomerNote { at: now_unix(), text });
+                            }
+                            self.acct_note_input.clear();
+                            self.dirty = true;
+                            self.save();
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    // ── 메모 목록 (최신 먼저) ──
+                    let notes = self.store.customers.get(ci).map(|c| c.notes.clone()).unwrap_or_default();
+                    if notes.is_empty() {
+                        ui.label(egui::RichText::new("아직 메모가 없습니다.").weak());
+                    } else {
+                        let mut del_note: Option<usize> = None;
+                        let avail = ui.available_height();
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).max_height((avail - 20.0).max(140.0)).show(ui, |ui| {
+                            for (i, n) in notes.iter().enumerate() {
+                                card(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(fmt_kst(n.at)).weak().monospace());
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.add(egui::Button::new(egui::RichText::new(ph::TRASH).color(egui::Color32::from_rgb(206, 112, 112))).frame(false)).on_hover_text("이 메모 삭제").clicked() {
+                                                del_note = Some(i);
+                                            }
+                                        });
+                                    });
+                                    ui.add(egui::Label::new(&n.text).wrap());
+                                });
+                                ui.add_space(4.0);
+                            }
+                        });
+                        if let Some(i) = del_note {
+                            if let Some(c) = self.store.customers.get_mut(ci) {
+                                if i < c.notes.len() { c.notes.remove(i); }
+                            }
+                            self.dirty = true;
+                            self.save();
+                        }
+                    }
+                }
             }
         });
         if let Some(v) = sel_all_sites { for r in self.all_sites.iter_mut().filter(|r| r.account == acct) { r.sel = v; } }
@@ -1331,7 +1430,24 @@ impl App {
         if select_deprecated { for m in &mut self.acct_mods { m.2 = is_deprecated_module(&m.0); } }
         if close { self.view = MainView::Domain; }
         self.load_aliases_batch(alias_loads, ctx);
-        if do_scan { self.rescan_account_into_all(acct.clone(), ctx); }
+        // 사이트 탭에서 생성일/퍼미션 미조회 행이 있으면 계정당 1회 조회
+        if self.acct_tab == AcctTab::Sites {
+            if self.all_sites.iter().any(|r| r.account == acct && r.created.is_empty()) { self.load_site_dates(&acct, ctx); }
+            if self.all_sites.iter().any(|r| r.account == acct && r.perm.is_empty()) { self.load_site_perms(&acct, ctx); }
+        }
+        if do_perm {
+            match ops::build_perm_audit(&self.store.settings, Some(&acct)) {
+                Ok(job) => self.run_diagnostic(job, ctx),
+                Err(e) => { self.log.push(format!("권한 점검: {e}")); self.status = format!("오류: {e}"); self.last_ok = Some(false); }
+            }
+        }
+        if do_permfix {
+            match ops::build_perm_fix_audit(&self.store.settings, Some(&acct)) {
+                Ok(job) => self.eond_confirm = Some(job),
+                Err(e) => { self.log.push(format!("권한 수정: {e}")); self.status = format!("오류: {e}"); self.last_ok = Some(false); }
+            }
+        }
+        if do_scan { self.site_dates_req.remove(&acct); self.site_perms_req.remove(&acct); self.rescan_account_into_all(acct.clone(), ctx); }
         if do_load_mods { self.load_account_modules(ci, ctx); }
         if do_scan_sel {
             let pairs: Vec<(String, String)> = self.all_sites.iter().filter(|r| r.account == acct && r.sel).map(|r| (r.account.clone(), r.domain.clone())).collect();
@@ -1384,7 +1500,7 @@ impl App {
     fn hydrate_scan_cache(&mut self) {
         if self.store.scan_cache.is_empty() { return; }
         self.all_sites = self.store.scan_cache.iter()
-            .map(|c| AcctSiteRow::new(c.account.clone(), c.domain.clone(), c.kind.clone(), c.version.clone(), c.status.clone(), c.git, c.file_bytes, c.db_bytes))
+            .map(|c| { let mut r = AcctSiteRow::new(c.account.clone(), c.domain.clone(), c.kind.clone(), c.version.clone(), c.status.clone(), c.git, c.file_bytes, c.db_bytes); r.created = c.created.clone(); r.perm = c.perm.clone(); r })
             .collect();
         self.all_sites_status = format!("캐시 {}개 ({}) — 최신화하려면 전체 스캔", self.all_sites.len(), ago_text(self.store.scan_cache_at));
     }
@@ -1394,6 +1510,7 @@ impl App {
         self.store.scan_cache = self.all_sites.iter().map(|r| CachedSite {
             account: r.account.clone(), domain: r.domain.clone(), kind: r.kind.clone(),
             version: r.version.clone(), status: r.status.clone(), git: r.git, file_bytes: r.file_bytes, db_bytes: r.db_bytes,
+            created: r.created.clone(), perm: r.perm.clone(),
         }).collect();
         self.store.scan_cache_at = now_unix();
         self.dirty = true;
@@ -1475,6 +1592,33 @@ impl App {
         });
     }
 
+    /// 계정의 웹도메인 생성일(HestiaCP DATE)을 백그라운드로 1회 조회 (중복 방지).
+    fn load_site_dates(&mut self, account: &str, ctx: &egui::Context) {
+        let acct = account.trim().to_string();
+        if acct.is_empty() || self.site_dates_req.contains(&acct) { return; }
+        self.site_dates_req.insert(acct.clone());
+        let (tx, settings, ctx) = (self.scan_tx.clone(), self.store.settings.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let dates = ops::hestia_web_domain_dates(&settings, &acct).unwrap_or_default();
+            let _ = tx.send(ScanMsg::SiteDates { account: acct, dates });
+            ctx.request_repaint();
+        });
+    }
+
+    /// 사이트 public_html 소유/권한을 백그라운드로 1회 조회 (account=""=전체). 중복 방지.
+    fn load_site_perms(&mut self, account: &str, ctx: &egui::Context) {
+        let key = account.trim().to_string();
+        if self.site_perms_req.contains(&key) { return; }
+        self.site_perms_req.insert(key.clone());
+        let scope = if key.is_empty() { None } else { Some(key) };
+        let (tx, settings, ctx) = (self.scan_tx.clone(), self.store.settings.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let perms = ops::scan_site_perms(&settings, scope.as_deref()).unwrap_or_default();
+            let _ = tx.send(ScanMsg::SitePerms { perms });
+            ctx.request_repaint();
+        });
+    }
+
     /// 선택 사이트의 파일+DB를 로컬로 백업 (확인 모달 경유)
     fn backup_sites(&mut self, pairs: Vec<(String, String)>) {
         if pairs.is_empty() { return; }
@@ -1514,6 +1658,8 @@ impl App {
                     Ok(list) => {
                         self.all_sites = list.into_iter().map(|(account, domain, kind, version, status, git, file_bytes, db_bytes)| AcctSiteRow::new(account, domain, kind, version, status, git, file_bytes, db_bytes)).collect();
                         self.all_sites_status = format!("전체 사이트 {}개 스캔됨", self.all_sites.len());
+                        self.site_dates_req.clear(); // 새 스캔 → 생성일 재조회 허용
+                        self.site_perms_req.clear(); // 새 스캔 → 퍼미션 재조회 허용
                         self.save_scan_cache();
                         self.last_ok = Some(true);
                         self.status = self.all_sites_status.clone();
@@ -1578,6 +1724,28 @@ impl App {
                         }
                     }
                 },
+                ScanMsg::SiteDates { account, dates } => {
+                    let mut hit = false;
+                    for (domain, date) in dates {
+                        if date.trim().is_empty() { continue; }
+                        for r in self.all_sites.iter_mut().filter(|r| r.account == account && r.domain == domain) {
+                            r.created = date.clone();
+                            hit = true;
+                        }
+                    }
+                    if hit { self.save_scan_cache(); } // 생성일 캐시에 영구 기록
+                },
+                ScanMsg::SitePerms { perms } => {
+                    let mut hit = false;
+                    for (account, domain, perm) in perms {
+                        if perm.trim().is_empty() { continue; }
+                        for r in self.all_sites.iter_mut().filter(|r| r.account == account && r.domain == domain) {
+                            r.perm = perm.clone();
+                            hit = true;
+                        }
+                    }
+                    if hit { self.save_scan_cache(); }
+                },
                 ScanMsg::AccountModules { ci, label, res } => match res {
                     Ok(list) => {
                         self.acct_mods_for = Some(ci);
@@ -1640,11 +1808,11 @@ impl App {
         let mut allsel = any && self.all_sites.iter().filter(|r| vis(r)).all(|r| r.sel);
         if ui.checkbox(&mut allsel, "보이는 항목 전체 선택").changed() { sel_all = Some(allsel); }
         ui.add_space(2.0);
-        let lead = (if show_account { 110.0 } else { 0.0 }) + 175.0 + 100.0 + 76.0 + 150.0;
+        let lead = (if show_account { 110.0 } else { 0.0 }) + 175.0 + 92.0 + 100.0 + 76.0 + 150.0;
         egui::ScrollArea::both().auto_shrink([false, false]).max_height(max_h).show(ui, |ui| {
             let mut header: SiteCols = Vec::new();
             if show_account { header.push(("계정".to_string(), hc, 110.0)); }
-            for (h, w) in [("도메인", 175.0), ("CMS", 100.0), ("버전", 76.0), ("상태", 150.0), ("ALIAS", 200.0), ("A레코드", 120.0), ("파일", 60.0), ("DB", 60.0)] {
+            for (h, w) in [("도메인", 175.0), ("생성일", 92.0), ("CMS", 100.0), ("버전", 76.0), ("상태", 150.0), ("ALIAS", 200.0), ("A레코드", 120.0), ("파일", 60.0), ("DB", 60.0), ("퍼미션", 130.0)] {
                 header.push((h.to_string(), hc, w));
             }
             site_info_row(ui, &header);
@@ -1667,6 +1835,7 @@ impl App {
                 let mut cols: SiteCols = Vec::new();
                 if show_account { cols.push((r.account.clone(), egui::Color32::GRAY, 110.0)); }
                 cols.push((r.domain.clone(), tc, 175.0));
+                cols.push((if r.created.is_empty() { "…".to_string() } else { r.created.clone() }, weak, 92.0));
                 cols.push((format!("{}{}", r.kind, if r.git { " (git)" } else { "" }), kc, 100.0));
                 cols.push((r.version.clone(), tc, 76.0));
                 cols.push((if r.status.is_empty() { "-".to_string() } else { r.status.clone() }, sc, 150.0));
@@ -1674,11 +1843,21 @@ impl App {
                 cols.push((if r.a_record.is_empty() { "-".to_string() } else { r.a_record.clone() }, tc, 120.0));
                 cols.push((human_bytes(r.file_bytes), tc, 60.0));
                 cols.push((human_bytes(r.db_bytes), tc, 60.0));
+                // 퍼미션 "소유자:chmod" → "chmod 소유자", 소유자가 계정과 다르면 빨강(access denied 위험)
+                let (perm_txt, perm_col) = if r.perm.is_empty() {
+                    ("…".to_string(), weak)
+                } else {
+                    let owner = r.perm.split(':').next().unwrap_or("");
+                    let txt = match r.perm.split_once(':') { Some((o, p)) => format!("{p}  {o}"), None => r.perm.clone() };
+                    let col = if owner == r.account { tc } else { egui::Color32::from_rgb(220, 120, 120) };
+                    (txt, col)
+                };
+                cols.push((perm_txt, perm_col, 130.0));
                 if site_row(ui, r.sel, &cols) { r.sel = !r.sel; }
                 tf += r.file_bytes;
                 tdb += r.db_bytes;
             }
-            let tot: SiteCols = vec![("합계".to_string(), hc, lead + 200.0 + 120.0), (human_bytes(tf), hc, 60.0), (human_bytes(tdb), hc, 60.0)];
+            let tot: SiteCols = vec![("합계".to_string(), hc, lead + 200.0 + 120.0), (human_bytes(tf), hc, 60.0), (human_bytes(tdb), hc, 60.0), (String::new(), hc, 130.0)];
             site_info_row(ui, &tot);
         });
         (sel_all, to_load)
@@ -1696,6 +1875,8 @@ impl App {
         let mut do_dns = false;
         let mut do_scan_selected = false;
         let mut do_backup_sites = false;
+        let mut do_perm = false;
+        let mut do_permfix = false;
         let mut alias_loads: Vec<(String, String)> = Vec::new();
         let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
@@ -1711,6 +1892,9 @@ impl App {
                 if ui.add_enabled(!running && !scanning, btn_primary(format!("{}  전체 스캔", ph::ARROWS_CLOCKWISE))).clicked() { do_load = true; }
                 if ui.add_enabled(!running && !scanning && !self.all_filter_acct.is_empty(), egui::Button::new(format!("{}  이 계정만 재스캔", ph::ARROWS_CLOCKWISE)))
                     .on_hover_text("계정 필터에 선택된 계정만 다시 스캔해 갱신").clicked() { do_rescan_acct = true; }
+                let perm_hint = if self.all_filter_acct.is_empty() { "모든 계정 사이트 public_html 권한 일괄 점검 (CMS 무관)" } else { "선택 계정 사이트 public_html 권한 일괄 점검" };
+                if ui.add_enabled(!running, egui::Button::new("🔐  권한 점검")).on_hover_text(perm_hint).clicked() { do_perm = true; }
+                if ui.add_enabled(!running, egui::Button::new("🔧  권한 수정")).on_hover_text("사이트 public_html 을 해당 계정 소유로 chown -R + 755 (필터 계정 또는 전체, 확인 후 실행)").clicked() { do_permfix = true; }
                 if scanning { ui.spinner(); ui.label("스캔 중…"); }
             });
             // 계정 필터 + 도메인 검색
@@ -1769,8 +1953,26 @@ impl App {
             }
         }
         self.load_aliases_batch(alias_loads, ctx);
+        // 퍼미션 미조회 사이트가 있으면 전체 1회 조회 (표에 소유/권한 표시)
+        if self.all_sites.iter().any(|r| r.perm.is_empty()) { self.load_site_perms("", ctx); }
         if close { self.view = MainView::Domain; }
         if do_load { self.load_all_sites(ctx); }
+        if do_perm {
+            let acct = self.all_filter_acct.clone();
+            let scope = if acct.trim().is_empty() { None } else { Some(acct.as_str()) };
+            match ops::build_perm_audit(&self.store.settings, scope) {
+                Ok(job) => self.run_diagnostic(job, ctx),
+                Err(e) => { self.log.push(format!("권한 점검: {e}")); self.status = format!("오류: {e}"); self.last_ok = Some(false); }
+            }
+        }
+        if do_permfix {
+            let acct = self.all_filter_acct.clone();
+            let scope = if acct.trim().is_empty() { None } else { Some(acct.as_str()) };
+            match ops::build_perm_fix_audit(&self.store.settings, scope) {
+                Ok(job) => self.eond_confirm = Some(job),
+                Err(e) => { self.log.push(format!("권한 수정: {e}")); self.status = format!("오류: {e}"); self.last_ok = Some(false); }
+            }
+        }
         if do_rescan_acct { let a = self.all_filter_acct.clone(); self.rescan_account_into_all(a, ctx); }
         if do_dns {
             let doms: Vec<String> = self.all_sites.iter().filter(|r| r.sel).map(|r| r.domain.clone()).collect();
@@ -2156,6 +2358,7 @@ impl App {
                         id,
                         name: self.new_customer.trim().to_string(),
                         memo: String::new(),
+                        notes: Vec::new(),
                         domains: Vec::new(),
                         deleted_at: None,
                     });
@@ -2183,6 +2386,8 @@ impl App {
     fn tree_view(&mut self, ui: &mut egui::Ui) {
         let mut select: Option<(usize, usize)> = None;
         let mut open_account: Option<usize> = None;
+        // 우클릭으로 "작업중" 토글할 (고객,도메인) 인덱스
+        let mut toggle_working: Option<(usize, usize)> = None;
         for ci in 0..self.store.customers.len() {
             if self.store.customers[ci].deleted_at.is_some() {
                 continue;
@@ -2251,6 +2456,7 @@ impl App {
                                 cms_install: Default::default(),
                                 deleted_at: None,
                                 history: Vec::new(),
+                                working: false,
                             });
                             self.sel_customer = Some(ci);
                             self.sel_domain = Some(0);
@@ -2265,12 +2471,30 @@ impl App {
                         continue;
                     }
                     let dname = self.store.customers[ci].domains[di].name.clone();
+                    let working = self.store.customers[ci].domains[di].working;
                     let selected = self.sel_customer == Some(ci) && self.sel_domain == Some(di);
-                    if ui.selectable_label(selected, format!("{}  {dname}", ph::GLOBE)).clicked() {
-                        select = Some((ci, di));
-                    }
+                    // 작업중이면 렌치 아이콘 + 앰버색 강조
+                    let amber = egui::Color32::from_rgb(224, 168, 74);
+                    let label = if working {
+                        egui::RichText::new(format!("{}  {dname}  {}", ph::GLOBE, ph::WRENCH)).color(amber).strong()
+                    } else {
+                        egui::RichText::new(format!("{}  {dname}", ph::GLOBE))
+                    };
+                    let resp = ui.selectable_label(selected, label);
+                    if resp.clicked() { select = Some((ci, di)); }
+                    resp.context_menu(|ui| {
+                        let txt = if working { format!("{}  작업중 해제", ph::WRENCH) } else { format!("{}  작업중으로 표시", ph::WRENCH) };
+                        if ui.button(txt).clicked() { toggle_working = Some((ci, di)); ui.close_menu(); }
+                    });
                 }
             });
+        }
+        if let Some((ci, di)) = toggle_working {
+            if let Some(d) = self.store.customers.get_mut(ci).and_then(|c| c.domains.get_mut(di)) {
+                d.working = !d.working;
+            }
+            self.dirty = true;
+            self.save();
         }
         if let Some((ci, di)) = select {
             self.sel_customer = Some(ci);
@@ -2290,6 +2514,7 @@ impl App {
         self.acct_mods.clear();
         self.acct_mods_status.clear();
         self.acct_mods_for = Some(ci);
+        self.acct_note_input.clear();
         self.view = MainView::AccountModules(ci);
     }
 
@@ -2506,6 +2731,8 @@ impl App {
             let mut wp_scan_req = false;
             let mut wp_upload_req: Option<bool> = None;
             let mut wp_download_req: Option<bool> = None;
+            let mut wp_perm_req = false;
+            let mut wp_permfix_req = false;
             let mut changed = false;
             let mut request: Option<PendingAction> = None;
             let mut view_request: Option<(OpKind, String, String, Site, Site)> = None;
@@ -2849,6 +3076,12 @@ impl App {
                                         wp_scan_req = true;
                                     }
                                     if wp_scanning { ui.spinner(); }
+                                    if ui.add_enabled(!running, egui::Button::new("🔐  권한 점검")).on_hover_text("이 도메인 public_html 소유/권한(chmod)/쓰기가능 진단 (CMS 무관, 'access denied' 원인 파악)").clicked() {
+                                        wp_perm_req = true;
+                                    }
+                                    if ui.add_enabled(!running, egui::Button::new("🔧  권한 수정")).on_hover_text("public_html 전체를 웹유저 소유로 chown -R + 755 (root 필요, 확인 후 실행)").clicked() {
+                                        wp_permfix_req = true;
+                                    }
                                     ui.label(egui::RichText::new(&wp_scan_status).weak());
                                     if cached && !wp_scanning { ui.label(egui::RichText::new("· 캐시 표시중").weak()); }
                                 });
@@ -3256,6 +3489,40 @@ impl App {
                     }
                     Err(e) => {
                         self.log.push(format!("WP {} 내려받기: {e}", wp_kind.label()));
+                        self.status = format!("오류: {e}");
+                        self.last_ok = Some(false);
+                    }
+                }
+            }
+            if wp_perm_req {
+                let dom = &self.store.customers[ci].domains[di];
+                let mut c = dom.cms_install.clone();
+                let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                c.hestia_user = server.ftp_id.clone();
+                c.hestia_pass = server.ftp_pw.clone();
+                if c.hestia_user.trim().is_empty() { c.hestia_user = customer_name.clone(); }
+                let dn = dom.name.clone();
+                match ops::build_perm_check(&server, &c, &dn, self.use_root) {
+                    Ok(job) => self.run_diagnostic(job, ctx),
+                    Err(e) => {
+                        self.log.push(format!("권한 점검: {e}"));
+                        self.status = format!("오류: {e}");
+                        self.last_ok = Some(false);
+                    }
+                }
+            }
+            if wp_permfix_req {
+                let dom = &self.store.customers[ci].domains[di];
+                let mut c = dom.cms_install.clone();
+                let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                c.hestia_user = server.ftp_id.clone();
+                c.hestia_pass = server.ftp_pw.clone();
+                if c.hestia_user.trim().is_empty() { c.hestia_user = customer_name.clone(); }
+                let dn = dom.name.clone();
+                match ops::build_perm_fix(&server, &c, &dn, self.use_root) {
+                    Ok(job) => self.eond_confirm = Some(job), // 되돌리기 어려운 변경 → 확인 모달
+                    Err(e) => {
+                        self.log.push(format!("권한 수정: {e}"));
                         self.status = format!("오류: {e}");
                         self.last_ok = Some(false);
                     }

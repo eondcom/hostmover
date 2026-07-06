@@ -893,6 +893,20 @@ pub fn list_aliases(s: &Settings, user: &str, domain: &str) -> Result<Vec<String
     Ok(list)
 }
 
+/// 특정 유저의 웹도메인별 생성일 (도메인, DATE=YYYY-MM-DD). HestiaCP web.conf 기준(v-list-web-domains).
+pub fn hestia_web_domain_dates(s: &Settings, user: &str) -> Result<Vec<(String, String)>, String> {
+    let (script, env) = hestia_api_job(s, "v-list-web-domains", &[user, "json"]);
+    let out = run_capture(&script, &env)?;
+    let v = parse_json(&out)?;
+    let obj = v.as_object().ok_or("도메인 목록 형식 오류")?;
+    let mut res = Vec::new();
+    for (dom, fields) in obj {
+        let date = fields.get("DATE").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        res.push((dom.clone(), date));
+    }
+    Ok(res)
+}
+
 /// 특정 유저의 웹도메인 목록 (도메인, IP)
 pub fn hestia_list_web_domains(s: &Settings, user: &str) -> Result<Vec<(String, String)>, String> {
     let (script, env) = hestia_api_job(s, "v-list-web-domains", &[user, "json"]);
@@ -1808,6 +1822,7 @@ fn build_git_cms_update(server: &Site, c: &CmsInstall, s: &Settings, domain_name
              [ -d \"$WR\" ] || {{ echo \"✗ 웹루트 없음: $WR\"; exit 1; }}\n\
              INNER='{inner}'\n\
              sudo -u \"$OWN\" WR=\"$WR\" REPO=\"$REPO\" EXCL=\"$EXCL\" bash -c \"$INNER\"\n\
+             chown -R \"$OWN:$OWN\" \"$WR\" && echo \"  ✓ 소유권 보정: $WR → $OWN:$OWN\"\n\
              echo \"== $CMSNAME 업데이트 완료: $DOMAIN ==\"\n",
             own = sq(&owner), dom = sq(&domain), cn = sq(g.name), repo = sq(g.repo), excl = sq(&excl), inner = CMS_UPDATE_INNER,
         );
@@ -2202,8 +2217,8 @@ pub fn build_account_git_update(s: &Settings, account: &str, domains: &[String])
     let scope = if domains.is_empty() { "전체".to_string() } else { format!("{}개 선택", domains.len()) };
     let body = format!(
         "shopt -s nullglob\nOK=0; SKIP=0; FAIL=0\n\
-         for WR in {list}; do\n  [ -d \"$WR\" ] || continue\n  DOM=\"$(basename \"$(dirname \"$WR\")\")\"\n{step}\ndone\n\
-         echo \"== 완료: 업데이트 $OK · 건너뜀 $SKIP · 실패 $FAIL ==\"\n",
+         for WR in {list}; do\n  [ -d \"$WR\" ] || continue\n  DOM=\"$(basename \"$(dirname \"$WR\")\")\"\n{step}\n  chown -R \"$OWN:$OWN\" \"$WR\" 2>/dev/null || true\ndone\n\
+         echo \"== 완료: 업데이트 $OK · 건너뜀 $SKIP · 실패 $FAIL (소유권 $OWN 로 보정) ==\"\n",
         list = list, step = SITE_UPDATE_STEP,
     );
     let raw = format!("export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin\"\nOWN={}\n{}", sq(acct), body);
@@ -2669,6 +2684,38 @@ fn wp_read_local_assets(src: &str, kind: WpAssetKind) -> Vec<(String, String, St
     out
 }
 
+/// wp-load.php 를 기준으로 WEBROOT 를 자동 탐지하는 bash/sh 스니펫.
+/// 사전조건: 스크립트에 VUSER, DOMAIN 이 이미 설정돼 있어야 한다.
+/// 서버마다 웹루트가 다른 문제 해결 — 설정된 site_path(1순위) → 흔한 후보들 → find 폴백 순으로
+/// wp-load.php 가 있는 디렉터리를 WEBROOT 로 잡는다. 못 찾으면 WEBROOT 는 빈 문자열.
+fn wp_webroot_detect(site_path: &str) -> String {
+    let sp = site_path.trim().trim_end_matches('/');
+    format!(
+        "SITEPATH={sp}\n\
+         WEBROOT=''\n\
+         for c in \"$SITEPATH\" \"/home/$VUSER/web/$DOMAIN/public_html\" \"/home/$VUSER/public_html\" \"/var/www/$DOMAIN/public_html\" \"/var/www/$DOMAIN\" \"/var/www/html\"; do\n\
+           if [ -n \"$c\" ] && [ -f \"$c/wp-load.php\" ]; then WEBROOT=\"$c\"; break; fi\n\
+         done\n\
+         if [ -z \"$WEBROOT\" ]; then F=\"$(find /home/$VUSER /var/www -maxdepth 5 -name wp-load.php 2>/dev/null | head -1)\"; [ -n \"$F\" ] && WEBROOT=\"$(dirname \"$F\")\"; fi\n",
+        sp = sq(sp),
+    )
+}
+
+/// CMS 무관 docroot(public_html) 자동 탐지 스니펫 (디렉터리 존재 기준).
+/// wp-load.php 를 요구하지 않으므로 Rhymix/그누보드/정적 사이트에도 쓸 수 있다.
+/// 사전조건: VUSER, DOMAIN 이 이미 설정돼 있어야 한다. 설정된 site_path(1순위) → 흔한 후보 순.
+fn docroot_detect(site_path: &str) -> String {
+    let sp = site_path.trim().trim_end_matches('/');
+    format!(
+        "SITEPATH={sp}\n\
+         WEBROOT=''\n\
+         for c in \"$SITEPATH\" \"/home/$VUSER/web/$DOMAIN/public_html\" \"/home/$VUSER/public_html\" \"/var/www/$DOMAIN/public_html\" \"/var/www/$DOMAIN\" \"/var/www/html\"; do\n\
+           if [ -n \"$c\" ] && [ -d \"$c\" ]; then WEBROOT=\"$c\"; break; fi\n\
+         done\n",
+        sp = sq(sp),
+    )
+}
+
 /// 로컬 dev/wp 와 대상 사이트의 설치 플러그인/테마 버전을 비교해 표 데이터를 만든다 (blocking).
 pub fn wp_asset_scan(server: &Site, c: &CmsInstall, src_base: &str, domain_name: &str, use_root: bool, kind: WpAssetKind) -> Result<Vec<WpPluginRow>, String> {
     cms_validate(server, c, use_root, false, false)?;
@@ -2686,9 +2733,9 @@ pub fn wp_asset_scan(server: &Site, c: &CmsInstall, src_base: &str, domain_name:
     //       이제 {sub} 디렉터리 전체를 find 한 번으로 훑고 awk 로 폴더별 합계/최신수정을 집계한다(프로세스 1개).
     let raw = format!(
         "export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin\"\nVUSER={u}\nDOMAIN={d}\n\
-         WEBROOT=/home/$VUSER/web/$DOMAIN/public_html\n\
+         {det}\
          WPCLI=/usr/local/bin/wp\n\
-         if [ ! -f \"$WEBROOT/wp-load.php\" ]; then echo 'NOTWP'; exit 0; fi\n\
+         if [ -z \"$WEBROOT\" ] || [ ! -f \"$WEBROOT/wp-load.php\" ]; then echo 'NOTWP'; exit 0; fi\n\
          DIR=\"$WEBROOT/wp-content/{sub}\"\n\
          if [ -d \"$DIR\" ]; then\n\
            find \"$DIR\" -mindepth 2 {fx}-type f -printf '%P\\t%s\\t%T@\\n' 2>/dev/null | \\\n\
@@ -2697,7 +2744,7 @@ pub fn wp_asset_scan(server: &Site, c: &CmsInstall, src_base: &str, domain_name:
          fi\n\
          if ! [ -x \"$WPCLI\" ]; then curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o \"$WPCLI\" 2>/dev/null && chmod +x \"$WPCLI\"; fi\n\
          sudo -u \"$VUSER\" \"$WPCLI\" --path=\"$WEBROOT\" {wc} list --fields=name,status,version --format=json 2>/dev/null || echo '[]'\n",
-        u = sq(c.hestia_user.trim()), d = sq(&domain), sub = sub, wc = kind.wp_cli(), fx = find_exclude_conds(),
+        u = sq(c.hestia_user.trim()), d = sq(&domain), det = wp_webroot_detect(&server.path), sub = sub, wc = kind.wp_cli(), fx = find_exclude_conds(),
     );
     let (script, sshpass, mut env) = eondcms_exec(server, &raw, use_root, c.sudo);
     env.push(("SSHPASS".to_string(), sshpass));
@@ -2812,16 +2859,16 @@ pub fn build_wp_asset_upload(server: &Site, c: &CmsInstall, src_base: &str, item
     let remote_raw = format!(
         "set -e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin\"\n\
          VUSER={vu}\nDOMAIN={d}\nSTAGING={st}\n\
-         WEBROOT=\"/home/$VUSER/web/$DOMAIN/public_html\"\n\
+         {det}\
+         [ -n \"$WEBROOT\" ] && [ -f \"$WEBROOT/wp-load.php\" ] || {{ echo \"✗ WordPress 웹루트 탐지 실패(설정>서버의 '경로'를 지정하거나 대상 확인)\"; rm -rf \"$STAGING\"; exit 1; }}\n\
          echo \"== WordPress {lbl} 설치: $DOMAIN (webroot=$WEBROOT) ==\"\n\
-         [ -f \"$WEBROOT/wp-load.php\" ] || {{ echo \"✗ WordPress 미설치: $WEBROOT\"; rm -rf \"$STAGING\"; exit 1; }}\n\
          mkdir -p \"$WEBROOT/wp-content/{sub}\"\n\
          for d in \"$STAGING/{sub}\"/*/; do [ -d \"$d\" ] || continue; n=$(basename \"$d\");\n\
            rm -rf \"$WEBROOT/wp-content/{sub}/$n\"; cp -a \"$d\" \"$WEBROOT/wp-content/{sub}/$n\"; echo \"  + {sub}/$n\"; done\n\
          chown -R \"$VUSER:$VUSER\" \"$WEBROOT/wp-content/{sub}\"\n\
          rm -rf \"$STAGING\"\n\
          echo \"== 업로드 완료 ==\"\n",
-        vu = sq(vuser), d = sq(&domain), st = sq(&staging), sub = sub, lbl = lbl,
+        vu = sq(vuser), d = sq(&domain), st = sq(&staging), det = wp_webroot_detect(&server.path), sub = sub, lbl = lbl,
     );
     let (sudo_script, sshpass, env) = eondcms_exec(server, &remote_raw, use_root, c.sudo);
     let script = format!("{rs}{sudo_script}");
@@ -2830,7 +2877,7 @@ pub fn build_wp_asset_upload(server: &Site, c: &CmsInstall, src_base: &str, item
         script,
         sshpass,
         env,
-        note: format!("로컬 {assetbase} → {user}@{host}:{webroot}/wp-content/{sub}  ({})", names.join(",")),
+        note: format!("로컬 {assetbase} → {user}@{host}:<웹루트 자동탐지>/wp-content/{sub}  (기본 {webroot}) ({})", names.join(",")),
     })
 }
 
@@ -2863,9 +2910,9 @@ pub fn build_wp_asset_download(server: &Site, c: &CmsInstall, src_base: &str, it
     let remote_raw = format!(
         "set -e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin\"\n\
          VUSER={vu}\nDOMAIN={d}\nSTAGING={st}\nLOGINU={lu}\n\
-         WEBROOT=\"/home/$VUSER/web/$DOMAIN/public_html\"\n\
+         {det}\
+         [ -n \"$WEBROOT\" ] && [ -f \"$WEBROOT/wp-load.php\" ] || {{ echo \"✗ WordPress 웹루트 탐지 실패(설정>서버의 '경로'를 지정하거나 대상 확인)\"; exit 1; }}\n\
          echo \"== WordPress {lbl} 내려받기 준비: $DOMAIN (webroot=$WEBROOT) ==\"\n\
-         [ -f \"$WEBROOT/wp-load.php\" ] || {{ echo \"✗ WordPress 미설치: $WEBROOT\"; exit 1; }}\n\
          rm -rf \"$STAGING\"; mkdir -p \"$STAGING/{sub}\"\n\
          for n in {namelist}; do\n\
            if [ -d \"$WEBROOT/wp-content/{sub}/$n\" ]; then cp -a \"$WEBROOT/wp-content/{sub}/$n\" \"$STAGING/{sub}/$n\"; echo \"  ↓준비 {sub}/$n\"; \
@@ -2873,7 +2920,7 @@ pub fn build_wp_asset_download(server: &Site, c: &CmsInstall, src_base: &str, it
          done\n\
          chown -R \"$LOGINU\" \"$STAGING\"\n\
          echo \"== 준비 완료 ==\"\n",
-        vu = sq(vuser), d = sq(&domain), st = sq(&staging), lu = sq(user), sub = sub, lbl = lbl, namelist = namelist,
+        vu = sq(vuser), d = sq(&domain), st = sq(&staging), lu = sq(user), det = wp_webroot_detect(&server.path), sub = sub, lbl = lbl, namelist = namelist,
     );
     let (stage_script, sshpass, env) = eondcms_exec(server, &remote_raw, use_root, c.sudo);
 
@@ -2906,8 +2953,191 @@ pub fn build_wp_asset_download(server: &Site, c: &CmsInstall, src_base: &str, it
         script,
         sshpass,
         env,
-        note: format!("원격 {user}@{host}:{webroot}/wp-content/{sub} → 로컬 {assetbase}  ({})", names.join(",")),
+        note: format!("원격 {user}@{host}:<웹루트 자동탐지>/wp-content/{sub} → 로컬 {assetbase}  (기본 {webroot}) ({})", names.join(",")),
     })
+}
+
+/// 단일 도메인 권한/소유권 진단 (읽기전용). "access denied" 원인 파악용:
+/// 실행권한(root/sudo), vuser 존재, 웹루트 탐지, wp-content 소유·권한, vuser 쓰기가능, wp-cli 실행권한.
+pub fn build_perm_check(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    cms_validate(server, c, use_root, false, false)?;
+    let domain = to_ascii_domain(domain_name);
+    let vuser = c.hestia_user.trim();
+    if vuser.is_empty() { return Err("HestiaCP 유저가 비어 있습니다".into()); }
+    let raw = format!(
+        "export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin\"\n\
+         VUSER={vu}\nDOMAIN={d}\n\
+         echo \"== 권한 점검: $DOMAIN (웹유저=$VUSER) ==\"\n\
+         echo \"- 실행 계정: $(id -un 2>/dev/null) uid=$(id -u 2>/dev/null)\"\n\
+         if [ \"$(id -u)\" = 0 ]; then echo \"  ✓ root 권한 확보\"; else echo \"  ✗ root 아님 — 소유권 변경/타유저 접근이 제한될 수 있음(설정에서 루트 또는 sudo 계정 확인)\"; fi\n\
+         if id \"$VUSER\" >/dev/null 2>&1; then echo \"  ✓ 시스템 유저 존재: $VUSER\"; else echo \"  ✗ 시스템 유저 없음: $VUSER (HestiaCP 유저/계정 확인)\"; fi\n\
+         {det}\
+         if [ -z \"$WEBROOT\" ]; then echo \"  ✗ 웹루트(public_html) 자동탐지 실패 — 설정>서버의 '경로' 지정 필요\"; echo \"== 점검 종료 ==\"; exit 0; fi\n\
+         echo \"  ✓ 웹루트: $WEBROOT\"\n\
+         CMS=\"일반/미상\"\n\
+         if [ -f \"$WEBROOT/wp-load.php\" ]; then CMS=\"WordPress\"; elif [ -f \"$WEBROOT/config/config.inc.php\" ] || [ -d \"$WEBROOT/modules\" ]; then CMS=\"Rhymix/XE\"; elif [ -f \"$WEBROOT/common.php\" ] && [ -d \"$WEBROOT/bbs\" ]; then CMS=\"그누보드\"; fi\n\
+         echo \"  - CMS: $CMS\"\n\
+         OWN=$(stat -c '%U:%G' \"$WEBROOT\" 2>/dev/null); PERM=$(stat -c '%a' \"$WEBROOT\" 2>/dev/null)\n\
+         echo \"  - public_html  소유=$OWN  권한(chmod)=$PERM\"\n\
+         case \"$OWN\" in \"$VUSER:\"*) echo \"    ✓ 소유자 OK\";; *) echo \"    ✗ 소유자가 $VUSER 아님 (access denied 흔한 원인 — '권한 수정'으로 교정)\";; esac\n\
+         if sudo -u \"$VUSER\" test -w \"$WEBROOT\" 2>/dev/null; then echo \"    ✓ 웹유저 쓰기가능\"; else echo \"    ✗ 웹유저 쓰기불가\"; fi\n\
+         FOREIGN=$(find \"$WEBROOT\" ! -user \"$VUSER\" -print -quit 2>/dev/null)\n\
+         if [ -n \"$FOREIGN\" ]; then echo \"    ✗ 타유저(주로 root) 소유 파일 있음 (예: $FOREIGN)\"; else echo \"    ✓ 모든 파일 $VUSER 소유\"; fi\n\
+         echo \"- 쓰기 필요한 하위 디렉터리:\"\n\
+         for P in wp-content wp-content/uploads files config data cache; do\n\
+           D=\"$WEBROOT/$P\"; [ -d \"$D\" ] || continue\n\
+           O=$(stat -c '%U' \"$D\" 2>/dev/null); PM=$(stat -c '%a' \"$D\" 2>/dev/null)\n\
+           if sudo -u \"$VUSER\" test -w \"$D\" 2>/dev/null; then W=\"쓰기OK\"; else W=\"✗쓰기불가\"; fi\n\
+           echo \"  - $P  소유=$O  권한=$PM  $W\"\n\
+         done\n\
+         echo \"== 점검 완료 ==\"\n",
+        vu = sq(vuser), d = sq(&domain), det = docroot_detect(&server.path),
+    );
+    let (script, sshpass, env) = eondcms_exec(server, &raw, use_root, c.sudo);
+    Ok(Job {
+        title: format!("권한 점검 : {domain_name}"),
+        script,
+        sshpass,
+        env,
+        note: "읽기전용 진단 — public_html 소유/권한(chmod)/쓰기가능 (CMS 무관)".into(),
+    })
+}
+
+/// 단일 도메인 소유권 자동 수정: docroot(public_html) 전체를 웹유저 소유로 chown + 최상위 755.
+/// root/sudo 권한 필요(파일이 root 소유라 웹유저가 못 고치는 경우 대응). 되돌리기 어려운 변경 → 확인 후 실행.
+pub fn build_perm_fix(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    cms_validate(server, c, use_root, false, false)?;
+    let domain = to_ascii_domain(domain_name);
+    let vuser = c.hestia_user.trim();
+    if vuser.is_empty() { return Err("HestiaCP 유저가 비어 있습니다".into()); }
+    let raw = format!(
+        "set -e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin\"\n\
+         VUSER={vu}\nDOMAIN={d}\n\
+         if [ \"$(id -u)\" != 0 ]; then echo \"✗ root 아님 — 소유권 변경 불가('루트로 실행' 켜거나 sudo 계정 확인)\"; exit 1; fi\n\
+         if ! id \"$VUSER\" >/dev/null 2>&1; then echo \"✗ 시스템 유저 없음: $VUSER\"; exit 1; fi\n\
+         {det}\
+         if [ -z \"$WEBROOT\" ]; then echo \"✗ 웹루트(public_html) 탐지 실패 — 설정>서버의 '경로' 지정 필요\"; exit 1; fi\n\
+         echo \"== 소유권 수정: $WEBROOT → $VUSER:$VUSER ==\"\n\
+         BEFORE=$(find \"$WEBROOT\" ! -user \"$VUSER\" 2>/dev/null | wc -l)\n\
+         echo \"  - 수정 전 타유저 소유 파일: ${{BEFORE}}개\"\n\
+         chown -R \"$VUSER:$VUSER\" \"$WEBROOT\"\n\
+         chmod 755 \"$WEBROOT\"\n\
+         AFTER=$(find \"$WEBROOT\" ! -user \"$VUSER\" 2>/dev/null | wc -l)\n\
+         echo \"  ✓ chown 완료 (남은 타유저 소유: ${{AFTER}}개), public_html chmod 755\"\n\
+         echo \"== 소유권 수정 완료 ==\"\n",
+        vu = sq(vuser), d = sq(&domain), det = docroot_detect(&server.path),
+    );
+    let (script, sshpass, env) = eondcms_exec(server, &raw, use_root, c.sudo);
+    Ok(Job {
+        title: format!("권한 수정(chown) : {domain_name}"),
+        script,
+        sshpass,
+        env,
+        note: format!("public_html 전체를 {vuser} 소유로 변경 + 최상위 755 (root 필요)"),
+    })
+}
+
+/// 계정 glob 검증 후 `/home/<acct|*>/web/*/public_html` 패턴을 만든다.
+fn perm_glob(account: Option<&str>) -> Result<String, String> {
+    Ok(match account {
+        Some(a) => {
+            let a = a.trim();
+            if !is_safe_name(a) { return Err("계정 이름 형식 오류".into()); }
+            format!("/home/{a}/web/*/public_html")
+        }
+        None => "/home/*/web/*/public_html".to_string(),
+    })
+}
+
+/// 전체(또는 계정) 사이트 일괄 권한 점검 (읽기전용, CMS 무관). 각 사이트 public_html 의 소유자가
+/// 웹유저인지, 타유저(주로 root) 소유 파일이 섞였는지, 웹유저 쓰기가능한지 + chmod 를 한 줄 판정.
+/// account=Some 이면 그 계정만, None 이면 모든 계정.
+pub fn build_perm_audit(s: &Settings, account: Option<&str>) -> Result<Job, String> {
+    let srv = ssh_admin_site(s)?;
+    let glob = perm_glob(account)?;
+    let raw = format!(
+        "export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin\"\n\
+         shopt -s nullglob 2>/dev/null || true\n\
+         echo \"== 사이트 권한 점검 (public_html 소유/권한 · CMS 무관) ==\"\n\
+         TOTAL=0; BAD=0\n\
+         for WR in {glob}; do\n\
+           [ -d \"$WR\" ] || continue\n\
+           OWN=$(echo \"$WR\" | awk -F/ '{{print $3}}')\n\
+           DOM=$(basename \"$(dirname \"$WR\")\")\n\
+           TOTAL=$((TOTAL+1))\n\
+           DOWN=$(stat -c '%U' \"$WR\" 2>/dev/null); PERM=$(stat -c '%a' \"$WR\" 2>/dev/null)\n\
+           FOREIGN=$(find \"$WR\" ! -user \"$OWN\" -print -quit 2>/dev/null)\n\
+           if sudo -u \"$OWN\" test -w \"$WR\" 2>/dev/null; then WOK=1; else WOK=0; fi\n\
+           if [ \"$DOWN\" = \"$OWN\" ] && [ -z \"$FOREIGN\" ] && [ \"$WOK\" = 1 ]; then\n\
+             echo \"  ✓ $OWN / $DOM  (소유=$DOWN 권한=$PERM)\"\n\
+           else\n\
+             BAD=$((BAD+1))\n\
+             MSG=\"\"; [ \"$DOWN\" != \"$OWN\" ] && MSG=\"$MSG 소유=$DOWN\"; [ -n \"$FOREIGN\" ] && MSG=\"$MSG 타유저파일있음\"; [ \"$WOK\" != 1 ] && MSG=\"$MSG 쓰기불가\"\n\
+             echo \"  ✗ $OWN / $DOM  권한=$PERM :$MSG\"\n\
+           fi\n\
+         done\n\
+         echo \"== 완료: 사이트 $TOTAL곳 · 문제 $BAD곳 (✗ 는 access denied 위험 — '권한 수정'으로 교정) ==\"\n",
+        glob = glob,
+    );
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    let title = match account { Some(a) => format!("권한 점검(계정) : {a}"), None => "권한 점검(전체 사이트)".to_string() };
+    Ok(Job { title, script, sshpass, env, note: "읽기전용 — 각 사이트 public_html 소유/권한(chmod)/쓰기 판정".into() })
+}
+
+/// 전체(또는 계정) 사이트 일괄 소유권 수정. 각 사이트 public_html 을 그 계정(홈 소유자)으로 chown + 755.
+/// 되돌리기 어려운 변경 → 확인 후 실행.
+pub fn build_perm_fix_audit(s: &Settings, account: Option<&str>) -> Result<Job, String> {
+    let srv = ssh_admin_site(s)?;
+    let glob = perm_glob(account)?;
+    let raw = format!(
+        "export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin\"\n\
+         shopt -s nullglob 2>/dev/null || true\n\
+         echo \"== 사이트 소유권 일괄 수정 (public_html → 각 계정 소유) ==\"\n\
+         OK=0; NG=0\n\
+         for WR in {glob}; do\n\
+           [ -d \"$WR\" ] || continue\n\
+           OWN=$(echo \"$WR\" | awk -F/ '{{print $3}}')\n\
+           DOM=$(basename \"$(dirname \"$WR\")\")\n\
+           id \"$OWN\" >/dev/null 2>&1 || {{ echo \"  ✗ $OWN / $DOM : 유저 없음\"; NG=$((NG+1)); continue; }}\n\
+           if chown -R \"$OWN:$OWN\" \"$WR\" 2>/dev/null && chmod 755 \"$WR\" 2>/dev/null; then echo \"  ✓ $OWN / $DOM\"; OK=$((OK+1)); else echo \"  ✗ $OWN / $DOM : chown 실패\"; NG=$((NG+1)); fi\n\
+         done\n\
+         echo \"== 완료: 수정 $OK곳 · 실패 $NG곳 ==\"\n",
+        glob = glob,
+    );
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    let title = match account { Some(a) => format!("권한 수정(계정) : {a}"), None => "권한 수정(전체 사이트)".to_string() };
+    Ok(Job { title, script, sshpass, env, note: "각 사이트 public_html 을 해당 계정 소유로 chown -R + 755 (root)".into() })
+}
+
+/// 전체(또는 계정) 사이트의 public_html 소유/권한을 조회 (읽기전용, blocking).
+/// 반환: (계정, 도메인, "소유자:chmod")  예: ("rokmc", "hbphoto.kr", "root:755")
+pub fn scan_site_perms(s: &Settings, account: Option<&str>) -> Result<Vec<(String, String, String)>, String> {
+    let srv = ssh_admin_site(s)?;
+    let glob = perm_glob(account)?;
+    let raw = format!(
+        "export PATH=\"$PATH:/usr/bin:/bin:/usr/local/bin\"\n\
+         shopt -s nullglob 2>/dev/null || true\n\
+         for WR in {glob}; do\n\
+           [ -d \"$WR\" ] || continue\n\
+           OWN=$(echo \"$WR\" | awk -F/ '{{print $3}}')\n\
+           DOM=$(basename \"$(dirname \"$WR\")\")\n\
+           PO=$(stat -c '%U' \"$WR\" 2>/dev/null); PM=$(stat -c '%a' \"$WR\" 2>/dev/null)\n\
+           echo \"$OWN|$DOM|$PO:$PM\"\n\
+         done\n",
+        glob = glob,
+    );
+    let (script, sshpass, mut env) = eondcms_exec(&srv, &raw, false, true);
+    env.push(("SSHPASS".to_string(), sshpass));
+    let out = run_capture(&script, &env)?;
+    let mut res = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        let f: Vec<&str> = line.splitn(3, '|').collect();
+        if f.len() == 3 && !f[0].is_empty() && !f[1].is_empty() {
+            res.push((f[0].to_string(), f[1].to_string(), f[2].to_string()));
+        }
+    }
+    Ok(res)
 }
 
 /// finalize 원시 remote 스크립트 조립 (head + body1 + 내장 nginx 템플릿 heredoc + body2).
@@ -3567,6 +3797,40 @@ mod tests {
         assert!(build_wp_asset_download(&server, &c, &src, &["../x".into()], "ex.com", true, WpAssetKind::Theme).is_err());
         assert!(build_wp_asset_download(&server, &c, "/no/such/wp", &["eond-theme".into()], "ex.com", true, WpAssetKind::Theme).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn perm_check_and_audit_valid_bash() {
+        let mut server = sample_site();
+        server.root_id = "tong".into();
+        server.root_pw = "tongpw".into();
+        let c = CmsInstall { kind: CmsKind::WordPress, hestia_user: "eond".into(), sudo: true, ..Default::default() };
+        // 단일 도메인 권한 점검(CMS 무관 · public_html)
+        let j = build_perm_check(&server, &c, "ex.com", true).unwrap();
+        assert!(j.script.contains("권한 점검"), "{}", j.script);
+        assert!(j.script.contains("public_html") && j.script.contains("chmod"), "{}", j.script);
+        let o = std::process::Command::new("bash").args(["-n", "-c", &j.script]).output().expect("bash");
+        assert!(o.status.success(), "bash 오류(check):\n{}\n{}", String::from_utf8_lossy(&o.stderr), j.script);
+        // 단일 도메인 소유권 수정
+        let jf = build_perm_fix(&server, &c, "ex.com", true).unwrap();
+        assert!(jf.script.contains("chown -R"), "{}", jf.script);
+        let of = std::process::Command::new("bash").args(["-n", "-c", &jf.script]).output().expect("bash");
+        assert!(of.status.success(), "bash 오류(fix):\n{}\n{}", String::from_utf8_lossy(&of.stderr), jf.script);
+        // 전체 / 계정 일괄 점검 + 수정
+        let st = Settings { ssh_host: "1.2.3.4".into(), ssh_user: "tong".into(), ssh_pass: "pw".into(), ..Default::default() };
+        for (job, needle) in [
+            (build_perm_audit(&st, None).unwrap(), "/home/*/web/*/public_html"),
+            (build_perm_audit(&st, Some("eond")).unwrap(), "/home/eond/web/*/public_html"),
+            (build_perm_fix_audit(&st, None).unwrap(), "chown -R"),
+            (build_perm_fix_audit(&st, Some("eond")).unwrap(), "/home/eond/web/*/public_html"),
+        ] {
+            assert!(job.script.contains(needle), "'{needle}' 누락:\n{}", job.script);
+            let out = std::process::Command::new("bash").args(["-n", "-c", &job.script]).output().expect("bash");
+            assert!(out.status.success(), "bash 오류:\n{}\n{}", String::from_utf8_lossy(&out.stderr), job.script);
+        }
+        // 계정 이름 주입 방지
+        assert!(build_perm_audit(&st, Some("../etc")).is_err());
+        assert!(build_perm_fix_audit(&st, Some("../etc")).is_err());
     }
 
     #[test]

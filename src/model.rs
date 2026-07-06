@@ -60,6 +60,12 @@ pub struct CachedSite {
     pub file_bytes: u64,
     #[serde(default)]
     pub db_bytes: u64,
+    /// HestiaCP 웹도메인 생성일 (YYYY-MM-DD). 없으면 빈 문자열.
+    #[serde(default)]
+    pub created: String,
+    /// public_html 소유/권한 "소유자:chmod" (예: "rokmc:755"). 없으면 빈 문자열.
+    #[serde(default)]
+    pub perm: String,
 }
 
 /// 앱 설정 (HestiaCP 연동 등). 암호화 저장.
@@ -108,6 +114,15 @@ impl Store {
     }
 }
 
+/// 고객 메모 1건 (그때그때 추가요청/작업사항 기록). 작성 시각 자동 기록.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CustomerNote {
+    /// 작성(또는 최종수정) 시각 (unix 초)
+    pub at: i64,
+    /// 메모 본문
+    pub text: String,
+}
+
 /// 고객 (예: omg)
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Customer {
@@ -115,6 +130,9 @@ pub struct Customer {
     pub name: String,
     #[serde(default)]
     pub memo: String,
+    /// 고객별 메모 로그 (최신이 앞) — 추가요청/작업사항을 그때그때 기록
+    #[serde(default)]
+    pub notes: Vec<CustomerNote>,
     #[serde(default)]
     pub domains: Vec<Domain>,
     /// 소프트삭제 시각(unix초). Some 이면 휴지통, 30일 후 완전삭제.
@@ -164,6 +182,9 @@ pub struct Domain {
     /// 작업 기록 (이전/설치/업데이트 이력)
     #[serde(default)]
     pub history: Vec<ActivityLog>,
+    /// "작업중" 표시 (사이드바 우클릭으로 토글) — 진행 중인 도메인 눈에 띄게
+    #[serde(default)]
+    pub working: bool,
 }
 
 fn default_true() -> bool {
