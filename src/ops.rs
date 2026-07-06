@@ -2990,6 +2990,7 @@ pub fn build_perm_check(server: &Site, c: &CmsInstall, domain_name: &str, use_ro
            if sudo -u \"$VUSER\" test -w \"$D\" 2>/dev/null; then W=\"쓰기OK\"; else W=\"✗쓰기불가\"; fi\n\
            echo \"  - $P  소유=$O  권한=$PM  $W\"\n\
          done\n\
+         echo \"- 정상 기준: 디렉터리 755 · 파일 644 · public_html 751 · 소유자=웹유저 (files/config/data 등 쓰기폴더도 소유자만 맞으면 755로 충분)\"\n\
          echo \"== 점검 완료 ==\"\n",
         vu = sq(vuser), d = sq(&domain), det = docroot_detect(&server.path),
     );
@@ -3003,7 +3004,7 @@ pub fn build_perm_check(server: &Site, c: &CmsInstall, domain_name: &str, use_ro
     })
 }
 
-/// 단일 도메인 소유권 자동 수정: docroot(public_html) 전체를 웹유저 소유로 chown + 최상위 755.
+/// 단일 도메인 소유권 자동 수정: docroot(public_html) 소유 chown -R + 디렉터리 755·파일 644·최상위 751.
 /// root/sudo 권한 필요(파일이 root 소유라 웹유저가 못 고치는 경우 대응). 되돌리기 어려운 변경 → 확인 후 실행.
 pub fn build_perm_fix(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
     cms_validate(server, c, use_root, false, false)?;
@@ -3017,14 +3018,17 @@ pub fn build_perm_fix(server: &Site, c: &CmsInstall, domain_name: &str, use_root
          if ! id \"$VUSER\" >/dev/null 2>&1; then echo \"✗ 시스템 유저 없음: $VUSER\"; exit 1; fi\n\
          {det}\
          if [ -z \"$WEBROOT\" ]; then echo \"✗ 웹루트(public_html) 탐지 실패 — 설정>서버의 '경로' 지정 필요\"; exit 1; fi\n\
-         echo \"== 소유권 수정: $WEBROOT → $VUSER:$VUSER ==\"\n\
+         echo \"== 권한 수정: $WEBROOT → 소유 $VUSER:$VUSER, 디렉터리 755 / 파일 644 / 최상위 751 ==\"\n\
          BEFORE=$(find \"$WEBROOT\" ! -user \"$VUSER\" 2>/dev/null | wc -l)\n\
          echo \"  - 수정 전 타유저 소유 파일: ${{BEFORE}}개\"\n\
          chown -R \"$VUSER:$VUSER\" \"$WEBROOT\"\n\
-         chmod 755 \"$WEBROOT\"\n\
+         echo \"  · chown 완료, chmod 정규화 중...\"\n\
+         find \"$WEBROOT\" -type d -print0 2>/dev/null | xargs -0 -r chmod 755\n\
+         find \"$WEBROOT\" -type f -print0 2>/dev/null | xargs -0 -r chmod 644\n\
+         chmod 751 \"$WEBROOT\"\n\
          AFTER=$(find \"$WEBROOT\" ! -user \"$VUSER\" 2>/dev/null | wc -l)\n\
-         echo \"  ✓ chown 완료 (남은 타유저 소유: ${{AFTER}}개), public_html chmod 755\"\n\
-         echo \"== 소유권 수정 완료 ==\"\n",
+         echo \"  ✓ 완료 (남은 타유저 소유: ${{AFTER}}개) — 디렉터리 755·파일 644·public_html 751\"\n\
+         echo \"== 권한 수정 완료 ==\"\n",
         vu = sq(vuser), d = sq(&domain), det = docroot_detect(&server.path),
     );
     let (script, sshpass, env) = eondcms_exec(server, &raw, use_root, c.sudo);
@@ -3033,7 +3037,7 @@ pub fn build_perm_fix(server: &Site, c: &CmsInstall, domain_name: &str, use_root
         script,
         sshpass,
         env,
-        note: format!("public_html 전체를 {vuser} 소유로 변경 + 최상위 755 (root 필요)"),
+        note: format!("public_html 소유 {vuser} + 디렉터리 755·파일 644·최상위 751 (root)"),
     })
 }
 
@@ -3084,7 +3088,7 @@ pub fn build_perm_audit(s: &Settings, account: Option<&str>) -> Result<Job, Stri
     Ok(Job { title, script, sshpass, env, note: "읽기전용 — 각 사이트 public_html 소유/권한(chmod)/쓰기 판정".into() })
 }
 
-/// 전체(또는 계정) 사이트 일괄 소유권 수정. 각 사이트 public_html 을 그 계정(홈 소유자)으로 chown + 755.
+/// 전체(또는 계정) 사이트 일괄 소유권 수정. 각 사이트 public_html 소유 chown -R + 디렉터리 755·파일 644·최상위 751.
 /// 되돌리기 어려운 변경 → 확인 후 실행.
 pub fn build_perm_fix_audit(s: &Settings, account: Option<&str>) -> Result<Job, String> {
     let srv = ssh_admin_site(s)?;
@@ -3092,25 +3096,30 @@ pub fn build_perm_fix_audit(s: &Settings, account: Option<&str>) -> Result<Job, 
     let raw = format!(
         "export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin\"\n\
          shopt -s nullglob 2>/dev/null || true\n\
-         echo \"== 사이트 소유권 일괄 수정 (public_html → 각 계정 소유) ==\"\n\
+         echo \"== 사이트 권한 일괄 수정 (public_html → 각 계정 소유, 디렉터리 755·파일 644·최상위 751) ==\"\n\
          OK=0; NG=0\n\
          for WR in {glob}; do\n\
            [ -d \"$WR\" ] || continue\n\
            OWN=$(echo \"$WR\" | awk -F/ '{{print $3}}')\n\
            DOM=$(basename \"$(dirname \"$WR\")\")\n\
            id \"$OWN\" >/dev/null 2>&1 || {{ echo \"  ✗ $OWN / $DOM : 유저 없음\"; NG=$((NG+1)); continue; }}\n\
-           if chown -R \"$OWN:$OWN\" \"$WR\" 2>/dev/null && chmod 755 \"$WR\" 2>/dev/null; then echo \"  ✓ $OWN / $DOM\"; OK=$((OK+1)); else echo \"  ✗ $OWN / $DOM : chown 실패\"; NG=$((NG+1)); fi\n\
+           if chown -R \"$OWN:$OWN\" \"$WR\" 2>/dev/null; then\n\
+             find \"$WR\" -type d -print0 2>/dev/null | xargs -0 -r chmod 755\n\
+             find \"$WR\" -type f -print0 2>/dev/null | xargs -0 -r chmod 644\n\
+             chmod 751 \"$WR\" 2>/dev/null\n\
+             echo \"  ✓ $OWN / $DOM\"; OK=$((OK+1))\n\
+           else echo \"  ✗ $OWN / $DOM : chown 실패\"; NG=$((NG+1)); fi\n\
          done\n\
          echo \"== 완료: 수정 $OK곳 · 실패 $NG곳 ==\"\n",
         glob = glob,
     );
     let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
     let title = match account { Some(a) => format!("권한 수정(계정) : {a}"), None => "권한 수정(전체 사이트)".to_string() };
-    Ok(Job { title, script, sshpass, env, note: "각 사이트 public_html 을 해당 계정 소유로 chown -R + 755 (root)".into() })
+    Ok(Job { title, script, sshpass, env, note: "각 사이트 public_html 소유 chown -R + 디렉터리 755·파일 644·최상위 751 (root)".into() })
 }
 
 /// 전체(또는 계정) 사이트의 public_html 소유/권한을 조회 (읽기전용, blocking).
-/// 반환: (계정, 도메인, "소유자:chmod")  예: ("rokmc", "hbphoto.kr", "root:755")
+/// 반환: (계정, 도메인, "소유자:chmod")  예: ("rokmc", "hbphoto.kr", "root:751")
 pub fn scan_site_perms(s: &Settings, account: Option<&str>) -> Result<Vec<(String, String, String)>, String> {
     let srv = ssh_admin_site(s)?;
     let glob = perm_glob(account)?;

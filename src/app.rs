@@ -87,7 +87,7 @@ struct AcctSiteRow {
     db_bytes: u64,
     /// HestiaCP 웹도메인 생성일 (YYYY-MM-DD, 미조회 시 빈 문자열)
     created: String,
-    /// public_html 소유/권한 "소유자:chmod" (예: "rokmc:755", 미조회 시 빈 문자열)
+    /// public_html 소유/권한 "소유자:chmod" (예: "rokmc:751", 미조회 시 빈 문자열)
     perm: String,
     /// DNS A 레코드 (DNS 체크 시 채움)
     a_record: String,
@@ -1285,7 +1285,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.add_enabled(!running && !scanning, btn_primary(format!("{}  이 계정 스캔", ph::ARROWS_CLOCKWISE))).on_hover_text("이 계정만 다시 스캔해 공유 캐시 갱신").clicked() { do_scan = true; }
                         if ui.add_enabled(!running, egui::Button::new("🔐  권한 점검")).on_hover_text("이 계정의 모든 사이트 public_html 소유/권한 일괄 점검 (CMS 무관, 'access denied' 원인)").clicked() { do_perm = true; }
-                        if ui.add_enabled(!running, egui::Button::new("🔧  권한 수정")).on_hover_text("이 계정의 모든 사이트 public_html 을 해당 계정 소유로 chown -R + 755 (확인 후 실행)").clicked() { do_permfix = true; }
+                        if ui.add_enabled(!running, egui::Button::new("🔧  권한 수정")).on_hover_text("이 계정 사이트 소유 chown -R + 디렉터리 755·파일 644·최상위 751 (확인 후 실행)").clicked() { do_permfix = true; }
                         if scanning { ui.spinner(); ui.label("스캔 중…"); }
                         if has_rows {
                             if ui.button("전체 선택").clicked() { sel_all_sites = Some(true); }
@@ -1894,7 +1894,7 @@ impl App {
                     .on_hover_text("계정 필터에 선택된 계정만 다시 스캔해 갱신").clicked() { do_rescan_acct = true; }
                 let perm_hint = if self.all_filter_acct.is_empty() { "모든 계정 사이트 public_html 권한 일괄 점검 (CMS 무관)" } else { "선택 계정 사이트 public_html 권한 일괄 점검" };
                 if ui.add_enabled(!running, egui::Button::new("🔐  권한 점검")).on_hover_text(perm_hint).clicked() { do_perm = true; }
-                if ui.add_enabled(!running, egui::Button::new("🔧  권한 수정")).on_hover_text("사이트 public_html 을 해당 계정 소유로 chown -R + 755 (필터 계정 또는 전체, 확인 후 실행)").clicked() { do_permfix = true; }
+                if ui.add_enabled(!running, egui::Button::new("🔧  권한 수정")).on_hover_text("사이트 소유 chown -R + 디렉터리 755·파일 644·751 (필터 계정 또는 전체, 확인 후 실행)").clicked() { do_permfix = true; }
                 if scanning { ui.spinner(); ui.label("스캔 중…"); }
             });
             // 계정 필터 + 도메인 검색
@@ -3079,7 +3079,7 @@ impl App {
                                     if ui.add_enabled(!running, egui::Button::new("🔐  권한 점검")).on_hover_text("이 도메인 public_html 소유/권한(chmod)/쓰기가능 진단 (CMS 무관, 'access denied' 원인 파악)").clicked() {
                                         wp_perm_req = true;
                                     }
-                                    if ui.add_enabled(!running, egui::Button::new("🔧  권한 수정")).on_hover_text("public_html 전체를 웹유저 소유로 chown -R + 755 (root 필요, 확인 후 실행)").clicked() {
+                                    if ui.add_enabled(!running, egui::Button::new("🔧  권한 수정")).on_hover_text("public_html 소유 chown -R + 디렉터리 755·파일 644·최상위 751 (root, 확인 후 실행)").clicked() {
                                         wp_permfix_req = true;
                                     }
                                     ui.label(egui::RichText::new(&wp_scan_status).weak());
