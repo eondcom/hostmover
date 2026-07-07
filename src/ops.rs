@@ -1457,6 +1457,221 @@ fi
 echo "===== 설치 끝 ====="
 "#;
 
+// ===== 트래픽 감시 (호스팅사 계약 트래픽 초과 대응) =====
+//
+// 배경(2026-07-07): 통큰아이 등 호스팅사가 "5분 단위 최대 트래픽이 계약량 초과"를 통보해도
+// 어느 도메인이 원인인지는 알려주지 않는다. HestiaCP 의 v-list-user-stats/v-list-users-stats 는
+// 월 1회 스냅샷(U_BANDWIDTH)만 제공해 실시간 원인 추적에는 못 쓴다(직접 SSH 로 확인해 확정).
+// 대신 도메인 접속로그(주로 apache2/domains, 없으면 nginx/domains)에서 최근 N분 구간을 직접 집계해
+// 원인 도메인 → 상위 IP/User-Agent 순으로 좁혀가는 방식을 그대로 자동화한다.
+
+/// 최근 N분 구간을 매칭하기 위한 Apache/Nginx 로그 타임스탬프 패턴(day/Mon/Year:HH:MM) 생성 + 도메인별
+/// 트래픽 Top10, 1위 도메인의 상위 IP/User-Agent 를 뽑는 셸 로직. 여러 곳(즉석 진단/자동 감시)에서
+/// 그대로 재사용하도록 문자열 상수로 둔다 (파라미터는 셸 변수 MINWIN/DOMLOG_DIR 로 주입).
+const TRAFFIC_TOP_DOMAINS_BODY: &str = r#"
+NOW=$(date +%s)
+PATS=""
+i=0
+while [ $i -lt $MINWIN ]; do
+  T=$(LC_TIME=C date -d "@$((NOW-i*60))" +'%d/%b/%Y:%H:%M')
+  PATS="$PATS|$T"
+  i=$((i+1))
+done
+PATS=${PATS#|}
+DOMLOG_DIR=/var/log/apache2/domains
+[ -d "$DOMLOG_DIR" ] || DOMLOG_DIR=/var/log/nginx/domains
+TOP=$(for f in "$DOMLOG_DIR"/*.log; do
+  [ -f "$f" ] || continue
+  case "$f" in *.error.log) continue;; esac
+  dom=$(basename "$f" .log)
+  tail -n 20000 "$f" 2>/dev/null | grep -E "$PATS" | awk -v d="$dom" '{s+=$10; n++} END{if(n>0) printf "%12d bytes %6d reqs  %s\n", s, n, d}'
+done | sort -rn)
+echo "$TOP" | head -10
+TOPDOM=$(echo "$TOP" | head -1 | awk '{print $NF}')
+if [ -n "$TOPDOM" ] && [ -f "$DOMLOG_DIR/$TOPDOM.log" ]; then
+  echo "-- '$TOPDOM' 상위 요청 IP --"
+  tail -n 20000 "$DOMLOG_DIR/$TOPDOM.log" | grep -E "$PATS" | awk '{b[$1]+=$10; n[$1]++} END{for(i in b) printf "%12d bytes %6d reqs  %s\n", b[i], n[i], i}' | sort -rn | head -8
+  echo "-- '$TOPDOM' 상위 User-Agent --"
+  tail -n 20000 "$DOMLOG_DIR/$TOPDOM.log" | grep -E "$PATS" | awk -F'"' '{print substr($6,1,90)}' | sort | uniq -c | sort -rn | head -6
+fi
+"#;
+
+/// 지금 즉시 회선 사용량 + 도메인별 트래픽 Top 진단 (SSH, sudo, 읽기 전용).
+/// 호스팅사의 "계약 트래픽 초과" 통보를 받았을 때, 그 자리에서 원인 도메인을 좁히기 위한 버튼.
+pub fn build_traffic_snapshot(s: &Settings) -> Result<Job, String> {
+    let (srv, who) = server_ssh_site(s)?;
+    let raw = format!(
+        r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+echo "===== 트래픽 스냅샷 ====="
+echo "[1] 회선 사용량 (10초 샘플)"
+IFACE=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{{for(i=1;i<=NF;i++) if($i=="dev"){{print $(i+1); exit}}}}')
+[ -z "$IFACE" ] && IFACE=$(awk -F: 'NR>2 && $1 !~ /lo/{{gsub(/ /,"",$1); print $1; exit}}' /proc/net/dev)
+read_bytes(){{ awk -v i="$1:" '$1==i{{print $2" "$10}}' /proc/net/dev; }}
+R1=$(read_bytes "$IFACE")
+sleep 10
+R2=$(read_bytes "$IFACE")
+RX1=$(echo "$R1" | awk '{{print $1}}'); TX1=$(echo "$R1" | awk '{{print $2}}')
+RX2=$(echo "$R2" | awk '{{print $1}}'); TX2=$(echo "$R2" | awk '{{print $2}}')
+awk -v a="$RX1" -v b="$RX2" -v c="$TX1" -v d="$TX2" -v i="$IFACE" 'BEGIN{{printf "  인터페이스 %s   RX %.2f Mbps   TX %.2f Mbps\n", i, (b-a)*8/10/1000000, (d-c)*8/10/1000000}}'
+echo ""
+echo "[2] 도메인별 트래픽 Top10 (최근 15분)"
+MINWIN=15
+{top_domains}
+echo ""
+echo "[3] 봇 차단 적용 상태"
+if [ -f /etc/nginx/conf.d/block-scrapers.conf ]; then
+  echo "  적용됨 ($(grep -c '^deny' /etc/nginx/conf.d/block-scrapers.conf 2>/dev/null) 개 대역 차단 중)"
+else
+  echo "  차단 설정 없음"
+fi
+echo "===== 진단 끝 ====="
+echo "※ 1위 도메인의 상위 IP가 특정 대역(예: OVH/Hetzner 등 해외 데이터센터)에 몰려 있으면 nginx conf.d 에 deny 추가를 검토하세요."
+"#,
+        top_domains = TRAFFIC_TOP_DOMAINS_BODY,
+    );
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: "트래픽 스냅샷 진단".into(),
+        script,
+        sshpass,
+        env,
+        note: format!("{who} → 회선 사용량(10초) + 최근 15분 도메인별 Top10 + 1위 도메인 상위 IP/UA (읽기 전용, 20~30초 소요)"),
+    })
+}
+
+/// 트래픽 자동 감시 설치 (SSH, sudo, 서버 상태 변경 — 확인 모달 권장).
+/// 5분마다 회선 사용량을 측정해 임계치(Mbps) 초과 시 그 시점의 도메인별 트래픽 Top + 상위 IP/UA 를
+/// /var/log/hm-traffic-monitor.log 에 자동 기록한다. 최신 측정값은 /var/lib/hm-traffic-monitor/last.txt.
+pub fn build_traffic_monitor_install(s: &Settings, threshold_mbps: &str) -> Result<Job, String> {
+    let (srv, who) = server_ssh_site(s)?;
+    let thr: u32 = threshold_mbps.trim().parse().map_err(|_| "임계치는 숫자(Mbps)여야 합니다".to_string())?;
+    if thr == 0 || thr > 100_000 {
+        return Err("임계치가 올바르지 않습니다 (1~100000 Mbps)".into());
+    }
+    let head = format!("set +e\nTHRESHOLD={thr}\n");
+    let raw = head + &TRAFFIC_MONITOR_INSTALL_BODY.replace("__TOP_DOMAINS__", TRAFFIC_TOP_DOMAINS_BODY);
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: "트래픽 자동 감시 설치".into(),
+        script,
+        sshpass,
+        env,
+        note: format!("{who} → 5분마다 회선 사용량 확인, {thr}Mbps 초과 시 도메인별 원인 자동 캡처 (cron 설치, 서버 상태 변경)"),
+    })
+}
+
+/// 트래픽 자동 감시 제거 (SSH, sudo). 로그/상태파일은 보존.
+pub fn build_traffic_monitor_uninstall(s: &Settings) -> Result<Job, String> {
+    let (srv, who) = server_ssh_site(s)?;
+    let raw = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+echo "===== 트래픽 자동 감시 제거 ====="
+rm -f /etc/cron.d/hm-traffic-monitor /usr/local/sbin/hm-traffic-monitor.sh
+echo "  cron/스크립트 제거"
+systemctl restart cron 2>/dev/null || service cron restart 2>/dev/null || systemctl restart crond 2>/dev/null || true
+echo "  ※ 상태파일(/var/lib/hm-traffic-monitor)·로그(/var/log/hm-traffic-monitor.log)는 보존됨"
+echo "===== 제거 끝 ====="
+"#;
+    let (script, sshpass, env) = eondcms_exec(&srv, raw, false, true);
+    Ok(Job {
+        title: "트래픽 자동 감시 제거".into(),
+        script,
+        sshpass,
+        env,
+        note: format!("{who} → cron/스크립트 제거"),
+    })
+}
+
+/// 트래픽 자동 감시 상태 확인 (SSH, sudo, 읽기 전용) — 설치여부 + 최근 측정값 + 최근 초과 이력.
+pub fn build_traffic_monitor_status(s: &Settings) -> Result<Job, String> {
+    let (srv, who) = server_ssh_site(s)?;
+    let raw = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+echo "===== 트래픽 자동 감시 상태 ====="
+if [ -f /etc/cron.d/hm-traffic-monitor ]; then
+  THR=$(grep -oE '^THRESHOLD=[0-9]+' /usr/local/sbin/hm-traffic-monitor.sh 2>/dev/null | cut -d= -f2)
+  echo "  설치됨 (임계치 ${THR:-알수없음}Mbps, 5분마다 실행)"
+else
+  echo "  설치 안 됨"
+fi
+echo ""
+echo "-- 최근 측정값 --"
+cat /var/lib/hm-traffic-monitor/last.txt 2>/dev/null || echo "  (아직 없음)"
+echo ""
+echo "-- 최근 초과 이력 (최대 60줄) --"
+tail -n 60 /var/log/hm-traffic-monitor.log 2>/dev/null || echo "  (기록 없음)"
+echo "===== 끝 ====="
+"#;
+    let (script, sshpass, env) = eondcms_exec(&srv, raw, false, true);
+    Ok(Job {
+        title: "트래픽 자동 감시 상태 확인".into(),
+        script,
+        sshpass,
+        env,
+        note: format!("{who} → 감시 설치여부 + 최근 측정값 + 초과 이력 (읽기 전용)"),
+    })
+}
+
+/// 설치 스크립트 본문(셸). __TOP_DOMAINS__ 는 build_traffic_monitor_install 에서
+/// TRAFFIC_TOP_DOMAINS_BODY 로 치환된다(진단/감시 로직 중복 방지).
+const TRAFFIC_MONITOR_INSTALL_BODY: &str = r#"
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+echo "===== hostmover 트래픽 자동 감시 설치 (임계치 ${THRESHOLD}Mbps) ====="
+mkdir -p /var/lib/hm-traffic-monitor
+cat > /usr/local/sbin/hm-traffic-monitor.sh <<'EOS'
+#!/usr/bin/env bash
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+THRESHOLD=__THRESHOLD__
+STATE=/var/lib/hm-traffic-monitor
+LOG=/var/log/hm-traffic-monitor.log
+DUR=10
+IFACE=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+[ -z "$IFACE" ] && IFACE=$(awk -F: 'NR>2 && $1 !~ /lo/{gsub(/ /,"",$1); print $1; exit}' /proc/net/dev)
+read_bytes(){ awk -v i="$1:" '$1==i{print $2" "$10}' /proc/net/dev; }
+R1=$(read_bytes "$IFACE")
+sleep "$DUR"
+R2=$(read_bytes "$IFACE")
+RX1=$(echo "$R1" | awk '{print $1}'); TX1=$(echo "$R1" | awk '{print $2}')
+RX2=$(echo "$R2" | awk '{print $1}'); TX2=$(echo "$R2" | awk '{print $2}')
+RXMBPS=$(awk -v a="$RX1" -v b="$RX2" -v d="$DUR" 'BEGIN{ if(a=="") a=0; if(b=="") b=0; printf "%.2f", (b-a)*8/d/1000000}')
+TXMBPS=$(awk -v a="$TX1" -v b="$TX2" -v d="$DUR" 'BEGIN{ if(a=="") a=0; if(b=="") b=0; printf "%.2f", (b-a)*8/d/1000000}')
+NOW_H=$(date '+%F %T')
+echo "$NOW_H iface=$IFACE rx=${RXMBPS}Mbps tx=${TXMBPS}Mbps threshold=${THRESHOLD}Mbps" > "$STATE/last.txt"
+OVER=$(awk -v t="$TXMBPS" -v r="$RXMBPS" -v th="$THRESHOLD" 'BEGIN{m=(t>r)?t:r; print (m>th)?"1":"0"}')
+if [ "$OVER" = "1" ]; then
+  {
+    echo "===== $NOW_H 초과 감지 (TX=${TXMBPS}Mbps RX=${RXMBPS}Mbps, 임계치=${THRESHOLD}Mbps) ====="
+    MINWIN=15
+__TOP_DOMAINS__
+    echo ""
+  } >> "$LOG"
+  if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+    tail -c 2621440 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+  fi
+fi
+EOS
+sed -i "s|__THRESHOLD__|$THRESHOLD|g" /usr/local/sbin/hm-traffic-monitor.sh
+chmod +x /usr/local/sbin/hm-traffic-monitor.sh
+
+cat > /etc/cron.d/hm-traffic-monitor <<'EOS'
+# hostmover 트래픽 감시 (자동 생성)
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root /usr/local/sbin/hm-traffic-monitor.sh
+EOS
+chmod 644 /etc/cron.d/hm-traffic-monitor
+
+/usr/local/sbin/hm-traffic-monitor.sh
+systemctl restart cron 2>/dev/null || service cron restart 2>/dev/null || systemctl restart crond 2>/dev/null || true
+echo "[완료]"
+echo "  5분마다 /usr/local/sbin/hm-traffic-monitor.sh 실행 (임계치 ${THRESHOLD}Mbps)"
+echo "  최근 상태: /var/lib/hm-traffic-monitor/last.txt"
+echo "  초과 시 상세 로그: /var/log/hm-traffic-monitor.log (5MB 넘으면 자동 축소)"
+cat /var/lib/hm-traffic-monitor/last.txt 2>/dev/null
+echo "===== 설치 끝 ====="
+"#;
+
 // ===== 일반 CMS 설치 (WordPress / Rhymix / 그누보드) =====
 
 fn cms_validate(server: &Site, c: &CmsInstall, use_root: bool, need_db: bool, need_admin: bool) -> Result<(), String> {

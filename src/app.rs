@@ -64,6 +64,7 @@ enum SettingsTab {
     BulkUpdate,
     ModuleDelete,
     Disk,
+    Traffic,
     Backup,
 }
 
@@ -410,6 +411,8 @@ pub struct App {
     mod_del_acct: String,
     disk_path: String,
     disk_alert_email: String,
+    /// 트래픽 자동 감시 임계치(Mbps) 입력값
+    traffic_threshold: String,
     /// WordPress 플러그인/테마 버전비교 스캔 결과 캐시 — (도메인id, 종류) → 행들.
     /// 재방문·플러그인↔테마 전환 시 네트워크 재조회 없이 즉시 표시(스캔 버튼=강제 새로고침).
     wp_cache: std::collections::HashMap<(u64, ops::WpAssetKind), Vec<ops::WpPluginRow>>,
@@ -490,6 +493,7 @@ impl App {
             mod_del_acct: String::new(),
             disk_path: "/backup".to_string(),
             disk_alert_email: "eond@eond.com".to_string(),
+            traffic_threshold: "25".to_string(),
             wp_cache: std::collections::HashMap::new(),
             wp_sel: std::collections::HashSet::new(),
             wp_kind: ops::WpAssetKind::Plugin,
@@ -532,7 +536,8 @@ impl App {
         };
         let settings_tab = match self.settings_tab {
             SettingsTab::Connect => "connect", SettingsTab::Ssh => "ssh", SettingsTab::BulkUpdate => "bulk",
-            SettingsTab::ModuleDelete => "moddel", SettingsTab::Disk => "disk", SettingsTab::Backup => "backup",
+            SettingsTab::ModuleDelete => "moddel", SettingsTab::Disk => "disk", SettingsTab::Traffic => "traffic",
+            SettingsTab::Backup => "backup",
         };
         crate::model::UiState {
             view: view.into(),
@@ -566,7 +571,8 @@ impl App {
         };
         self.settings_tab = match ui.settings_tab.as_str() {
             "ssh" => SettingsTab::Ssh, "bulk" => SettingsTab::BulkUpdate, "moddel" => SettingsTab::ModuleDelete,
-            "disk" => SettingsTab::Disk, "backup" => SettingsTab::Backup, _ => SettingsTab::Connect,
+            "disk" => SettingsTab::Disk, "traffic" => SettingsTab::Traffic, "backup" => SettingsTab::Backup,
+            _ => SettingsTab::Connect,
         };
         self.view = match ui.view.as_str() {
             "settings" => MainView::Settings,
@@ -733,6 +739,9 @@ impl App {
         let mut do_disk_health = false;
         let mut do_disk_scrub: Option<u32> = None;
         let mut do_disk_monitor: Option<bool> = None;
+        let mut do_traffic_snapshot = false;
+        let mut do_traffic_monitor: Option<bool> = None;
+        let mut do_traffic_status = false;
         let mut do_bulk_update: Option<bool> = None;
         let mut do_module_delete: Option<bool> = None;
         let mut do_backup = false;
@@ -755,6 +764,7 @@ impl App {
                     (SettingsTab::BulkUpdate, "  일괄 업데이트  "),
                     (SettingsTab::ModuleDelete, "  모듈 일괄 삭제  "),
                     (SettingsTab::Disk, "  디스크 점검  "),
+                    (SettingsTab::Traffic, "  트래픽 감시  "),
                     (SettingsTab::Backup, "  백업/복원  "),
                 ] {
                     if ui.selectable_label(self.settings_tab == t, label).clicked() {
@@ -964,6 +974,37 @@ impl App {
                             ui.label(egui::RichText::new("설치 마지막에 위 주소로 테스트 메일을 자동 발송하고, 사용된 전송수단(mail/sendmail)을 로그에 표시합니다. 메일이 안 오면 서버 MTA(exim/postfix) 큐·스팸함을 점검하세요.").weak());
                         });
                     }
+                    SettingsTab::Traffic => {
+                        card(ui, |ui| {
+                            ui.strong(format!("{}  지금 트래픽 진단", ph::CHART_LINE));
+                            ui.label(egui::RichText::new("호스팅사(예: 통큰아이)에서 '계약 트래픽 초과' 알림을 받았을 때, 지금 이 순간 어느 도메인이 원인인지 확인합니다. 회선 사용량(10초 샘플) + 최근 15분 도메인별 트래픽 Top10 + 1위 도메인의 상위 요청 IP·User-Agent를 한 번에 수집합니다(읽기 전용).").weak());
+                            ui.label(egui::RichText::new("※ '서버 SSH' 설정 필요. 20~30초 정도 걸립니다.").weak());
+                            ui.add_space(6.0);
+                            if ui.add_enabled(!running, btn_primary(format!("{}  지금 진단", ph::MAGNIFYING_GLASS)))
+                                .clicked() { do_traffic_snapshot = true; }
+                        });
+                        ui.add_space(8.0);
+                        card(ui, |ui| {
+                            ui.strong(format!("{}  자동 감시 (5분 단위, 초과 시 자동 캡처)", ph::GAUGE));
+                            ui.label(egui::RichText::new("서버에 cron 감시를 설치합니다: 5분마다 회선 사용량을 측정하고, 지정한 임계치(Mbps)를 넘으면 그 시점의 도메인별 트래픽 Top + 상위 IP·User-Agent를 자동으로 로그에 남깁니다.").weak());
+                            ui.add_space(6.0);
+                            egui::Grid::new("traffic_monitor_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                                grid_label(ui, "임계치 (Mbps)");
+                                ui.add(egui::TextEdit::singleline(&mut self.traffic_threshold).hint_text("25").desired_width(120.0).margin(FIELD_MARGIN));
+                                ui.end_row();
+                            });
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!running, btn_primary(format!("{}  감시 설치", ph::BELL_RINGING)))
+                                    .on_hover_text("확인 후 서버에 cron 설치").clicked() { do_traffic_monitor = Some(true); }
+                                if ui.add_enabled(!running, egui::Button::new(format!("{}  감시 제거", ph::BELL_SLASH)))
+                                    .clicked() { do_traffic_monitor = Some(false); }
+                                if ui.add_enabled(!running, egui::Button::new(format!("{}  상태 확인", ph::MAGNIFYING_GLASS)))
+                                    .clicked() { do_traffic_status = true; }
+                            });
+                            ui.label(egui::RichText::new("설치 여부·최근 측정값·최근 초과 이력은 '상태 확인' 버튼으로 확인하세요. 상세 로그는 서버의 /var/log/hm-traffic-monitor.log 에 쌓입니다(5MB 넘으면 자동 축소).").weak());
+                        });
+                    }
                     SettingsTab::Backup => {
                         card(ui, |ui| {
                             ui.strong(format!("{}  백업 (암호화)", ph::FLOPPY_DISK));
@@ -1133,6 +1174,53 @@ impl App {
                     self.last_ok = Some(false);
                     self.status = format!("자동 감시 준비 실패: {e}");
                     self.log.push(format!("자동 감시: {e}"));
+                }
+            }
+        }
+        if do_traffic_snapshot {
+            match ops::build_traffic_snapshot(&self.store.settings) {
+                Ok(job) => {
+                    self.running = true;
+                    self.last_ok = None;
+                    self.status = "트래픽 스냅샷 진단 중...".into();
+                    let ctx2 = ctx.clone();
+                    ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
+                }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = format!("진단 실패: {e}");
+                    self.log.push(format!("트래픽 스냅샷: {e}"));
+                }
+            }
+        }
+        if let Some(install) = do_traffic_monitor {
+            let built = if install {
+                ops::build_traffic_monitor_install(&self.store.settings, &self.traffic_threshold)
+            } else {
+                ops::build_traffic_monitor_uninstall(&self.store.settings)
+            };
+            match built {
+                Ok(job) => { self.eond_confirm = Some(job); }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = format!("자동 감시 준비 실패: {e}");
+                    self.log.push(format!("트래픽 자동 감시: {e}"));
+                }
+            }
+        }
+        if do_traffic_status {
+            match ops::build_traffic_monitor_status(&self.store.settings) {
+                Ok(job) => {
+                    self.running = true;
+                    self.last_ok = None;
+                    self.status = "트래픽 감시 상태 확인 중...".into();
+                    let ctx2 = ctx.clone();
+                    ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
+                }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = format!("상태 확인 실패: {e}");
+                    self.log.push(format!("트래픽 감시 상태: {e}"));
                 }
             }
         }
