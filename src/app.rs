@@ -436,6 +436,17 @@ pub struct App {
     pending_rescan_ready: bool,
 }
 
+/// 실행 중인 바이너리의 버전 (Cargo 버전 + git 커밋 + 커밋일).
+/// 런처가 옛 바이너리를 가리키고 있어도 이 줄을 보면 바로 알 수 있다.
+pub fn version_line() -> String {
+    format!(
+        "v{}  ({} · {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("HM_GIT_HASH"),
+        env!("HM_GIT_DATE"),
+    )
+}
+
 impl App {
     pub fn new() -> Self {
         let (tx, rx) = channel();
@@ -480,7 +491,8 @@ impl App {
             site_dates_req: std::collections::HashSet::new(),
             site_perms_req: std::collections::HashSet::new(),
             pending_import_sites: None,
-            log: Vec::new(),
+            // 로그 첫 줄에 버전을 남긴다 — 진단 결과를 붙여넣을 때 어느 빌드인지 같이 남도록
+            log: vec![format!("Hostmover {}", version_line())],
             running: false,
             confirm: None,
             cmd_view: None,
@@ -2251,6 +2263,9 @@ impl App {
                 ui.heading("Hostmover");
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("호스팅 이전 백업/복원 관리").weak());
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(version_line()).weak().small().monospace())
+                    .on_hover_text("실행 중인 바이너리의 버전 · git 커밋 · 커밋일");
                 ui.add_space(18.0);
                 // 화면 진입 시 포커스가 없으면 입력칸에 커서를 둔다
                 let nothing_focused = ui.memory(|m| m.focused().is_none());
@@ -2324,6 +2339,8 @@ impl App {
         egui::TopBottomPanel::top("top").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Hostmover");
+                ui.label(egui::RichText::new(version_line()).weak().small().monospace())
+                    .on_hover_text("실행 중인 바이너리의 버전 · git 커밋 · 커밋일");
                 ui.separator();
                 if ui.button(format!("{}  저장", ph::FLOPPY_DISK)).clicked() {
                     self.save();

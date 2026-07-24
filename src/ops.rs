@@ -1207,8 +1207,26 @@ for V in $TARGETS; do
   echo
   echo "--- 소켓 / listen 중복 검사 ---"
   ls -la "/run/php/php${V}-fpm.sock" 2>/dev/null || echo "  소켓 없음 (미기동이면 정상)"
-  grep -rhE '^[[:space:]]*listen[[:space:]]*=' "/etc/php/$V/fpm/pool.d/"*.conf 2>/dev/null | sort | uniq -c | sort -rn | head -n 5
-  echo "  ※ 위 첫 열이 2 이상이면 같은 listen 을 쓰는 중복 pool = 기동 실패 원인"
+  echo "  · 같은 버전 안에서 중복:"
+  grep -rhE '^[[:space:]]*listen[[:space:]]*=' "/etc/php/$V/fpm/pool.d/"*.conf 2>/dev/null \
+    | sort | uniq -c | sort -rn | awk '$1 > 1' | head -n 5
+  echo "  · 버전을 넘나드는 중복 (7.4 pool 이 8.4 소켓을 잡는 등 — 흔한 함정):"
+  grep -rhE '^[[:space:]]*listen[[:space:]]*=' /etc/php/*/fpm/pool.d/*.conf 2>/dev/null \
+    | sort | uniq -c | sort -rn | awk '$1 > 1' | head -n 8
+  echo "  (위 두 목록이 비어 있으면 중복 없음)"
+  echo
+  echo "--- 기동을 막는 소켓을 실제로 누가 잡고 있나 ---"
+  BLOCK=$(journalctl -u "$S" -n 200 --no-pager 2>/dev/null \
+    | grep -oE '/run/php/[^ ]+\.sock' | tail -n 1)
+  if [ -n "$BLOCK" ]; then
+    echo "  로그가 지목한 소켓: $BLOCK"
+    ls -la "$BLOCK" 2>/dev/null || echo "  → 파일 없음"
+    ss -xlp 2>/dev/null | grep -F "$BLOCK" || echo "  → 아무 프로세스도 listen 하지 않음 = stale 소켓 (지우고 재시작)"
+    echo "  이 소켓을 정의한 pool conf (전 버전 교차 검색):"
+    grep -rln -F "$BLOCK" /etc/php/*/fpm/pool.d/ 2>/dev/null || echo "  → 정의한 conf 없음"
+  else
+    echo "  (로그에서 문제 소켓을 특정하지 못함)"
+  fi
   echo
   echo "--- pool 개수 / 최근 변경된 pool conf ---"
   echo "  pool 수: $(ls -1 "/etc/php/$V/fpm/pool.d/"*.conf 2>/dev/null | wc -l)"
@@ -1243,11 +1261,18 @@ echo "  (Error 20 = 서비스 재시작 실패)"
 echo
 echo "[7] 메모리 / php-fpm 프로세스 수"
 free -h 2>/dev/null | head -n 2
-echo "  php-fpm 프로세스: $(ps --no-headers -C php-fpm 2>/dev/null | wc -l)"
+echo "  php-fpm 마스터/워커 (버전별):"
+ps -eo comm 2>/dev/null | grep -E '^php-fpm' | sort | uniq -c | sed 's/^/    /'
+echo "  (프로세스명은 php-fpm7.4 처럼 버전이 붙는다 — ps -C php-fpm 으로는 안 잡힘)"
 
 echo
 echo "===== 진단 끝 ====="
 echo "※ [3] 문법검사에 오류 라인 → 그 pool conf 수정 후 sudo systemctl restart php<버전>-fpm"
+echo "※ 'Another FPM instance seems to already listen on ...' + 그 소켓을 다른 버전 php-fpm 이"
+echo "   잡고 있으면 → 도메인 PHP 버전을 바꿨는데 옛 버전이 리로드되지 않은 것."
+echo "   옛 버전을 먼저 재시작해 소켓을 놓아준 뒤 대상 버전을 올린다:"
+echo "     sudo systemctl restart php<옛버전>-fpm && sudo systemctl restart php<대상버전>-fpm"
+echo "※ 같은 에러인데 아무도 listen 하지 않으면 → stale 소켓. 파일을 지우고 재시작"
 echo "※ 'Address already in use' → 같은 listen 소켓을 쓰는 중복 pool 제거"
 echo "※ 'Unable to load dynamic library' → 확장 .so 누락, 해당 php 패키지 재설치"
 echo "※ pool conf 가 깨졌거나 사라졌으면 → sudo v-rebuild-web-domains <유저>"

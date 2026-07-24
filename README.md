@@ -70,6 +70,9 @@ cargo build --release
 ./target/release/hostmover
 ```
 
+앱 첫 화면·상단바·로그 첫 줄에 `v0.1.0 (커밋 · 날짜)` 형태로 실행 중인 빌드가 표시된다.
+업데이트 절차와 "고쳤는데 런처에서 안 바뀐다" 문제 해결은 **[docs/updating.md](docs/updating.md)** 참고.
+
 ### macOS
 
 > egui 앱은 사실상 크로스컴파일이 안 되므로 **macOS 에서 직접 빌드**해야 한다.
