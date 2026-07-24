@@ -71,7 +71,12 @@ cargo build --release
 ```
 
 앱 첫 화면·상단바·로그 첫 줄에 `v0.1.0 (커밋 · 날짜)` 형태로 실행 중인 빌드가 표시된다.
-업데이트 절차와 "고쳤는데 런처에서 안 바뀐다" 문제 해결은 **[docs/updating.md](docs/updating.md)** 참고.
+
+문서:
+
+- **[docs/updating.md](docs/updating.md)** — hostmover 업데이트 절차, "고쳤는데 런처에서 안 바뀐다" 해결
+- **[docs/bulk-update.md](docs/bulk-update.md)** — 일괄 업데이트의 안정 릴리스 원칙, 결과 보고서/메일, 플러그인 골라 업데이트
+- **[docs/rx-cli.md](docs/rx-cli.md)** — Rhymix 터미널 도구 rx-cli 배포와 사용
 
 ### macOS
 
