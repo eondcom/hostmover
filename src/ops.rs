@@ -1145,6 +1145,123 @@ fn server_ssh_site(s: &Settings) -> Result<(Site, String), String> {
     Ok((srv, format!("{user}@{host}")))
 }
 
+/// PHP-FPM / 웹 에러로그 진단 (SSH, sudo, 읽기 전용).
+/// `v-restart-service 'php8.4-fpm' [Error 20]` 처럼 PHP 백엔드가 기동에 실패할 때
+/// 설정 문법검사·journalctl·FPM 로그·중복 listen·확장 로드 경고까지 한 번에 모아 원인을 확정한다.
+/// 정상 동작 중이면 최신 버전을 기준으로 로그만 보여준다.
+pub fn build_php_diagnose(s: &Settings) -> Result<Job, String> {
+    let (srv, who) = server_ssh_site(s)?;
+    let raw = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+echo "===== PHP-FPM / 웹 에러로그 진단 ====="
+
+echo "[1] 설치된 PHP 버전"
+VERS=$(ls -1 /etc/php/ 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V)
+[ -z "$VERS" ] && VERS=$(ls -1 /usr/sbin/php-fpm* 2>/dev/null | sed 's|.*php-fpm||' | grep -E '^[0-9]')
+if [ -z "$VERS" ]; then echo "  PHP 설치 흔적 없음 (/etc/php 없음)"; else echo "  $(echo $VERS | tr '\n' ' ')"; fi
+
+echo
+echo "[2] php*-fpm 서비스 상태"
+BAD=""
+for V in $VERS; do
+  S="php${V}-fpm"
+  ST=$(systemctl is-active "$S" 2>/dev/null)
+  EN=$(systemctl is-enabled "$S" 2>/dev/null)
+  printf '  %-16s active=%-12s enabled=%s\n' "$S" "${ST:-없음}" "${EN:-없음}"
+  [ "$ST" = "active" ] || BAD="$BAD $V"
+done
+if [ -n "$BAD" ]; then echo "  ✗ 비정상:$BAD  → [3] 에서 원인 확인"; else echo "  ✓ 전부 active"; fi
+
+echo
+echo "[3] 상세 (비정상 버전 우선, 없으면 최신 버전)"
+TARGETS="$BAD"
+[ -z "$TARGETS" ] && TARGETS=$(echo "$VERS" | tail -n 1)
+for V in $TARGETS; do
+  S="php${V}-fpm"
+  echo "================ $S ================"
+  echo "--- systemctl status (기동 실패 사유) ---"
+  systemctl status "$S" --no-pager -l 2>&1 | head -n 22
+  echo
+  echo "--- 설정 문법검사 (여기 오류 = 재시작 실패의 직접 원인) ---"
+  FB=""
+  for C in "/usr/sbin/php-fpm$V" "/usr/bin/php-fpm$V" "php-fpm$V"; do
+    command -v "$C" >/dev/null 2>&1 && FB="$C" && break
+  done
+  if [ -n "$FB" ]; then "$FB" -t 2>&1 | tail -n 20; else echo "  php-fpm$V 바이너리 없음 (패키지 미설치/삭제됨)"; fi
+  echo
+  echo "--- journalctl -u $S 실패/에러 라인만 (핵심) ---"
+  journalctl -u "$S" -n 400 --no-pager 2>/dev/null \
+    | grep -iE 'error|fail|fatal|cannot|unable|refus|denied|already in use|invalid|syntax' \
+    | tail -n 20
+  echo "  (위가 비어 있으면 아래 원문에서 확인)"
+  echo
+  echo "--- journalctl -u $S 최근 30줄 (원문) ---"
+  journalctl -u "$S" -n 30 --no-pager 2>&1 | tail -n 30
+  echo
+  echo "--- FPM 로그 최근 40줄 ---"
+  FOUND=0
+  for L in "/var/log/php${V}-fpm.log" "/var/log/php-fpm/php${V}-fpm.log" "/var/log/php/${V}/fpm.log"; do
+    [ -f "$L" ] && { echo "  ($L)"; tail -n 40 "$L"; FOUND=1; break; }
+  done
+  [ "$FOUND" = 0 ] && echo "  FPM 로그 파일 없음"
+  echo
+  echo "--- 소켓 / listen 중복 검사 ---"
+  ls -la "/run/php/php${V}-fpm.sock" 2>/dev/null || echo "  소켓 없음 (미기동이면 정상)"
+  grep -rhE '^[[:space:]]*listen[[:space:]]*=' "/etc/php/$V/fpm/pool.d/"*.conf 2>/dev/null | sort | uniq -c | sort -rn | head -n 5
+  echo "  ※ 위 첫 열이 2 이상이면 같은 listen 을 쓰는 중복 pool = 기동 실패 원인"
+  echo
+  echo "--- pool 개수 / 최근 변경된 pool conf ---"
+  echo "  pool 수: $(ls -1 "/etc/php/$V/fpm/pool.d/"*.conf 2>/dev/null | wc -l)"
+  ls -lt "/etc/php/$V/fpm/pool.d/"*.conf 2>/dev/null | head -n 6
+  echo
+  echo "--- PHP CLI 로드 경고 (확장 .so 누락 확인) ---"
+  if command -v "php$V" >/dev/null 2>&1; then "php$V" -v 2>&1 | head -n 8; else echo "  php$V CLI 없음"; fi
+done
+
+echo
+echo "[4] 최근 7일 내 변경된 PHP 설정 (원인 추적)"
+find /etc/php -type f \( -name '*.ini' -o -name '*.conf' \) -mtime -7 2>/dev/null | head -n 20
+echo "  (위 목록이 비어 있으면 최근 설정 변경 없음)"
+
+echo
+echo "[5] 웹 도메인 에러로그 (최근 수정 5개, 각 12줄)"
+for D in /var/log/apache2/domains /var/log/nginx/domains; do
+  [ -d "$D" ] || continue
+  echo "--- $D ---"
+  for F in $(ls -1t "$D"/*.error.log 2>/dev/null | head -n 5); do
+    [ -s "$F" ] || continue
+    echo "== $F =="
+    tail -n 12 "$F"
+  done
+done
+
+echo
+echo "[6] HestiaCP 에러로그의 PHP 관련 실패"
+grep -iE 'php[0-9.]*-fpm|v-restart-web-backend' /var/log/hestia/error.log 2>/dev/null | tail -n 15
+echo "  (Error 20 = 서비스 재시작 실패)"
+
+echo
+echo "[7] 메모리 / php-fpm 프로세스 수"
+free -h 2>/dev/null | head -n 2
+echo "  php-fpm 프로세스: $(ps --no-headers -C php-fpm 2>/dev/null | wc -l)"
+
+echo
+echo "===== 진단 끝 ====="
+echo "※ [3] 문법검사에 오류 라인 → 그 pool conf 수정 후 sudo systemctl restart php<버전>-fpm"
+echo "※ 'Address already in use' → 같은 listen 소켓을 쓰는 중복 pool 제거"
+echo "※ 'Unable to load dynamic library' → 확장 .so 누락, 해당 php 패키지 재설치"
+echo "※ pool conf 가 깨졌거나 사라졌으면 → sudo v-rebuild-web-domains <유저>"
+"#;
+    let (script, sshpass, env) = eondcms_exec(&srv, raw, false, true);
+    Ok(Job {
+        title: "PHP-FPM / 에러로그 진단".to_string(),
+        script,
+        sshpass,
+        env,
+        note: format!("{who} → sudo 로 php*-fpm 상태/설정검사/journal/FPM로그/도메인 에러로그 수집 (읽기 전용)"),
+    })
+}
+
 /// 디스크 건강 종합 진단 (SSH, sudo, 읽기 전용).
 /// dmesg I/O·ext4 체크섬 에러, tune2fs FS 에러카운트, SMART, RO 재마운트, df 를 수집한다.
 /// ※ 교훈(2026-06): SMART PASSED 여도 silent corruption 가능 — 확정은 build_disk_scrub(write→read-back).

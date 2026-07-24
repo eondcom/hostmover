@@ -730,6 +730,7 @@ impl App {
         let mut do_panel_probe = false;
         let mut do_panel_diag = false;
         let mut do_panel_recover = false;
+        let mut do_php_diag = false;
         let mut do_disk_health = false;
         let mut do_disk_scrub: Option<u32> = None;
         let mut do_disk_monitor: Option<bool> = None;
@@ -816,6 +817,18 @@ impl App {
                             });
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("서버 진단 결과는 아래 로그창에 표시됩니다. 진단은 읽기 전용이며, '패널 복구'는 확인 후 서버를 재시작합니다.").weak());
+                        });
+                        card(ui, |ui| {
+                            ui.strong(format!("{}  PHP-FPM / 에러로그 진단", ph::FILE_TEXT));
+                            ui.label(egui::RichText::new("PHP 백엔드(php8.4-fpm 등)가 안 뜰 때 원인을 찾습니다. 패널 로그에 v-restart-service 'php8.4-fpm' [Error 20] 이 반복되면 이 진단으로 실패 사유를 확인하세요.").weak());
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!running, btn_primary(format!("{}  PHP 진단 (SSH)", ph::FILE_TEXT)))
+                                    .on_hover_text("php*-fpm 서비스 상태·설정 문법검사·journalctl·FPM 로그·중복 listen·도메인 에러로그 수집 — '서버 SSH' 설정 필요")
+                                    .clicked() { do_php_diag = true; }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("읽기 전용입니다. 비정상 버전이 있으면 그 버전을, 모두 정상이면 최신 버전을 상세 출력합니다.").weak());
                         });
                     }
                     SettingsTab::Ssh => {
@@ -1075,6 +1088,22 @@ impl App {
                     self.last_ok = Some(false);
                     self.status = format!("진단 실패: {e}");
                     self.log.push(format!("패널 서버 진단: {e}"));
+                }
+            }
+        }
+        if do_php_diag {
+            match ops::build_php_diagnose(&self.store.settings) {
+                Ok(job) => {
+                    self.running = true;
+                    self.last_ok = None;
+                    self.status = "PHP-FPM 진단 중...".into();
+                    let ctx2 = ctx.clone();
+                    ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
+                }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = format!("PHP 진단 실패: {e}");
+                    self.log.push(format!("PHP-FPM 진단: {e}"));
                 }
             }
         }
