@@ -2006,7 +2006,8 @@ fn build_git_cms_update(server: &Site, c: &CmsInstall, s: &Settings, domain_name
 
 /// 서버 전체 일괄 업데이트: sudo 유저(예: tong)로 SSH → sudo 로 root → /home/*/web/*/public_html 순회.
 /// .git 있으면 소유 유저로 얕은 업데이트(depth=1), 없으면 "선택 필요"로 보고만.
-pub fn build_bulk_git_update(s: &Settings) -> Result<Job, String> {
+/// `mailto` 가 비어 있지 않으면 서버에서 결과 보고서를 그 주소로 메일 발송한다.
+pub fn build_bulk_git_update(s: &Settings, mailto: &str) -> Result<Job, String> {
     let host = if s.ssh_host.trim().is_empty() { s.hestia_host.trim() } else { s.ssh_host.trim() };
     if host.is_empty() { return Err("서버 SSH 호스트가 비어 있습니다 (설정)".into()); }
     let user = s.ssh_user.trim();
@@ -2027,10 +2028,12 @@ pub fn build_bulk_git_update(s: &Settings) -> Result<Job, String> {
     let raw = format!(
         r#"set -o pipefail
 export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin"
-echo "== 전체 사이트 일괄 업데이트 (안정 릴리스) =="
+RPT_TITLE="전체 사이트 일괄 업데이트 (안정 릴리스)"
+MAILTO={mailto}
+echo "== $RPT_TITLE =="
 shopt -s nullglob
 {tagfn}
-OK=0; SKIP=0; FAIL=0
+OK=0; SKIP=0; FAIL=0; RPT=""
 for WR in /home/*/web/*/public_html; do
   [ -d "$WR" ] || continue
   DOM="$(basename "$(dirname "$WR")")"
@@ -2039,11 +2042,11 @@ for WR in /home/*/web/*/public_html; do
 {step}
   chown -R "$OWN:$OWN" "$WR" 2>/dev/null || true
 done
-echo
-echo "== 완료: 업데이트 $OK · 건너뜀 $SKIP · 실패 $FAIL =="
-"#,
+{footer}"#,
+        mailto = sq(mailto.trim()),
         tagfn = STABLE_TAG_FN,
         step = SITE_UPDATE_STEP,
+        footer = REPORT_FOOTER,
     );
     let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
     Ok(Job {
@@ -2052,6 +2055,73 @@ echo "== 완료: 업데이트 $OK · 건너뜀 $SKIP · 실패 $FAIL =="
         sshpass,
         env,
         note: format!("{user}@{host} → sudo 로 root 후 /home/*/web/*/public_html 순회 · WordPress=wp-cli, git=최신 릴리스 태그, 비-git=오버레이"),
+    })
+}
+
+/// rx-cli (Rhymix 터미널 도구, wp-cli 스타일) 를 서버 `/usr/local/bin/rx` 에 배포한다.
+///
+/// 소스는 설정의 'Rhymix 소스' 경로 하위 `modules/rxdashboard/bin/rx`.
+/// rx-cli 는 `--path` 를 받지 않고 **현재 디렉터리에서 위로 올라가며** Rhymix 루트를 찾으므로,
+/// 심볼릭 링크가 아니라 파일 자체를 복사해 두고 `cd <웹루트> && rx <명령>` 으로 쓴다.
+/// 배포 후 서버의 Rhymix 사이트 한 곳에서 `rx version` 을 시험 실행해 동작을 확인한다.
+pub fn build_rx_cli_install(s: &Settings) -> Result<Job, String> {
+    let src = s.rx_source_local.trim();
+    if src.is_empty() {
+        return Err("설정 > HestiaCP 연동 의 'Rhymix 소스' 경로가 비어 있습니다 (예: /home/dell/dev/rx)".into());
+    }
+    let path = Path::new(src).join("modules").join("rxdashboard").join("bin").join("rx");
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| format!("rx-cli 를 읽지 못했습니다 ({}): {e}", path.display()))?;
+    if body.is_empty() {
+        return Err(format!("rx-cli 가 비어 있습니다: {}", path.display()));
+    }
+    // 중첩 heredoc 마커가 본문에 섞여 있으면 스크립트가 깨진다
+    if body.contains("HM_RX_EOF") || body.contains("HM_EOF") {
+        return Err("rx-cli 본문에 heredoc 마커(HM_RX_EOF/HM_EOF)가 있어 이 방식으로 배포할 수 없습니다".into());
+    }
+    let srv = ssh_admin_site(s)?;
+    let raw = format!(
+        r#"set -e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin"
+echo "== rx-cli 배포 → /usr/local/bin/rx =="
+[ -f /usr/local/bin/rx ] && cp -a /usr/local/bin/rx "/usr/local/bin/rx.bak.$(date +%Y%m%d%H%M%S)" && echo "기존 rx 백업함"
+cat > /usr/local/bin/rx <<'HM_RX_EOF'
+{body}
+HM_RX_EOF
+chmod 755 /usr/local/bin/rx
+chown root:root /usr/local/bin/rx
+echo "설치 완료: $(ls -la /usr/local/bin/rx)"
+echo
+echo "-- PHP 문법 검사 --"
+php -l /usr/local/bin/rx || {{ echo "✗ 문법 오류 — 배포한 파일을 확인하세요"; exit 1; }}
+echo
+echo "-- Rhymix 사이트에서 시험 실행 --"
+shopt -s nullglob
+TESTED=0
+for WR in /home/*/web/*/public_html; do
+  [ -d "$WR/common/framework" ] || [ -f "$WR/common/constants.php" ] || continue
+  OWN="$(stat -c %U "$WR" 2>/dev/null)"; [ -z "$OWN" ] && continue
+  echo "  대상: $WR (유저 $OWN)"
+  (cd "$WR" && sudo -u "$OWN" /usr/local/bin/rx version 2>&1 | head -n 6)
+  TESTED=1
+  break
+done
+[ "$TESTED" = 0 ] && echo "  (서버에서 Rhymix 사이트를 찾지 못해 시험 실행은 건너뜀)"
+echo
+echo "== 사용법 =="
+echo "  cd /home/<유저>/web/<도메인>/public_html && rx version"
+echo "  rx cache flush · rx module list · rx update check · rx db cli · rx help"
+echo "  ※ rx 는 --path 를 받지 않는다. 반드시 Rhymix 디렉터리 안에서 실행할 것."
+"#,
+        body = body.trim_end(),
+    );
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: "rx-cli 배포 (/usr/local/bin/rx)".into(),
+        script,
+        sshpass,
+        env,
+        note: format!("{} → sudo 로 rx-cli 설치 + php -l 검사 + Rhymix 사이트에서 rx version 시험", path.display()),
     })
 }
 
@@ -2397,14 +2467,47 @@ hm_wp_stable() {
 }
 "#;
 
+/// 작업 끝에 사람이 읽기 쉬운 요약 보고서를 찍고, $MAILTO 가 있으면 메일로도 보낸다.
+/// 앞서 $RPT(사이트별 한 줄 누적)·$OK·$SKIP·$FAIL·$RPT_TITLE 이 채워져 있어야 한다.
+/// 로그 수백 줄을 다 읽지 않아도 무엇이 바뀌고 무엇이 실패했는지 이 블록만 보면 된다.
+const REPORT_FOOTER: &str = r#"
+HOSTN="$(hostname -f 2>/dev/null || hostname)"
+WHEN="$(date '+%Y-%m-%d %H:%M:%S')"
+BAR="════════════════════════════════════════════════════════════════════════"
+SUB="────────────────────────────────────────────────────────────────────────"
+REPORT="$BAR
+ $RPT_TITLE
+ $HOSTN · $WHEN
+$BAR
+  성공 $OK    건너뜀 $SKIP    실패 $FAIL
+$SUB
+  사이트                           방식        결과   버전
+$SUB
+$RPT$BAR"
+echo
+echo "$REPORT"
+if [ -n "$MAILTO" ]; then
+  SUBJ="[hostmover] $RPT_TITLE — 성공 $OK / 실패 $FAIL ($HOSTN)"
+  if command -v mail >/dev/null 2>&1; then
+    printf '%s\n' "$REPORT" | mail -s "$SUBJ" "$MAILTO" && echo "✉ 메일 발송: $MAILTO" || echo "✉ 메일 발송 실패"
+  elif command -v sendmail >/dev/null 2>&1; then
+    printf 'To: %s\nSubject: %s\n\n%s\n' "$MAILTO" "$SUBJ" "$REPORT" | sendmail -t && echo "✉ 메일 발송: $MAILTO" || echo "✉ 메일 발송 실패"
+  else
+    echo "✉ mail/sendmail 이 없어 발송하지 못함 — 위 보고서를 복사해 쓰세요"
+  fi
+fi
+"#;
+
 /// 한 사이트 업데이트 스텝(소유자 $OWN, 웹루트 $WR 기준). CMS 유형 자동 판별:
 /// WordPress=wp-cli, git 설치본=최신 릴리스 태그, 일반(비-git) Rhymix/그누보드=최신본 오버레이.
 /// 어느 경로든 **안정 릴리스**만 올린다. 앞에 STABLE_TAG_FN 이 정의돼 있어야 한다.
-const SITE_UPDATE_STEP: &str = r#"  if [ -f "$WR/wp-load.php" ]; then
+const SITE_UPDATE_STEP: &str = r#"  RES=""; CMSN=""; VFROM=""; VTO=""; NOTE=""
+  if [ -f "$WR/wp-load.php" ]; then
     WP=/usr/local/bin/wp
     if ! [ -x "$WP" ]; then echo "wp-cli 설치"; curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$WP" 2>/dev/null && chmod +x "$WP"; fi
     echo "── [$OWN/$DOM] WordPress 업데이트 (wp-cli · 안정 릴리스) ──"
     CUR="$(sudo -u "$OWN" "$WP" --path="$WR" core version 2>/dev/null)"
+    CMSN=wp; VFROM="$CUR"
     FORCE=""
     # 과거 git 업데이트로 개발 trunk 가 올라간 사이트는 안정 릴리스로 되돌린다
     case "$CUR" in
@@ -2412,9 +2515,10 @@ const SITE_UPDATE_STEP: &str = r#"  if [ -f "$WR/wp-load.php" ]; then
         STABLE="$(hm_wp_stable)"
         if [ -n "$STABLE" ]; then
           echo "   ! 개발버전 감지 ($CUR) → 안정 $STABLE 로 되돌림"
-          FORCE="--version=$STABLE --force"
+          FORCE="--version=$STABLE --force"; NOTE="개발버전→안정 되돌림"
         else
           echo "   ! 개발버전 감지 ($CUR) — 안정 버전 조회 실패, 되돌리지 못함"
+          NOTE="개발버전인데 되돌리지 못함"
         fi ;;
     esac
     if sudo -u "$OWN" "$WP" --path="$WR" core update $FORCE; then
@@ -2422,47 +2526,65 @@ const SITE_UPDATE_STEP: &str = r#"  if [ -f "$WR/wp-load.php" ]; then
       sudo -u "$OWN" "$WP" --path="$WR" plugin update --all || true
       sudo -u "$OWN" "$WP" --path="$WR" theme update --all || true
       sudo -u "$OWN" "$WP" --path="$WR" language core update || true
-      echo "   OK $(sudo -u "$OWN" "$WP" --path="$WR" core version 2>/dev/null)"; OK=$((OK+1))
-    else echo "   FAIL"; FAIL=$((FAIL+1)); fi
+      VTO="$(sudo -u "$OWN" "$WP" --path="$WR" core version 2>/dev/null)"
+      echo "   OK $VTO"; OK=$((OK+1)); RES=OK
+    else echo "   FAIL"; FAIL=$((FAIL+1)); RES=FAIL; fi
     # WordPress 인데 .git 이 남아 있으면 git 경로로 다시 샐 수 있다 — 알린다
     if [ -d "$WR/.git" ]; then
       RM="$(sudo -u "$OWN" git -C "$WR" remote get-url origin 2>/dev/null)"
       case "$RM" in *[Ww]ord[Pp]ress/[Ww]ord[Pp]ress*)
-        echo "   ! .git 이 남아 있음 (origin=$RM) — nightly 로 덮인 원인. 확인 후 .git 제거 권장" ;;
+        echo "   ! .git 이 남아 있음 (origin=$RM) — nightly 로 덮인 원인. 확인 후 .git 제거 권장"
+        NOTE="${NOTE:+$NOTE / }.git(WordPress) 남아 있음 — 제거 권장" ;;
       esac
     fi
   elif [ -d "$WR/.git" ]; then
     TAG="$(hm_latest_tag "$OWN" "$WR")"
+    VFROM="$(sudo -u "$OWN" git -C "$WR" rev-parse --short HEAD 2>/dev/null)"
     if [ -n "$TAG" ]; then
+      CMSN="git-tag"
       echo "── [$OWN/$DOM] git 안정 릴리스 업데이트 ($TAG) ──"
       if sudo -u "$OWN" git -C "$WR" fetch --depth=1 -f origin "refs/tags/$TAG:refs/tags/$TAG" \
          && sudo -u "$OWN" git -C "$WR" reset --hard "$TAG"; then
         sudo -u "$OWN" git -C "$WR" reflog expire --expire=now --all 2>/dev/null || true
         sudo -u "$OWN" git -C "$WR" gc --prune=now --quiet 2>/dev/null || true
-        echo "   OK $TAG ($(sudo -u "$OWN" git -C "$WR" rev-parse --short HEAD 2>/dev/null))"; OK=$((OK+1))
-      else echo "   FAIL"; FAIL=$((FAIL+1)); fi
+        VTO="$TAG"
+        echo "   OK $TAG ($(sudo -u "$OWN" git -C "$WR" rev-parse --short HEAD 2>/dev/null))"; OK=$((OK+1)); RES=OK
+      else echo "   FAIL"; FAIL=$((FAIL+1)); RES=FAIL; fi
     else
+      CMSN="git-branch"
       BR="$(sudo -u "$OWN" git -C "$WR" rev-parse --abbrev-ref HEAD 2>/dev/null)"; [ -z "$BR" -o "$BR" = HEAD ] && BR=master
+      NOTE="릴리스 태그 없는 저장소 — 개발 브랜치 $BR"
       echo "── [$OWN/$DOM] 릴리스 태그 없음 → 브랜치 $BR 얕은 업데이트 ──"
       if sudo -u "$OWN" git -C "$WR" fetch --depth=1 origin "$BR" && sudo -u "$OWN" git -C "$WR" reset --hard FETCH_HEAD; then
         sudo -u "$OWN" git -C "$WR" reflog expire --expire=now --all 2>/dev/null || true
         sudo -u "$OWN" git -C "$WR" gc --prune=now --quiet 2>/dev/null || true
-        echo "   OK $(sudo -u "$OWN" git -C "$WR" rev-parse --short HEAD 2>/dev/null) (개발 브랜치 — 태그 릴리스가 없는 저장소)"; OK=$((OK+1))
-      else echo "   FAIL"; FAIL=$((FAIL+1)); fi
+        VTO="$(sudo -u "$OWN" git -C "$WR" rev-parse --short HEAD 2>/dev/null)"
+        echo "   OK $VTO (개발 브랜치 — 태그 릴리스가 없는 저장소)"; OK=$((OK+1)); RES=OK
+      else echo "   FAIL"; FAIL=$((FAIL+1)); RES=FAIL; fi
     fi
   else
     REPO=""; EXCL=""
     if [ -d "$WR/common/framework" ] || [ -f "$WR/common/constants.php" ] || [ -f "$WR/config/config.inc.php" ]; then REPO="https://github.com/rhymix/rhymix.git"; EXCL="--exclude=/config/ --exclude=/files/"
     elif [ -f "$WR/common.php" ] && [ -d "$WR/bbs" ]; then REPO="https://github.com/gnuboard/gnuboard5.git"; EXCL="--exclude=/data/"
     fi
-    if [ -z "$REPO" ]; then echo "── [$OWN/$DOM] CMS 미상 → 건너뜀"; SKIP=$((SKIP+1)); continue; fi
+    if [ -z "$REPO" ]; then
+      echo "── [$OWN/$DOM] CMS 미상 → 건너뜀"; SKIP=$((SKIP+1))
+      RPT="$RPT$(printf '  %-32s %-11s %-6s %s' "$DOM" "unknown" "SKIP" "CMS 를 판별하지 못함")"$'\n'
+      continue
+    fi
+    CMSN="overlay"
     TAG="$(hm_latest_tag "$OWN" "$REPO")"
     CLONE_AT=""; [ -n "$TAG" ] && CLONE_AT="--branch $TAG"
     echo "── [$OWN/$DOM] 일반설치 오버레이 업데이트 ${TAG:-개발브랜치} (보존 $EXCL) ──"
     TMP="$(sudo -u "$OWN" mktemp -d)"
     if sudo -u "$OWN" git clone --depth 1 $CLONE_AT "$REPO" "$TMP" && sudo -u "$OWN" rsync -a $EXCL "$TMP"/ "$WR"/; then
-      sudo -u "$OWN" rm -rf "$TMP"; echo "   OK 오버레이 완료 ${TAG:+($TAG)} (다음부터 git)"; OK=$((OK+1))
-    else sudo -u "$OWN" rm -rf "$TMP" 2>/dev/null; echo "   FAIL"; FAIL=$((FAIL+1)); fi
+      sudo -u "$OWN" rm -rf "$TMP"; VTO="${TAG:-개발브랜치}"
+      echo "   OK 오버레이 완료 ${TAG:+($TAG)} (다음부터 git)"; OK=$((OK+1)); RES=OK
+    else sudo -u "$OWN" rm -rf "$TMP" 2>/dev/null; echo "   FAIL"; FAIL=$((FAIL+1)); RES=FAIL; fi
+  fi
+  # 사이트 한 줄 요약을 모아 마지막 보고서에 쓴다
+  if [ -n "$RES" ]; then
+    RPT="$RPT$(printf '  %-32s %-11s %-6s %s → %s%s' "$DOM" "$CMSN" "$RES" "${VFROM:--}" "${VTO:--}" "${NOTE:+  ※ $NOTE}")"$'\n'
   fi
 "#;
 
@@ -2484,10 +2606,10 @@ pub fn build_account_git_update(s: &Settings, account: &str, domains: &[String])
     };
     let scope = if domains.is_empty() { "전체".to_string() } else { format!("{}개 선택", domains.len()) };
     let body = format!(
-        "shopt -s nullglob\n{tagfn}\nOK=0; SKIP=0; FAIL=0\n\
-         for WR in {list}; do\n  [ -d \"$WR\" ] || continue\n  DOM=\"$(basename \"$(dirname \"$WR\")\")\"\n{step}\n  chown -R \"$OWN:$OWN\" \"$WR\" 2>/dev/null || true\ndone\n\
-         echo \"== 완료: 업데이트 $OK · 건너뜀 $SKIP · 실패 $FAIL (소유권 $OWN 로 보정) ==\"\n",
-        tagfn = STABLE_TAG_FN, list = list, step = SITE_UPDATE_STEP,
+        "shopt -s nullglob\nRPT_TITLE=\"계정 {acct} 사이트 업데이트 ({scope})\"\nMAILTO=\"\"\n{tagfn}\nOK=0; SKIP=0; FAIL=0; RPT=\"\"\n\
+         for WR in {list}; do\n  [ -d \"$WR\" ] || continue\n  DOM=\"$(basename \"$(dirname \"$WR\")\")\"\n{step}\n  chown -R \"$OWN:$OWN\" \"$WR\" 2>/dev/null || true\ndone\n{footer}",
+        acct = acct, scope = scope, tagfn = STABLE_TAG_FN, list = list,
+        step = SITE_UPDATE_STEP, footer = REPORT_FOOTER,
     );
     let raw = format!("export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin\"\nOWN={}\n{}", sq(acct), body);
     let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);

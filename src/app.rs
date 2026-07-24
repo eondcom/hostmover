@@ -411,6 +411,8 @@ pub struct App {
     /// WordPress 특정 플러그인 일괄 업데이트 — 슬러그 / 대상 계정(비우면 서버 전체)
     wp_plug_slug: String,
     wp_plug_acct: String,
+    /// 일괄 업데이트 결과 보고서를 받을 메일 주소 (비우면 발송 안 함)
+    bulk_mail: String,
     disk_path: String,
     disk_alert_email: String,
     /// WordPress 플러그인/테마 버전비교 스캔 결과 캐시 — (도메인id, 종류) → 행들.
@@ -505,6 +507,7 @@ impl App {
             mod_del_acct: String::new(),
             wp_plug_slug: String::new(),
             wp_plug_acct: String::new(),
+            bulk_mail: String::new(),
             disk_path: "/backup".to_string(),
             disk_alert_email: "eond@eond.com".to_string(),
             wp_cache: std::collections::HashMap::new(),
@@ -754,6 +757,7 @@ impl App {
         let mut do_bulk_update: Option<bool> = None;
         // (실행할지, 점검만인지) — 점검은 읽기 전용이라 확인 모달 없이 바로 돈다
         let mut do_wp_plugin: Option<(bool, bool)> = None;
+        let mut do_rx_cli: Option<bool> = None;
         let mut do_module_delete: Option<bool> = None;
         let mut do_backup = false;
         let mut do_restore: Option<std::path::PathBuf> = None;
@@ -891,6 +895,12 @@ impl App {
                             ui.label(egui::RichText::new("※ 서버 SSH(sudo 유저) 설정이 필요합니다.").weak());
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
+                                grid_label(ui, "결과 메일 받기");
+                                ui.add(egui::TextEdit::singleline(&mut self.bulk_mail).hint_text("비우면 발송 안 함 (예: eond@eond.com)").desired_width(240.0).margin(FIELD_MARGIN))
+                                    .on_hover_text("작업이 끝나면 서버가 요약 보고서를 이 주소로 메일 발송합니다 (mail/sendmail 사용)");
+                            });
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
                                 if ui.add_enabled(!running, btn_primary(format!("{}  일괄 업데이트 실행", ph::ARROWS_CLOCKWISE))).clicked() {
                                     do_bulk_update = Some(true);
                                 }
@@ -926,6 +936,22 @@ impl App {
                             });
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("자체 업데이터를 쓰는 상용 플러그인은 wp-cli 로 올라가지 않을 수 있습니다(실패로 보고됨).").weak());
+                        });
+                        card(ui, |ui| {
+                            ui.strong(format!("{}  rx-cli 배포 (Rhymix 터미널 도구)", ph::TERMINAL_WINDOW));
+                            ui.label(egui::RichText::new("wp-cli 처럼 쓰는 Rhymix CLI 를 서버 /usr/local/bin/rx 에 설치합니다. 소스는 '설정 > Rhymix 소스' 경로의 modules/rxdashboard/bin/rx 입니다.").weak());
+                            ui.label(egui::RichText::new("설치 후: cd <웹루트> && rx version / rx cache flush / rx module list / rx update check").weak());
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!running, btn_primary(format!("{}  rx-cli 배포", ph::UPLOAD_SIMPLE)))
+                                    .on_hover_text("서버에 설치 + php -l 문법검사 + Rhymix 사이트에서 rx version 시험 실행 (기존 파일은 백업)")
+                                    .clicked() { do_rx_cli = Some(true); }
+                                if ui.button(format!("{}  명령어 보기", ph::FILE_TEXT)).clicked() {
+                                    do_rx_cli = Some(false);
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("rx 는 --path 를 받지 않고 현재 디렉터리에서 Rhymix 루트를 찾습니다. 반드시 사이트 폴더 안에서 실행하세요.").weak());
                         });
                     }
                     SettingsTab::ModuleDelete => {
@@ -1214,7 +1240,7 @@ impl App {
             }
         }
         if let Some(run) = do_bulk_update {
-            match ops::build_bulk_git_update(&self.store.settings) {
+            match ops::build_bulk_git_update(&self.store.settings, &self.bulk_mail) {
                 Ok(job) => {
                     if run {
                         self.eond_confirm = Some(job);
@@ -1224,6 +1250,22 @@ impl App {
                 }
                 Err(e) => {
                     self.log.push(format!("일괄 업데이트: {e}"));
+                    self.status = format!("오류: {e}");
+                    self.last_ok = Some(false);
+                }
+            }
+        }
+        if let Some(run) = do_rx_cli {
+            match ops::build_rx_cli_install(&self.store.settings) {
+                Ok(job) => {
+                    if run {
+                        self.eond_confirm = Some(job);
+                    } else {
+                        self.cmd_view = Some(CmdView { title: job.title.clone(), command: render_command(&job, self.show_pw) });
+                    }
+                }
+                Err(e) => {
+                    self.log.push(format!("rx-cli 배포: {e}"));
                     self.status = format!("오류: {e}");
                     self.last_ok = Some(false);
                 }
