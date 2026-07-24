@@ -408,6 +408,9 @@ pub struct App {
     /// 설정의 Rhymix 모듈 삭제 도구 입력값
     mod_del_name: String,
     mod_del_acct: String,
+    /// WordPress 특정 플러그인 일괄 업데이트 — 슬러그 / 대상 계정(비우면 서버 전체)
+    wp_plug_slug: String,
+    wp_plug_acct: String,
     disk_path: String,
     disk_alert_email: String,
     /// WordPress 플러그인/테마 버전비교 스캔 결과 캐시 — (도메인id, 종류) → 행들.
@@ -500,6 +503,8 @@ impl App {
             last_edit: 0.0,
             mod_del_name: String::new(),
             mod_del_acct: String::new(),
+            wp_plug_slug: String::new(),
+            wp_plug_acct: String::new(),
             disk_path: "/backup".to_string(),
             disk_alert_email: "eond@eond.com".to_string(),
             wp_cache: std::collections::HashMap::new(),
@@ -747,6 +752,8 @@ impl App {
         let mut do_disk_scrub: Option<u32> = None;
         let mut do_disk_monitor: Option<bool> = None;
         let mut do_bulk_update: Option<bool> = None;
+        // (실행할지, 점검만인지) — 점검은 읽기 전용이라 확인 모달 없이 바로 돈다
+        let mut do_wp_plugin: Option<(bool, bool)> = None;
         let mut do_module_delete: Option<bool> = None;
         let mut do_backup = false;
         let mut do_restore: Option<std::path::PathBuf> = None;
@@ -878,8 +885,9 @@ impl App {
                     }
                     SettingsTab::BulkUpdate => {
                         card(ui, |ui| {
-                            ui.strong(format!("{}  Rhymix/그누보드 일괄 업데이트", ph::ARROWS_CLOCKWISE));
-                            ui.label(egui::RichText::new("서버의 모든 vhost 웹루트(/home/*/web/*/public_html)를 순회합니다. .git 있으면 얕은 업데이트(depth=1), 없으면 '수동/선택 필요'로 보고만 합니다.").weak());
+                            ui.strong(format!("{}  전체 사이트 일괄 업데이트 (안정 릴리스)", ph::ARROWS_CLOCKWISE));
+                            ui.label(egui::RichText::new("서버의 모든 vhost 웹루트(/home/*/web/*/public_html)를 순회하며 CMS 유형별로 업데이트합니다. WordPress=wp-cli(core·플러그인·테마), git 설치본=최신 릴리스 태그, 비-git Rhymix/그누보드=최신본 오버레이.").weak());
+                            ui.label(egui::RichText::new("※ master(개발 trunk)가 아니라 릴리스 태그만 올립니다. 개발버전(alpha/beta/RC)이 올라간 WordPress는 안정 릴리스로 되돌립니다.").weak());
                             ui.label(egui::RichText::new("※ 서버 SSH(sudo 유저) 설정이 필요합니다.").weak());
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
@@ -890,6 +898,34 @@ impl App {
                                     do_bulk_update = Some(false);
                                 }
                             });
+                        });
+                        card(ui, |ui| {
+                            ui.strong(format!("{}  WordPress 플러그인 골라서 일괄 업데이트", ph::PUZZLE_PIECE));
+                            ui.label(egui::RichText::new("망보드처럼 여러 사이트에 공통으로 깔린 플러그인 하나만 골라 한 번에 올립니다. 먼저 '점검만'으로 어디에 몇 버전이 깔려 있는지 확인하세요.").weak());
+                            ui.add_space(6.0);
+                            egui::Grid::new("wp_plug_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                                grid_label(ui, "플러그인 슬러그");
+                                ui.add(egui::TextEdit::singleline(&mut self.wp_plug_slug).hint_text("예: mangboard (wp-content/plugins/ 폴더 이름)").desired_width(260.0).margin(FIELD_MARGIN));
+                                ui.end_row();
+                                grid_label(ui, "대상 계정");
+                                ui.add(egui::TextEdit::singleline(&mut self.wp_plug_acct).hint_text("비우면 서버 전체 / 입력 시 해당 계정만").desired_width(260.0).margin(FIELD_MARGIN));
+                                ui.end_row();
+                            });
+                            ui.add_space(6.0);
+                            let enabled = !running && !self.wp_plug_slug.trim().is_empty();
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(enabled, egui::Button::new(format!("{}  점검만 (읽기 전용)", ph::MAGNIFYING_GLASS))).clicked() {
+                                    do_wp_plugin = Some((true, true));
+                                }
+                                if ui.add_enabled(enabled, btn_primary(format!("{}  업데이트 실행", ph::ARROWS_CLOCKWISE))).clicked() {
+                                    do_wp_plugin = Some((true, false));
+                                }
+                                if ui.add_enabled(enabled, egui::Button::new(format!("{}  명령어 보기", ph::FILE_TEXT))).clicked() {
+                                    do_wp_plugin = Some((false, false));
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("자체 업데이터를 쓰는 상용 플러그인은 wp-cli 로 올라가지 않을 수 있습니다(실패로 보고됨).").weak());
                         });
                     }
                     SettingsTab::ModuleDelete => {
@@ -1188,6 +1224,30 @@ impl App {
                 }
                 Err(e) => {
                     self.log.push(format!("일괄 업데이트: {e}"));
+                    self.status = format!("오류: {e}");
+                    self.last_ok = Some(false);
+                }
+            }
+        }
+        if let Some((run, dry)) = do_wp_plugin {
+            let (slug, acct) = (self.wp_plug_slug.clone(), self.wp_plug_acct.clone());
+            match ops::build_wp_plugin_bulk_update(&self.store.settings, &slug, &acct, dry) {
+                Ok(job) => {
+                    if !run {
+                        self.cmd_view = Some(CmdView { title: job.title.clone(), command: render_command(&job, self.show_pw) });
+                    } else if dry {
+                        // 점검은 서버를 바꾸지 않으므로 확인 모달 없이 실행
+                        self.running = true;
+                        self.last_ok = None;
+                        self.status = format!("플러그인 점검 중: {}", slug.trim());
+                        let ctx2 = ctx.clone();
+                        ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
+                    } else {
+                        self.eond_confirm = Some(job);
+                    }
+                }
+                Err(e) => {
+                    self.log.push(format!("플러그인 일괄 업데이트: {e}"));
                     self.status = format!("오류: {e}");
                     self.last_ok = Some(false);
                 }

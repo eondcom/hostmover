@@ -2020,40 +2020,113 @@ pub fn build_bulk_git_update(s: &Settings) -> Result<Job, String> {
         ssh_port: s.ssh_port.trim().to_string(),
         ..Default::default()
     };
-    // 단일 인용부호 heredoc 안에서 원격 bash 로 실행됨 (로컬 확장 없음)
-    let raw = r#"set -o pipefail
+    // 단일 인용부호 heredoc 안에서 원격 bash 로 실행됨 (로컬 확장 없음).
+    // ※ 예전에는 여기서 .git 존재만 보고 무조건 reset --hard 했다. 그 탓에 origin 이
+    //   WordPress/WordPress 인 사이트가 nightly 로 덮였다(2026-07-25). 지금은 계정별
+    //   업데이트와 같은 SITE_UPDATE_STEP 을 쓴다 — WordPress 는 wp-cli, git 은 릴리스 태그.
+    let raw = format!(
+        r#"set -o pipefail
 export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin"
-echo "== Rhymix/그누보드 일괄 업데이트 (서버 전체 git 사이트) =="
+echo "== 전체 사이트 일괄 업데이트 (안정 릴리스) =="
 shopt -s nullglob
+{tagfn}
 OK=0; SKIP=0; FAIL=0
 for WR in /home/*/web/*/public_html; do
   [ -d "$WR" ] || continue
   DOM="$(basename "$(dirname "$WR")")"
   OWN="$(stat -c %U "$WR" 2>/dev/null)"
-  if [ -d "$WR/.git" ]; then
-    echo "── [$DOM] git 얕은 업데이트 (유저 $OWN) ──"
-    BR="$(sudo -u "$OWN" git -C "$WR" rev-parse --abbrev-ref HEAD 2>/dev/null)"; [ -z "$BR" -o "$BR" = HEAD ] && BR=master
-    if sudo -u "$OWN" git -C "$WR" fetch --depth=1 origin "$BR" && sudo -u "$OWN" git -C "$WR" reset --hard FETCH_HEAD; then
-      sudo -u "$OWN" git -C "$WR" reflog expire --expire=now --all 2>/dev/null || true
-      sudo -u "$OWN" git -C "$WR" gc --prune=now --quiet 2>/dev/null || true
-      echo "   ✓ $(sudo -u "$OWN" git -C "$WR" rev-parse --short HEAD 2>/dev/null)  (.git $(du -sh "$WR/.git" 2>/dev/null | awk '{print $1}'))"
-      OK=$((OK+1))
-    else
-      echo "   ✗ 실패: $DOM"; FAIL=$((FAIL+1))
-    fi
-  else
-    echo "── [$DOM] git 아님 → 수동/선택 필요: $WR"; SKIP=$((SKIP+1))
-  fi
+  [ -z "$OWN" ] && continue
+{step}
+  chown -R "$OWN:$OWN" "$WR" 2>/dev/null || true
 done
-echo "== 완료: 업데이트 $OK · git아님(선택필요) $SKIP · 실패 $FAIL =="
-"#;
-    let (script, sshpass, env) = eondcms_exec(&srv, raw, false, true);
+echo
+echo "== 완료: 업데이트 $OK · 건너뜀 $SKIP · 실패 $FAIL =="
+"#,
+        tagfn = STABLE_TAG_FN,
+        step = SITE_UPDATE_STEP,
+    );
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
     Ok(Job {
-        title: "Rhymix/그누보드 일괄 업데이트 (서버 git 사이트)".into(),
+        title: "전체 사이트 일괄 업데이트 (안정 릴리스)".into(),
         script,
         sshpass,
         env,
-        note: format!("{user}@{host} → sudo 로 root 후 /home/*/web/*/public_html 순회 (git=얕은 업데이트, 비-git=보고)"),
+        note: format!("{user}@{host} → sudo 로 root 후 /home/*/web/*/public_html 순회 · WordPress=wp-cli, git=최신 릴리스 태그, 비-git=오버레이"),
+    })
+}
+
+/// 특정 WordPress 플러그인만 골라 일괄 처리 (서버 전체 또는 한 계정).
+/// 망보드처럼 여러 사이트에 공통으로 깔린 플러그인을 한 번에 올릴 때 쓴다.
+/// `dry=true` 면 어디에 몇 버전이 깔려 있는지 **점검만** 하고 아무것도 바꾸지 않는다.
+pub fn build_wp_plugin_bulk_update(s: &Settings, slug: &str, account: &str, dry: bool) -> Result<Job, String> {
+    let sl = slug.trim();
+    if !is_safe_name(sl) {
+        return Err("플러그인 슬러그는 영숫자/._- 만 허용됩니다 (예: mangboard)".into());
+    }
+    let acct = account.trim();
+    if !acct.is_empty() && !is_safe_name(acct) {
+        return Err("계정 이름은 영숫자/._- 만 허용됩니다".into());
+    }
+    let srv = ssh_admin_site(s)?;
+    let home = if acct.is_empty() { "/home/*".to_string() } else { format!("/home/{acct}") };
+    let scope = if acct.is_empty() { "서버 전체".to_string() } else { format!("계정 {acct}") };
+    let mode = if dry { "점검" } else { "업데이트" };
+    let head = format!(
+        "set +e\nexport PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin\"\nSLUG={slug}\nDRY={dry}\nGLOB={home}\n",
+        slug = sq(sl),
+        dry = if dry { "1" } else { "0" },
+        home = sq(&home),
+    );
+    // GLOB 은 따옴표 없이 전개해야 /home/* 가 확장된다 (값은 위에서 검증된 안전한 문자열)
+    let body = r#"shopt -s nullglob
+echo "== WordPress 플러그인 [$SLUG] $([ "$DRY" = 1 ] && echo 점검 || echo 일괄업데이트) =="
+WP=/usr/local/bin/wp
+if ! [ -x "$WP" ]; then echo "wp-cli 설치"; curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$WP" 2>/dev/null && chmod +x "$WP"; fi
+FOUND=0; OK=0; NOUP=0; FAIL=0; NONE=0
+for WR in $GLOB/web/*/public_html; do
+  [ -d "$WR" ] || continue
+  [ -f "$WR/wp-load.php" ] || continue
+  DOM="$(basename "$(dirname "$WR")")"
+  OWN="$(stat -c %U "$WR" 2>/dev/null)"; [ -z "$OWN" ] && continue
+  CUR="$(sudo -u "$OWN" "$WP" --path="$WR" plugin get "$SLUG" --field=version 2>/dev/null)"
+  if [ -z "$CUR" ]; then NONE=$((NONE+1)); continue; fi
+  FOUND=$((FOUND+1))
+  STAT="$(sudo -u "$OWN" "$WP" --path="$WR" plugin get "$SLUG" --field=status 2>/dev/null)"
+  AVAIL="$(sudo -u "$OWN" "$WP" --path="$WR" plugin list --name="$SLUG" --field=update_version 2>/dev/null | head -n 1)"
+  if [ "$DRY" = 1 ]; then
+    printf '  %-34s %-10s %s%s\n' "$DOM" "$CUR" "$STAT" "$([ -n "$AVAIL" ] && echo "  → $AVAIL 있음")"
+    continue
+  fi
+  if [ -z "$AVAIL" ]; then
+    echo "── [$OWN/$DOM] $CUR — 새 버전 없음"; NOUP=$((NOUP+1)); continue
+  fi
+  echo "── [$OWN/$DOM] $CUR → $AVAIL ──"
+  if sudo -u "$OWN" "$WP" --path="$WR" plugin update "$SLUG"; then
+    NEW="$(sudo -u "$OWN" "$WP" --path="$WR" plugin get "$SLUG" --field=version 2>/dev/null)"
+    chown -R "$OWN:$OWN" "$WR/wp-content/plugins/$SLUG" 2>/dev/null || true
+    echo "   OK $CUR → $NEW"; OK=$((OK+1))
+  else
+    echo "   FAIL (자체 업데이터를 쓰는 상용 플러그인은 wp-cli 로 못 올릴 수 있음)"; FAIL=$((FAIL+1))
+  fi
+done
+echo
+if [ "$DRY" = 1 ]; then
+  echo "== 점검 완료: 설치됨 $FOUND · 미설치 $NONE =="
+else
+  echo "== 완료: 업데이트 $OK · 이미최신 $NOUP · 실패 $FAIL · 미설치 $NONE =="
+fi
+"#;
+    let raw = format!("{head}{body}");
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("WordPress 플러그인 {mode} : {sl} ({scope})"),
+        script,
+        sshpass,
+        env,
+        note: format!(
+            "{home}/web/*/public_html 중 WordPress 사이트만 순회 · wp-cli plugin {}",
+            if dry { "get/list (읽기 전용)" } else { "update" }
+        ),
     })
 }
 
@@ -2305,37 +2378,90 @@ pub fn scan_account_sites(s: &Settings, account: &str) -> Result<Vec<(String, St
     Ok(res)
 }
 
+/// 저장소의 최신 **릴리스 태그**를 고르는 셸 함수. 업데이트 스텝보다 먼저 삽입해야 한다.
+///
+/// master 브랜치는 개발 trunk 다. 그대로 당기면 프로덕션에 알파/베타가 올라간다 —
+/// 2026-07-25 에 WordPress 사이트 4곳이 `WordPress/WordPress` master(nightly)로,
+/// Rhymix/그누보드도 master 로 덮여쓰인 실사고가 있었다. 그래서 태그를 우선한다.
+const STABLE_TAG_FN: &str = r#"# hm_latest_tag <소유자> <git경로|저장소URL> → 최신 릴리스 태그(없으면 빈 문자열)
+hm_latest_tag() {
+  sudo -u "$1" git ls-remote --tags --refs "$2" 2>/dev/null \
+    | awk -F/ '{print $NF}' \
+    | grep -E '^v?[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+    | sort -V | tail -n 1
+}
+# hm_wp_stable → wordpress.org 가 알려주는 최신 안정 릴리스
+hm_wp_stable() {
+  curl -fsSL https://api.wordpress.org/core/version-check/1.7/ 2>/dev/null \
+    | tr ',' '\n' | grep -m1 '"current"' | cut -d'"' -f4
+}
+"#;
+
 /// 한 사이트 업데이트 스텝(소유자 $OWN, 웹루트 $WR 기준). CMS 유형 자동 판별:
-/// WordPress=wp-cli, git 설치본=얕은 업데이트, 일반(비-git) Rhymix/그누보드=최신본 오버레이.
+/// WordPress=wp-cli, git 설치본=최신 릴리스 태그, 일반(비-git) Rhymix/그누보드=최신본 오버레이.
+/// 어느 경로든 **안정 릴리스**만 올린다. 앞에 STABLE_TAG_FN 이 정의돼 있어야 한다.
 const SITE_UPDATE_STEP: &str = r#"  if [ -f "$WR/wp-load.php" ]; then
     WP=/usr/local/bin/wp
     if ! [ -x "$WP" ]; then echo "wp-cli 설치"; curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$WP" 2>/dev/null && chmod +x "$WP"; fi
-    echo "── [$OWN/$DOM] WordPress 업데이트 (wp-cli) ──"
-    if sudo -u "$OWN" "$WP" --path="$WR" core update; then
+    echo "── [$OWN/$DOM] WordPress 업데이트 (wp-cli · 안정 릴리스) ──"
+    CUR="$(sudo -u "$OWN" "$WP" --path="$WR" core version 2>/dev/null)"
+    FORCE=""
+    # 과거 git 업데이트로 개발 trunk 가 올라간 사이트는 안정 릴리스로 되돌린다
+    case "$CUR" in
+      *alpha*|*beta*|*RC*|*-src*)
+        STABLE="$(hm_wp_stable)"
+        if [ -n "$STABLE" ]; then
+          echo "   ! 개발버전 감지 ($CUR) → 안정 $STABLE 로 되돌림"
+          FORCE="--version=$STABLE --force"
+        else
+          echo "   ! 개발버전 감지 ($CUR) — 안정 버전 조회 실패, 되돌리지 못함"
+        fi ;;
+    esac
+    if sudo -u "$OWN" "$WP" --path="$WR" core update $FORCE; then
       sudo -u "$OWN" "$WP" --path="$WR" core update-db || true
       sudo -u "$OWN" "$WP" --path="$WR" plugin update --all || true
       sudo -u "$OWN" "$WP" --path="$WR" theme update --all || true
       sudo -u "$OWN" "$WP" --path="$WR" language core update || true
       echo "   OK $(sudo -u "$OWN" "$WP" --path="$WR" core version 2>/dev/null)"; OK=$((OK+1))
     else echo "   FAIL"; FAIL=$((FAIL+1)); fi
+    # WordPress 인데 .git 이 남아 있으면 git 경로로 다시 샐 수 있다 — 알린다
+    if [ -d "$WR/.git" ]; then
+      RM="$(sudo -u "$OWN" git -C "$WR" remote get-url origin 2>/dev/null)"
+      case "$RM" in *[Ww]ord[Pp]ress/[Ww]ord[Pp]ress*)
+        echo "   ! .git 이 남아 있음 (origin=$RM) — nightly 로 덮인 원인. 확인 후 .git 제거 권장" ;;
+      esac
+    fi
   elif [ -d "$WR/.git" ]; then
-    BR="$(sudo -u "$OWN" git -C "$WR" rev-parse --abbrev-ref HEAD 2>/dev/null)"; [ -z "$BR" -o "$BR" = HEAD ] && BR=master
-    echo "── [$OWN/$DOM] git 얕은 업데이트 ($BR) ──"
-    if sudo -u "$OWN" git -C "$WR" fetch --depth=1 origin "$BR" && sudo -u "$OWN" git -C "$WR" reset --hard FETCH_HEAD; then
-      sudo -u "$OWN" git -C "$WR" reflog expire --expire=now --all 2>/dev/null || true
-      sudo -u "$OWN" git -C "$WR" gc --prune=now --quiet 2>/dev/null || true
-      echo "   OK $(sudo -u "$OWN" git -C "$WR" rev-parse --short HEAD 2>/dev/null)"; OK=$((OK+1))
-    else echo "   FAIL"; FAIL=$((FAIL+1)); fi
+    TAG="$(hm_latest_tag "$OWN" "$WR")"
+    if [ -n "$TAG" ]; then
+      echo "── [$OWN/$DOM] git 안정 릴리스 업데이트 ($TAG) ──"
+      if sudo -u "$OWN" git -C "$WR" fetch --depth=1 -f origin "refs/tags/$TAG:refs/tags/$TAG" \
+         && sudo -u "$OWN" git -C "$WR" reset --hard "$TAG"; then
+        sudo -u "$OWN" git -C "$WR" reflog expire --expire=now --all 2>/dev/null || true
+        sudo -u "$OWN" git -C "$WR" gc --prune=now --quiet 2>/dev/null || true
+        echo "   OK $TAG ($(sudo -u "$OWN" git -C "$WR" rev-parse --short HEAD 2>/dev/null))"; OK=$((OK+1))
+      else echo "   FAIL"; FAIL=$((FAIL+1)); fi
+    else
+      BR="$(sudo -u "$OWN" git -C "$WR" rev-parse --abbrev-ref HEAD 2>/dev/null)"; [ -z "$BR" -o "$BR" = HEAD ] && BR=master
+      echo "── [$OWN/$DOM] 릴리스 태그 없음 → 브랜치 $BR 얕은 업데이트 ──"
+      if sudo -u "$OWN" git -C "$WR" fetch --depth=1 origin "$BR" && sudo -u "$OWN" git -C "$WR" reset --hard FETCH_HEAD; then
+        sudo -u "$OWN" git -C "$WR" reflog expire --expire=now --all 2>/dev/null || true
+        sudo -u "$OWN" git -C "$WR" gc --prune=now --quiet 2>/dev/null || true
+        echo "   OK $(sudo -u "$OWN" git -C "$WR" rev-parse --short HEAD 2>/dev/null) (개발 브랜치 — 태그 릴리스가 없는 저장소)"; OK=$((OK+1))
+      else echo "   FAIL"; FAIL=$((FAIL+1)); fi
+    fi
   else
     REPO=""; EXCL=""
     if [ -d "$WR/common/framework" ] || [ -f "$WR/common/constants.php" ] || [ -f "$WR/config/config.inc.php" ]; then REPO="https://github.com/rhymix/rhymix.git"; EXCL="--exclude=/config/ --exclude=/files/"
     elif [ -f "$WR/common.php" ] && [ -d "$WR/bbs" ]; then REPO="https://github.com/gnuboard/gnuboard5.git"; EXCL="--exclude=/data/"
     fi
     if [ -z "$REPO" ]; then echo "── [$OWN/$DOM] CMS 미상 → 건너뜀"; SKIP=$((SKIP+1)); continue; fi
-    echo "── [$OWN/$DOM] 일반설치 오버레이 업데이트 (보존 $EXCL) ──"
+    TAG="$(hm_latest_tag "$OWN" "$REPO")"
+    CLONE_AT=""; [ -n "$TAG" ] && CLONE_AT="--branch $TAG"
+    echo "── [$OWN/$DOM] 일반설치 오버레이 업데이트 ${TAG:-개발브랜치} (보존 $EXCL) ──"
     TMP="$(sudo -u "$OWN" mktemp -d)"
-    if sudo -u "$OWN" git clone --depth 1 "$REPO" "$TMP" && sudo -u "$OWN" rsync -a $EXCL "$TMP"/ "$WR"/; then
-      sudo -u "$OWN" rm -rf "$TMP"; echo "   OK 오버레이 완료 (다음부터 git)"; OK=$((OK+1))
+    if sudo -u "$OWN" git clone --depth 1 $CLONE_AT "$REPO" "$TMP" && sudo -u "$OWN" rsync -a $EXCL "$TMP"/ "$WR"/; then
+      sudo -u "$OWN" rm -rf "$TMP"; echo "   OK 오버레이 완료 ${TAG:+($TAG)} (다음부터 git)"; OK=$((OK+1))
     else sudo -u "$OWN" rm -rf "$TMP" 2>/dev/null; echo "   FAIL"; FAIL=$((FAIL+1)); fi
   fi
 "#;
@@ -2358,10 +2484,10 @@ pub fn build_account_git_update(s: &Settings, account: &str, domains: &[String])
     };
     let scope = if domains.is_empty() { "전체".to_string() } else { format!("{}개 선택", domains.len()) };
     let body = format!(
-        "shopt -s nullglob\nOK=0; SKIP=0; FAIL=0\n\
+        "shopt -s nullglob\n{tagfn}\nOK=0; SKIP=0; FAIL=0\n\
          for WR in {list}; do\n  [ -d \"$WR\" ] || continue\n  DOM=\"$(basename \"$(dirname \"$WR\")\")\"\n{step}\n  chown -R \"$OWN:$OWN\" \"$WR\" 2>/dev/null || true\ndone\n\
          echo \"== 완료: 업데이트 $OK · 건너뜀 $SKIP · 실패 $FAIL (소유권 $OWN 로 보정) ==\"\n",
-        list = list, step = SITE_UPDATE_STEP,
+        tagfn = STABLE_TAG_FN, list = list, step = SITE_UPDATE_STEP,
     );
     let raw = format!("export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin\"\nOWN={}\n{}", sq(acct), body);
     let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
