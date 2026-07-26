@@ -75,8 +75,18 @@ enum AcctTab {
     Notes,
 }
 
+/// 비번 변경 실행 경로 — 화면마다 접속 방식이 다르다
+#[derive(Clone, Copy, PartialEq)]
+enum WpPwScope {
+    /// 계정 관리·전체 사이트: 설정의 서버 SSH(sudo) + /home/<계정>/web/<도메인>/public_html
+    Accounts,
+    /// 도메인 화면: 그 사이트(현재/신규)의 서버·자격증명 + 웹루트 자동탐지
+    Site { ci: usize, di: usize },
+}
+
 /// WordPress 관리자 비밀번호 변경 입력 모달 상태
 struct WpPwDialog {
+    scope: WpPwScope,
     /// 대상 (계정, 도메인, 스캔된 CMS 종류)
     targets: Vec<(String, String, String)>,
     /// 관리자 로그인 ID (기본 admin)
@@ -1511,7 +1521,7 @@ impl App {
                 .filter(|r| r.account == acct && r.sel)
                 .map(|r| (r.account.clone(), r.domain.clone(), r.kind.clone()))
                 .collect();
-            self.open_wp_pw_dialog(targets);
+            self.open_wp_pw_dialog(WpPwScope::Accounts, targets, "admin".to_string());
         }
         if do_scan { self.site_dates_req.remove(&acct); self.site_perms_req.remove(&acct); self.rescan_account_into_all(acct.clone(), ctx); }
         if do_load_mods { self.load_account_modules(ci, ctx); }
@@ -2047,7 +2057,7 @@ impl App {
                 .filter(|r| r.sel)
                 .map(|r| (r.account.clone(), r.domain.clone(), r.kind.clone()))
                 .collect();
-            self.open_wp_pw_dialog(targets);
+            self.open_wp_pw_dialog(WpPwScope::Accounts, targets, "admin".to_string());
         }
         if do_rescan_acct { let a = self.all_filter_acct.clone(); self.rescan_account_into_all(a, ctx); }
         if do_dns {
@@ -2817,6 +2827,7 @@ impl App {
             let mut wp_download_req: Option<bool> = None;
             let mut wp_perm_req = false;
             let mut wp_permfix_req = false;
+            let mut wp_pw_req = false;
             let mut changed = false;
             let mut request: Option<PendingAction> = None;
             let mut view_request: Option<(OpKind, String, String, Site, Site)> = None;
@@ -3165,6 +3176,10 @@ impl App {
                                     }
                                     if ui.add_enabled(!running, egui::Button::new("🔧  권한 수정")).on_hover_text("public_html 소유 chown -R + 디렉터리 755·파일 644·최상위 751 (root, 확인 후 실행)").clicked() {
                                         wp_permfix_req = true;
+                                    }
+                                    if ui.add_enabled(!running, egui::Button::new(format!("{}  관리자 비번 변경", ph::KEY)))
+                                        .on_hover_text("이 사이트의 WordPress 관리자(기본 admin) 비밀번호를 입력한 값으로 변경").clicked() {
+                                        wp_pw_req = true;
                                     }
                                     ui.label(egui::RichText::new(&wp_scan_status).weak());
                                     if cached && !wp_scanning { ui.label(egui::RichText::new("· 캐시 표시중").weak()); }
@@ -3595,6 +3610,18 @@ impl App {
                     }
                 }
             }
+            if wp_pw_req {
+                let dom = &self.store.customers[ci].domains[di];
+                // 관리자 ID 는 ④ CMS 접속정보의 ID 를 기본값으로(비면 admin), 비번은 항상 새로 입력받는다
+                let uid = dom.cms.id.trim();
+                let user = if uid.is_empty() { "admin".to_string() } else { uid.to_string() };
+                let acct = {
+                    let s = if dom.cms_install.use_asis { &dom.asis } else { &dom.tobe };
+                    if s.ftp_id.trim().is_empty() { customer_name.clone() } else { s.ftp_id.trim().to_string() }
+                };
+                let targets = vec![(acct, dom.name.clone(), "WordPress".to_string())];
+                self.open_wp_pw_dialog(WpPwScope::Site { ci, di }, targets, user);
+            }
             if wp_permfix_req {
                 let dom = &self.store.customers[ci].domains[di];
                 let mut c = dom.cms_install.clone();
@@ -3711,11 +3738,12 @@ impl App {
         }
     }
 
-    /// 선택한 사이트들로 WordPress 관리자 비번 변경 모달 열기 (계정 관리·전체 사이트 공용)
-    fn open_wp_pw_dialog(&mut self, targets: Vec<(String, String, String)>) {
+    /// WordPress 관리자 비번 변경 모달 열기 (계정 관리·전체 사이트·도메인 화면 공용)
+    fn open_wp_pw_dialog(&mut self, scope: WpPwScope, targets: Vec<(String, String, String)>, user: String) {
         self.wp_pw_dlg = Some(WpPwDialog {
+            scope,
             targets,
-            user: "admin".to_string(),
+            user,
             pass: String::new(),
             pass_confirm: String::new(),
             show: false,
@@ -3737,8 +3765,16 @@ impl App {
             .default_width(460.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.label(format!("대상 {}개 사이트 (스캔 결과 WordPress: {wp_cnt}개)", d.targets.len()));
-                ui.label(egui::RichText::new("입력한 관리자 ID의 로그인 비밀번호만 변경합니다. WordPress 가 아니거나 그 ID가 없는 사이트는 건너뜁니다.").weak());
+                match d.scope {
+                    WpPwScope::Accounts => {
+                        ui.label(format!("대상 {}개 사이트 (스캔 결과 WordPress: {wp_cnt}개)", d.targets.len()));
+                        ui.label(egui::RichText::new("입력한 관리자 ID의 로그인 비밀번호만 변경합니다. WordPress 가 아니거나 그 ID가 없는 사이트는 건너뜁니다.").weak());
+                    }
+                    WpPwScope::Site { .. } => {
+                        ui.label("대상: 이 도메인 1곳");
+                        ui.label(egui::RichText::new("정보 탭에서 고른 서버(현재/신규)로 접속해 웹루트를 자동탐지합니다. '루트로 실행'이 켜져 있어야 합니다.").weak());
+                    }
+                }
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
                     for (a, dom, kind) in &d.targets {
@@ -3779,8 +3815,25 @@ impl App {
             if d.pass != d.pass_confirm {
                 d.error = "비밀번호와 확인이 일치하지 않습니다.".into();
             } else {
-                let pairs: Vec<(String, String)> = d.targets.iter().map(|(a, dom, _)| (a.clone(), dom.clone())).collect();
-                match ops::build_wp_admin_passwd(&self.store.settings, &pairs, &d.user, &d.pass) {
+                let built = match d.scope {
+                    WpPwScope::Accounts => {
+                        let pairs: Vec<(String, String)> = d.targets.iter().map(|(a, dom, _)| (a.clone(), dom.clone())).collect();
+                        ops::build_wp_admin_passwd(&self.store.settings, &pairs, &d.user, &d.pass)
+                    }
+                    // 도메인 화면: 권한 점검/수정과 동일하게 그 사이트의 서버·자격증명을 쓴다
+                    WpPwScope::Site { ci, di } => {
+                        let cust = self.store.customers[ci].name.clone();
+                        let dom = &self.store.customers[ci].domains[di];
+                        let mut c = dom.cms_install.clone();
+                        let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                        c.hestia_user = server.ftp_id.clone();
+                        c.hestia_pass = server.ftp_pw.clone();
+                        if c.hestia_user.trim().is_empty() { c.hestia_user = cust; }
+                        let dn = dom.name.clone();
+                        ops::build_wp_site_admin_passwd(&server, &c, &dn, self.use_root, &d.user, &d.pass)
+                    }
+                };
+                match built {
                     Ok(job) => { self.eond_confirm = Some(job); close = true; }
                     Err(e) => d.error = e,
                 }

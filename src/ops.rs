@@ -2584,18 +2584,81 @@ fn wp_login_ok(u: &str) -> bool {
     !u.is_empty() && u.len() <= 60 && !u.chars().any(|c| c.is_control())
 }
 
+/// 관리자 ID/새 비번 공통 검증 → 실제 사용할 관리자 ID (빈 값이면 admin).
+/// 제어문자를 거르는 이유: 스크립트가 heredoc(`<<'HM_EOF'`)으로 전달되므로 줄바꿈이 섞이면 깨진다.
+fn wp_pw_validate(admin_user: &str, new_pass: &str) -> Result<String, String> {
+    let u = admin_user.trim();
+    let user = if u.is_empty() { "admin" } else { u };
+    if !wp_login_ok(user) { return Err("관리자 ID 형식 오류 (제어문자 불가, 60자 이내)".into()); }
+    if new_pass.trim().is_empty() { return Err("새 비밀번호가 비어 있습니다".into()); }
+    if new_pass.chars().any(|c| c.is_control()) { return Err("새 비밀번호에 줄바꿈/제어문자는 쓸 수 없습니다".into()); }
+    Ok(user.to_string())
+}
+
+/// wp-cli 준비 (없으면 설치). $WPCLI 설정.
+const WP_CLI_PREP: &str = r#"WPCLI=/usr/local/bin/wp
+if ! [ -x "$WPCLI" ]; then echo "wp-cli 설치"; curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$WPCLI" 2>/dev/null && chmod +x "$WPCLI"; fi
+if ! [ -x "$WPCLI" ]; then echo "✗ wp-cli 가 없고 설치도 실패 — 중단"; exit 1; fi
+"#;
+
+/// 한 사이트의 관리자 비번 변경 (계정 일괄·도메인 개별 공용).
+/// `wp_pw_one <소유자> <도메인> <웹루트>` → 0=변경 1=실패 2=건너뜀(WP아님/ID없음).
+/// $ADMINU/$NEWPASS/$WPCLI 가 미리 정의돼 있어야 한다.
+const WP_PASSWD_FN: &str = r#"wp_pw_one() {
+  OWN="$1"; DOM="$2"; WR="$3"
+  if [ ! -f "$WR/wp-load.php" ]; then for C in "$WR"/*/wp-load.php; do [ -f "$C" ] || continue; WR="$(dirname "$C")"; break; done; fi
+  if [ ! -f "$WR/wp-load.php" ]; then echo "  · [$OWN/$DOM] WordPress 아님(wp-load.php 없음) → 건너뜀"; return 2; fi
+  WPU="$(sudo -u "$OWN" "$WPCLI" --path="$WR" user get "$ADMINU" --field=ID </dev/null 2>/dev/null)"
+  if [ -z "$WPU" ]; then echo "  · [$OWN/$DOM] 관리자 ID '$ADMINU' 조회 실패(없거나 DB 접속 불가) → 건너뜀"; return 2; fi
+  ROLE="$(sudo -u "$OWN" "$WPCLI" --path="$WR" user get "$ADMINU" --field=roles </dev/null 2>/dev/null)"
+  if sudo -u "$OWN" "$WPCLI" --path="$WR" user update "$WPU" --user_pass="$NEWPASS" --skip-email </dev/null >/dev/null 2>&1 \
+     || sudo -u "$OWN" "$WPCLI" --path="$WR" user update "$WPU" --user_pass="$NEWPASS" </dev/null >/dev/null 2>&1; then
+    echo "  ✓ [$OWN/$DOM] $ADMINU (ID=$WPU, 권한=$ROLE) 비밀번호 변경 완료"; return 0
+  fi
+  echo "  ✗ [$OWN/$DOM] $ADMINU 비밀번호 변경 실패 (웹루트=$WR)"; return 1
+}
+"#;
+
+/// 도메인 화면(사이트 1곳)의 WordPress 관리자 비밀번호 변경.
+/// 계정/전체 사이트의 일괄 변경과 달리 **그 사이트의 서버·자격증명**으로 접속하고
+/// 웹루트는 사이트 path → /home/<유저>/web/<도메인>/public_html 순으로 자동탐지한다.
+pub fn build_wp_site_admin_passwd(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool, admin_user: &str, new_pass: &str) -> Result<Job, String> {
+    cms_validate(server, c, use_root, false, false)?;
+    let user = wp_pw_validate(admin_user, new_pass)?;
+    let domain = to_ascii_domain(domain_name);
+    let vuser = c.hestia_user.trim();
+    if vuser.is_empty() { return Err("HestiaCP 유저가 비어 있습니다".into()); }
+    let raw = format!(
+        "export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin\"\n\
+         shopt -s nullglob 2>/dev/null || true\n\
+         VUSER={vu}\nDOMAIN={d}\nADMINU={au}\nNEWPASS={np}\n\
+         {prep}{fnbody}\
+         {det}\
+         if [ -z \"$WEBROOT\" ]; then echo \"✗ 웹루트(public_html) 자동탐지 실패 — 정보 탭에서 사이트 path 를 지정하세요\"; exit 1; fi\n\
+         echo \"== WordPress 관리자 비밀번호 변경: $DOMAIN (ID=$ADMINU, 웹루트=$WEBROOT) ==\"\n\
+         wp_pw_one \"$VUSER\" \"$DOMAIN\" \"$WEBROOT\"\n\
+         RC=$?\n\
+         [ \"$RC\" = 0 ] || exit 1\n\
+         echo \"== 완료: $DOMAIN 관리자 $ADMINU 비밀번호 변경됨 ==\"\n",
+        vu = sq(vuser), d = sq(&domain), au = sq(&user), np = sq(new_pass),
+        prep = WP_CLI_PREP, fnbody = WP_PASSWD_FN, det = docroot_detect(&server.path),
+    );
+    let (script, sshpass, env) = eondcms_exec(server, &raw, use_root, c.sudo);
+    Ok(Job {
+        title: format!("WordPress 관리자({user}) 비번 변경 : {domain_name}"),
+        script,
+        sshpass,
+        env,
+        note: format!("wp-cli user update {user} --user_pass (웹유저 {vuser} 권한) — 이 사이트의 로그인 비밀번호만 변경"),
+    })
+}
+
 /// 선택 사이트의 WordPress 관리자 비밀번호 일괄 재설정 — pairs = (계정, 도메인).
 /// wp-cli `user update <ID> --user_pass` 로 지정한 관리자 ID(기본 admin)의 비번만 바꾼다.
 /// WordPress 가 아니거나 그 ID 가 없는 사이트는 건너뛴다(다른 계정/데이터는 손대지 않음).
 pub fn build_wp_admin_passwd(s: &Settings, pairs: &[(String, String)], admin_user: &str, new_pass: &str) -> Result<Job, String> {
     if pairs.is_empty() { return Err("비밀번호를 변경할 사이트를 선택하세요".into()); }
-    let user = {
-        let u = admin_user.trim();
-        if u.is_empty() { "admin" } else { u }
-    };
-    if !wp_login_ok(user) { return Err("관리자 ID 형식 오류 (제어문자 불가, 60자 이내)".into()); }
-    if new_pass.trim().is_empty() { return Err("새 비밀번호가 비어 있습니다".into()); }
-    if new_pass.chars().any(|c| c.is_control()) { return Err("새 비밀번호에 줄바꿈/제어문자는 쓸 수 없습니다".into()); }
+    let user = wp_pw_validate(admin_user, new_pass)?;
     let srv = ssh_admin_site(s)?;
     let mut lines = Vec::new();
     for (a, d) in pairs {
@@ -2610,28 +2673,17 @@ pub fn build_wp_admin_passwd(s: &Settings, pairs: &[(String, String)], admin_use
         "shopt -s nullglob 2>/dev/null || true\n\
          ADMINU={au}\n\
          NEWPASS={np}\n\
-         WPCLI=/usr/local/bin/wp\n\
-         if ! [ -x \"$WPCLI\" ]; then echo \"wp-cli 설치\"; curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o \"$WPCLI\" 2>/dev/null && chmod +x \"$WPCLI\"; fi\n\
-         if ! [ -x \"$WPCLI\" ]; then echo \"✗ wp-cli 가 없고 설치도 실패 — 중단\"; exit 1; fi\n\
+         {prep}{fnbody}\
          echo \"== WordPress 관리자 비밀번호 변경 (ID=$ADMINU · 대상 {n}개) ==\"\n\
          OK=0; SKIP=0; FAIL=0\n\
-         while IFS='|' read -r OWN DOM; do\n\
-        \x20 [ -n \"$OWN\" ] || continue\n\
-        \x20 WR=\"/home/$OWN/web/$DOM/public_html\"\n\
-        \x20 if [ ! -f \"$WR/wp-load.php\" ]; then for C in \"$WR\"/*/wp-load.php; do [ -f \"$C\" ] || continue; WR=\"$(dirname \"$C\")\"; break; done; fi\n\
-        \x20 if [ ! -f \"$WR/wp-load.php\" ]; then echo \"  · [$OWN/$DOM] WordPress 아님 → 건너뜀\"; SKIP=$((SKIP+1)); continue; fi\n\
-        \x20 WPU=\"$(sudo -u \"$OWN\" \"$WPCLI\" --path=\"$WR\" user get \"$ADMINU\" --field=ID </dev/null 2>/dev/null)\"\n\
-        \x20 if [ -z \"$WPU\" ]; then echo \"  · [$OWN/$DOM] 관리자 ID '$ADMINU' 조회 실패(없거나 DB 접속 불가) → 건너뜀\"; SKIP=$((SKIP+1)); continue; fi\n\
-        \x20 ROLE=\"$(sudo -u \"$OWN\" \"$WPCLI\" --path=\"$WR\" user get \"$ADMINU\" --field=roles </dev/null 2>/dev/null)\"\n\
-        \x20 if sudo -u \"$OWN\" \"$WPCLI\" --path=\"$WR\" user update \"$WPU\" --user_pass=\"$NEWPASS\" --skip-email </dev/null >/dev/null 2>&1 \\\n\
-        \x20    || sudo -u \"$OWN\" \"$WPCLI\" --path=\"$WR\" user update \"$WPU\" --user_pass=\"$NEWPASS\" </dev/null >/dev/null 2>&1; then\n\
-        \x20   echo \"  ✓ [$OWN/$DOM] $ADMINU (ID=$WPU, 권한=$ROLE) 비밀번호 변경 완료\"; OK=$((OK+1))\n\
-        \x20 else\n\
-        \x20   echo \"  ✗ [$OWN/$DOM] $ADMINU 비밀번호 변경 실패 (웹루트=$WR)\"; FAIL=$((FAIL+1))\n\
-        \x20 fi\n\
+         while IFS='|' read -r A D; do\n\
+        \x20 [ -n \"$A\" ] || continue\n\
+        \x20 wp_pw_one \"$A\" \"$D\" \"/home/$A/web/$D/public_html\"\n\
+        \x20 case $? in 0) OK=$((OK+1));; 2) SKIP=$((SKIP+1));; *) FAIL=$((FAIL+1));; esac\n\
          done <<'PAIRS'\n{pairs}\nPAIRS\n\
          echo \"== 완료: 변경 $OK · 건너뜀 $SKIP · 실패 $FAIL (건너뜀 = WordPress 아님 또는 해당 관리자 ID 없음) ==\"\n",
-        au = sq(user), np = sq(new_pass), n = pairs.len(), pairs = pairs_text,
+        au = sq(&user), np = sq(new_pass), n = pairs.len(), pairs = pairs_text,
+        prep = WP_CLI_PREP, fnbody = WP_PASSWD_FN,
     );
     let raw = format!("export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin\"\n{body}");
     let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
@@ -4274,6 +4326,37 @@ mod tests {
 
         let out = std::process::Command::new("bash").args(["-n", "-c", &job.script]).output().expect("bash");
         assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn wp_site_admin_passwd_job() {
+        let mut server = sample_site();
+        server.root_id = "tong".into();
+        server.root_pw = "tongpw".into();
+        let c = CmsInstall { kind: CmsKind::WordPress, hestia_user: "rokmc".into(), ..Default::default() };
+        // root 꺼짐 / 빈 비번 / 제어문자 → 에러
+        assert!(build_wp_site_admin_passwd(&server, &c, "ex.com", false, "admin", "pw").is_err());
+        assert!(build_wp_site_admin_passwd(&server, &c, "ex.com", true, "admin", "  ").is_err());
+        assert!(build_wp_site_admin_passwd(&server, &c, "ex.com", true, "admin", "pw\nHM_EOF").is_err());
+        // HestiaCP 유저 없음 → 에러
+        let no_user = CmsInstall { kind: CmsKind::WordPress, ..Default::default() };
+        assert!(build_wp_site_admin_passwd(&server, &no_user, "ex.com", true, "admin", "pw").is_err());
+
+        // sudo(heredoc) / 직접 root 로그인(단일 인용) 두 경로 모두 유효한 bash 여야 한다
+        for sudo in [false, true] {
+            let cc = CmsInstall { sudo, ..c.clone() };
+            let job = build_wp_site_admin_passwd(&server, &cc, "예시도메인.com", true, "", "p'w \"x\"$(id)").unwrap();
+            assert!(job.script.contains("xn--"), "퓨니코드 변환: {}", job.script);
+            assert!(job.script.contains("wp_pw_one"), "{}", job.script);
+            let out = std::process::Command::new("bash").args(["-n", "-c", &job.script]).output().expect("bash");
+            assert!(out.status.success(), "bash 구문 오류 (sudo={sudo}): {}", String::from_utf8_lossy(&out.stderr));
+        }
+        // heredoc 경로에서는 원문이 그대로 들어가므로 인용 상태를 직접 확인
+        // (직접 root 로그인 경로는 remote_cmd 가 전체를 한 번 더 인용한다)
+        let job = build_wp_site_admin_passwd(&server, &CmsInstall { sudo: true, ..c.clone() }, "ex.com", true, "", "p'w \"x\"$(id)").unwrap();
+        assert!(job.script.contains("ADMINU='admin'"), "{}", job.script);
+        assert!(job.script.contains("NEWPASS='p'\\''w \"x\"$(id)'"), "{}", job.script);
+        assert!(job.script.contains("wp_pw_one \"$VUSER\" \"$DOMAIN\" \"$WEBROOT\""), "{}", job.script);
     }
 
     #[test]
