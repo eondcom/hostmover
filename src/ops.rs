@@ -2578,6 +2578,72 @@ pub fn build_global_update(s: &Settings, pairs: &[(String, String)]) -> Result<J
     })
 }
 
+/// WordPress 관리자 로그인 ID (기본 admin). 공백/제어문자만 거르고 나머지는 sq() 로 안전하게 인용.
+/// WP 는 `.`/`_`/`-`/`@`/공백을 로그인 ID 에 허용하므로 is_safe_name 보다 넓게 받는다.
+fn wp_login_ok(u: &str) -> bool {
+    !u.is_empty() && u.len() <= 60 && !u.chars().any(|c| c.is_control())
+}
+
+/// 선택 사이트의 WordPress 관리자 비밀번호 일괄 재설정 — pairs = (계정, 도메인).
+/// wp-cli `user update <ID> --user_pass` 로 지정한 관리자 ID(기본 admin)의 비번만 바꾼다.
+/// WordPress 가 아니거나 그 ID 가 없는 사이트는 건너뛴다(다른 계정/데이터는 손대지 않음).
+pub fn build_wp_admin_passwd(s: &Settings, pairs: &[(String, String)], admin_user: &str, new_pass: &str) -> Result<Job, String> {
+    if pairs.is_empty() { return Err("비밀번호를 변경할 사이트를 선택하세요".into()); }
+    let user = {
+        let u = admin_user.trim();
+        if u.is_empty() { "admin" } else { u }
+    };
+    if !wp_login_ok(user) { return Err("관리자 ID 형식 오류 (제어문자 불가, 60자 이내)".into()); }
+    if new_pass.trim().is_empty() { return Err("새 비밀번호가 비어 있습니다".into()); }
+    if new_pass.chars().any(|c| c.is_control()) { return Err("새 비밀번호에 줄바꿈/제어문자는 쓸 수 없습니다".into()); }
+    let srv = ssh_admin_site(s)?;
+    let mut lines = Vec::new();
+    for (a, d) in pairs {
+        let aa = a.trim();
+        let da = to_ascii_domain(d);
+        if !is_safe_name(aa) { return Err(format!("계정 형식 오류: {a}")); }
+        if !is_safe_name(&da) { return Err(format!("도메인 형식 오류: {d}")); }
+        lines.push(format!("{aa}|{da}"));
+    }
+    let pairs_text = lines.join("\n");
+    let body = format!(
+        "shopt -s nullglob 2>/dev/null || true\n\
+         ADMINU={au}\n\
+         NEWPASS={np}\n\
+         WPCLI=/usr/local/bin/wp\n\
+         if ! [ -x \"$WPCLI\" ]; then echo \"wp-cli 설치\"; curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o \"$WPCLI\" 2>/dev/null && chmod +x \"$WPCLI\"; fi\n\
+         if ! [ -x \"$WPCLI\" ]; then echo \"✗ wp-cli 가 없고 설치도 실패 — 중단\"; exit 1; fi\n\
+         echo \"== WordPress 관리자 비밀번호 변경 (ID=$ADMINU · 대상 {n}개) ==\"\n\
+         OK=0; SKIP=0; FAIL=0\n\
+         while IFS='|' read -r OWN DOM; do\n\
+        \x20 [ -n \"$OWN\" ] || continue\n\
+        \x20 WR=\"/home/$OWN/web/$DOM/public_html\"\n\
+        \x20 if [ ! -f \"$WR/wp-load.php\" ]; then for C in \"$WR\"/*/wp-load.php; do [ -f \"$C\" ] || continue; WR=\"$(dirname \"$C\")\"; break; done; fi\n\
+        \x20 if [ ! -f \"$WR/wp-load.php\" ]; then echo \"  · [$OWN/$DOM] WordPress 아님 → 건너뜀\"; SKIP=$((SKIP+1)); continue; fi\n\
+        \x20 WPU=\"$(sudo -u \"$OWN\" \"$WPCLI\" --path=\"$WR\" user get \"$ADMINU\" --field=ID </dev/null 2>/dev/null)\"\n\
+        \x20 if [ -z \"$WPU\" ]; then echo \"  · [$OWN/$DOM] 관리자 ID '$ADMINU' 조회 실패(없거나 DB 접속 불가) → 건너뜀\"; SKIP=$((SKIP+1)); continue; fi\n\
+        \x20 ROLE=\"$(sudo -u \"$OWN\" \"$WPCLI\" --path=\"$WR\" user get \"$ADMINU\" --field=roles </dev/null 2>/dev/null)\"\n\
+        \x20 if sudo -u \"$OWN\" \"$WPCLI\" --path=\"$WR\" user update \"$WPU\" --user_pass=\"$NEWPASS\" --skip-email </dev/null >/dev/null 2>&1 \\\n\
+        \x20    || sudo -u \"$OWN\" \"$WPCLI\" --path=\"$WR\" user update \"$WPU\" --user_pass=\"$NEWPASS\" </dev/null >/dev/null 2>&1; then\n\
+        \x20   echo \"  ✓ [$OWN/$DOM] $ADMINU (ID=$WPU, 권한=$ROLE) 비밀번호 변경 완료\"; OK=$((OK+1))\n\
+        \x20 else\n\
+        \x20   echo \"  ✗ [$OWN/$DOM] $ADMINU 비밀번호 변경 실패 (웹루트=$WR)\"; FAIL=$((FAIL+1))\n\
+        \x20 fi\n\
+         done <<'PAIRS'\n{pairs}\nPAIRS\n\
+         echo \"== 완료: 변경 $OK · 건너뜀 $SKIP · 실패 $FAIL (건너뜀 = WordPress 아님 또는 해당 관리자 ID 없음) ==\"\n",
+        au = sq(user), np = sq(new_pass), n = pairs.len(), pairs = pairs_text,
+    );
+    let raw = format!("export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin\"\n{body}");
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("WordPress 관리자({user}) 비번 변경 ({}개 사이트)", pairs.len()),
+        script,
+        sshpass,
+        env,
+        note: format!("wp-cli user update {user} --user_pass (사이트 소유자 권한으로 실행) — 해당 계정의 로그인 비밀번호만 변경"),
+    })
+}
+
 /// WordPress 설치 — v-add-* + wp-cli(core download/config/install) + SSL
 fn build_wp_install(server: &Site, c: &CmsInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
     cms_validate(server, c, use_root, true, true)?;
@@ -4180,6 +4246,34 @@ mod tests {
         // 그누보드는 자체 /install/ 마법사 — admin 불필요, DB만 있으면 Ok
         let gn = CmsInstall { kind: CmsKind::Gnuboard, hestia_user: "u".into(), db_name: "u_d".into(), db_user: "u_d".into(), db_pass: "p".into(), ..Default::default() };
         assert!(build_cms_install(&server, &gn, "ex.com", true).is_ok());
+    }
+
+    #[test]
+    fn wp_admin_passwd_job() {
+        let st = Settings { ssh_host: "10.0.0.1".into(), ssh_user: "tong".into(), ssh_pass: "tongpw".into(), ..Default::default() };
+        let pairs = vec![
+            ("rokmc".to_string(), "예시도메인.com".to_string()),
+            ("acme".to_string(), "a.co.kr".to_string()),
+        ];
+        // 선택 없음 / 빈 비번 / 제어문자 → 에러 (heredoc 깨짐·의도치 않은 초기화 방지)
+        assert!(build_wp_admin_passwd(&st, &[], "admin", "pw").is_err());
+        assert!(build_wp_admin_passwd(&st, &pairs, "admin", "   ").is_err());
+        assert!(build_wp_admin_passwd(&st, &pairs, "admin", "pw\nHM_EOF").is_err());
+        assert!(build_wp_admin_passwd(&st, &pairs, "ad\nmin", "pw").is_err());
+        assert!(build_wp_admin_passwd(&st, &[("rokmc".into(), "a.com".into())], "admin", "pw").is_ok());
+        // 계정/도메인 형식 검증 (경로 탈출 차단)
+        assert!(build_wp_admin_passwd(&st, &[("../etc".into(), "a.com".into())], "admin", "pw").is_err());
+
+        // 관리자 ID 를 비우면 admin 기본값, 비번은 single-quote 인용되어 쉘 확장 안 됨
+        let job = build_wp_admin_passwd(&st, &pairs, "", "p'w \"x\"$(id)").unwrap();
+        assert!(job.title.contains("admin"), "{}", job.title);
+        assert!(job.script.contains("ADMINU='admin'"), "{}", job.script);
+        assert!(job.script.contains("NEWPASS='p'\\''w \"x\"$(id)'"), "{}", job.script);
+        assert!(job.script.contains("xn--"), "한글 도메인 퓨니코드 변환: {}", job.script);
+        assert_eq!(job.sshpass, "tongpw");
+
+        let out = std::process::Command::new("bash").args(["-n", "-c", &job.script]).output().expect("bash");
+        assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
     }
 
     #[test]
