@@ -75,6 +75,18 @@ enum AcctTab {
     Notes,
 }
 
+/// WordPress 관리자 비밀번호 변경 입력 모달 상태
+struct WpPwDialog {
+    /// 대상 (계정, 도메인, 스캔된 CMS 종류)
+    targets: Vec<(String, String, String)>,
+    /// 관리자 로그인 ID (기본 admin)
+    user: String,
+    pass: String,
+    pass_confirm: String,
+    show: bool,
+    error: String,
+}
+
 /// 계정/전체 사이트 스캔 행
 struct AcctSiteRow {
     account: String,
@@ -392,6 +404,8 @@ pub struct App {
     acct_mods_status: String,
     /// 고객 메모 탭: 새 메모 입력 버퍼
     acct_note_input: String,
+    /// WordPress 관리자 비번 변경 모달 (열려 있으면 Some)
+    wp_pw_dlg: Option<WpPwDialog>,
     /// 생성일(HestiaCP DATE)을 이미 조회한 계정 집합(세션 중 중복조회 방지)
     site_dates_req: std::collections::HashSet<String>,
     /// 퍼미션(소유/권한)을 이미 조회한 계정 집합(중복조회 방지, ""=전체)
@@ -488,6 +502,7 @@ impl App {
             acct_mod_domain: String::new(),
             acct_mods_status: String::new(),
             acct_note_input: String::new(),
+            wp_pw_dlg: None,
             site_dates_req: std::collections::HashSet::new(),
             site_perms_req: std::collections::HashSet::new(),
             pending_import_sites: None,
@@ -1292,6 +1307,7 @@ impl App {
         let mut do_backup_sel = false;
         let mut do_perm = false;
         let mut do_permfix = false;
+        let mut do_wp_pw = false;
         let mut alias_loads: Vec<(String, String)> = Vec::new();
         let mut sel_all_sites: Option<bool> = None;
         let mut select_all = None;
@@ -1350,6 +1366,8 @@ impl App {
                             if ui.add_enabled(!running && seln > 0, btn_primary(format!("{}  선택 {seln}개 업데이트", ph::ARROWS_CLOCKWISE))).clicked() { do_update = Some(true); }
                             if ui.add_enabled(!scanning && seln > 0, egui::Button::new(format!("{}  선택 {seln}개만 스캔", ph::ARROWS_CLOCKWISE))).clicked() { do_scan_sel = true; }
                             if ui.add_enabled(!running && seln > 0, egui::Button::new(format!("{}  선택 파일·DB 백업", ph::DOWNLOAD_SIMPLE))).on_hover_text("선택 사이트의 파일+DB를 로컬로 내려받기").clicked() { do_backup_sel = true; }
+                            if ui.add_enabled(!running && seln > 0, egui::Button::new(format!("{}  WP 관리자 비번 변경", ph::KEY)))
+                                .on_hover_text("선택 사이트의 WordPress 관리자(기본 admin) 비밀번호를 입력한 값으로 변경").clicked() { do_wp_pw = true; }
                             if ui.add_enabled(seln > 0, egui::Button::new(format!("{}  DNS 체크(A)", ph::GLOBE_HEMISPHERE_WEST))).clicked() { do_dns = true; }
                             if ui.add_enabled(seln > 0, egui::Button::new(format!("{}  명령어 보기", ph::FILE_TEXT))).clicked() { do_update = Some(false); }
                         });
@@ -1487,6 +1505,20 @@ impl App {
                 Ok(job) => self.eond_confirm = Some(job),
                 Err(e) => { self.log.push(format!("권한 수정: {e}")); self.status = format!("오류: {e}"); self.last_ok = Some(false); }
             }
+        }
+        if do_wp_pw {
+            let targets: Vec<(String, String, String)> = self.all_sites.iter()
+                .filter(|r| r.account == acct && r.sel)
+                .map(|r| (r.account.clone(), r.domain.clone(), r.kind.clone()))
+                .collect();
+            self.wp_pw_dlg = Some(WpPwDialog {
+                targets,
+                user: "admin".to_string(),
+                pass: String::new(),
+                pass_confirm: String::new(),
+                show: false,
+                error: String::new(),
+            });
         }
         if do_scan { self.site_dates_req.remove(&acct); self.site_perms_req.remove(&acct); self.rescan_account_into_all(acct.clone(), ctx); }
         if do_load_mods { self.load_account_modules(ci, ctx); }
@@ -2213,6 +2245,9 @@ impl eframe::App for App {
         }
         if self.cmd_view.is_some() {
             self.cmd_view_modal(ctx);
+        }
+        if self.wp_pw_dlg.is_some() {
+            self.wp_pw_modal(ctx);
         }
         if self.eond_confirm.is_some() {
             self.eond_confirm_modal(ctx);
@@ -3671,6 +3706,72 @@ impl App {
         if !open {
             self.cmd_view = None;
         }
+    }
+
+    /// 🔑 WordPress 관리자 비밀번호 변경 입력 모달.
+    /// 입력을 받아 작업을 만들고 실행 확인 모달(eond_confirm)로 넘긴다.
+    fn wp_pw_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.wp_pw_dlg.take() else { return };
+        let running = self.running;
+        let wp_cnt = d.targets.iter().filter(|(_, _, k)| k == "WordPress").count();
+        let mut close = false;
+        let mut submit = false;
+        egui::Window::new(format!("{}  WordPress 관리자 비밀번호 변경", ph::KEY))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(format!("대상 {}개 사이트 (스캔 결과 WordPress: {wp_cnt}개)", d.targets.len()));
+                ui.label(egui::RichText::new("입력한 관리자 ID의 로그인 비밀번호만 변경합니다. WordPress 가 아니거나 그 ID가 없는 사이트는 건너뜁니다.").weak());
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    for (a, dom, kind) in &d.targets {
+                        let wp = kind == "WordPress";
+                        let col = if wp { egui::Color32::from_gray(200) } else { egui::Color32::from_gray(120) };
+                        let mark = if wp { "•" } else { "·" };
+                        ui.label(egui::RichText::new(format!("{mark} {a} / {dom}  ({kind})")).color(col).small());
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    grid_label(ui, "관리자 ID");
+                    ui.add(egui::TextEdit::singleline(&mut d.user).hint_text("admin").desired_width(220.0).margin(FIELD_MARGIN));
+                });
+                ui.horizontal(|ui| {
+                    grid_label(ui, "새 비밀번호");
+                    ui.add(egui::TextEdit::singleline(&mut d.pass).password(!d.show).desired_width(220.0).margin(FIELD_MARGIN));
+                });
+                ui.horizontal(|ui| {
+                    grid_label(ui, "비밀번호 확인");
+                    ui.add(egui::TextEdit::singleline(&mut d.pass_confirm).password(!d.show).desired_width(220.0).margin(FIELD_MARGIN));
+                });
+                ui.horizontal(|ui| {
+                    grid_label(ui, "");
+                    ui.checkbox(&mut d.show, "비밀번호 표시");
+                });
+                if !d.error.is_empty() {
+                    ui.colored_label(C_RED, &d.error);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!running, btn_primary(format!("{}  비밀번호 변경", ph::KEY))).clicked() { submit = true; }
+                    if ui.button("취소").clicked() { close = true; }
+                });
+            });
+        if submit {
+            d.error.clear();
+            if d.pass != d.pass_confirm {
+                d.error = "비밀번호와 확인이 일치하지 않습니다.".into();
+            } else {
+                let pairs: Vec<(String, String)> = d.targets.iter().map(|(a, dom, _)| (a.clone(), dom.clone())).collect();
+                match ops::build_wp_admin_passwd(&self.store.settings, &pairs, &d.user, &d.pass) {
+                    Ok(job) => { self.eond_confirm = Some(job); close = true; }
+                    Err(e) => d.error = e,
+                }
+            }
+        }
+        if !close { self.wp_pw_dlg = Some(d); }
     }
 
     fn eond_confirm_modal(&mut self, ctx: &egui::Context) {
