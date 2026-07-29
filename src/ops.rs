@@ -1380,7 +1380,7 @@ if [ "$RC" != 0 ]; then echo "  ✗ 쓰기 실패(dd=$RC) — RO 재마운트/�
 sync
 H1=$(timeout 300 sha256sum "$F" 2>/dev/null | awk '{{print $1}}')
 echo "[2] 캐시 드롭 (디스크에서 강제 재독)"
-sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo "  (drop_caches 불가 — 캐시 영향 가능)"
+sync; {{ echo 3 > /proc/sys/vm/drop_caches; }} 2>/dev/null || echo "  (drop_caches 불가 — 캐시 영향 가능)"
 echo "[3] 재독 후 해시 비교"
 H2=$(timeout 300 sha256sum "$F" 2>/dev/null | awk '{{print $1}}')
 RC=$?
@@ -1412,8 +1412,16 @@ echo "===== 검사 끝 ====="
 }
 
 /// 디스크 자동 감시 설치 (SSH, sudo, 서버 상태 변경 — 확인 모달 권장).
-/// smartd 활성화 + 매일 FS에러카운트/dmesg 감시 + 주간 write→read-back 스크럽 + 이상 시 이메일.
-pub fn build_disk_monitor_install(s: &Settings, email: &str, scrub_path: &str) -> Result<Job, String> {
+/// smartd 활성화 + 매일 아침 점검(결과를 이상 유무와 무관하게 항상 보존) + 주간 write→read-back
+/// 스크럽 + 이상 시 이메일. `keep_days` 는 일자별 점검기록 보존일수, `daily_mail` 이면 정상이어도
+/// 매일 결과 메일을 보낸다.
+pub fn build_disk_monitor_install(
+    s: &Settings,
+    email: &str,
+    scrub_path: &str,
+    keep_days: u32,
+    daily_mail: bool,
+) -> Result<Job, String> {
     let (srv, who) = server_ssh_site(s)?;
     let em = email.trim();
     if em.is_empty() || !em.contains('@') || em.contains('\'') || em.contains(char::is_whitespace) {
@@ -1423,17 +1431,123 @@ pub fn build_disk_monitor_install(s: &Settings, email: &str, scrub_path: &str) -
     if p.is_empty() || !p.starts_with('/') || p.contains('\'') || p.contains("..") {
         return Err("스크럽 경로는 / 로 시작하는 절대경로여야 합니다 (예: /backup)".into());
     }
-    // head: 원격 셸 변수로 이메일/경로 주입 (sed/스마트디/요약에서 사용). 스크립트 파일에는 placeholder→sed 로 박음.
-    let head = format!("set +e\nEMAIL={}\nSCRUB_PATH={}\n", sq(em), sq(p));
+    let keep = keep_days.clamp(7, 3650);
+    let daily = if daily_mail { "1" } else { "0" };
+    // head: 원격 셸 변수로 주입 (sed/스마트디/요약에서 사용). 스크립트 파일에는 placeholder→sed 로 박음.
+    let head = format!(
+        "set +e\nEMAIL={}\nSCRUB_PATH={}\nKEEP_DAYS={keep}\nDAILY_MAIL={daily}\n",
+        sq(em),
+        sq(p),
+    );
     let body = DISK_MONITOR_INSTALL_BODY;
     let raw = head + body;
     let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    let mailnote = if daily_mail { "매일 결과 메일" } else { "이상 시에만 메일" };
     Ok(Job {
         title: "디스크 자동 감시 설치".into(),
         script,
         sshpass,
         env,
-        note: format!("{who} → smartd + 매일 감시 + 주간 스크럽({p}) + 이메일({em}) 설치 (서버 상태 변경)"),
+        note: format!(
+            "{who} → 매일 07:30 점검+기록보존({keep}일) · 주간 스크럽({p}) · {mailnote}({em}) (서버 상태 변경)"
+        ),
+    })
+}
+
+/// 디스크 점검 기록 조회 (SSH, sudo, 읽기 전용).
+/// cron 설치·최근 실행 여부를 먼저 확인하고(감시가 죽어 있는 것이 가장 위험한 상태),
+/// 일자별 추이 표 → 최근 스냅샷 전문 → 경보 이력 → 스크럽 이력 순으로 보여준다.
+pub fn build_disk_history(s: &Settings, days: u32) -> Result<Job, String> {
+    let (srv, who) = server_ssh_site(s)?;
+    let n = days.clamp(1, 3650);
+    let raw = format!(
+        r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+STATE=/var/lib/hm-disk-monitor
+ARCH=/var/log/hostmover/disk
+HIST="$STATE/history.tsv"
+N={n}
+echo "===== 디스크 점검 기록 (최근 ${{N}}일) ====="
+echo
+
+echo "[1] 감시 설치 상태"
+if [ -f /etc/cron.d/hm-disk-monitor ]; then
+  echo "  ✓ cron 등록됨 /etc/cron.d/hm-disk-monitor"
+  grep -vE '^\s*(#|$)' /etc/cron.d/hm-disk-monitor 2>/dev/null | grep -E 'hm-disk' | sed 's/^/      /'
+else
+  echo "  ✗ cron 없음 — 자동 점검이 설치되어 있지 않습니다 ('디스크 자동 감시 설치' 를 먼저 실행)"
+fi
+for F in /usr/local/sbin/hm-disk-monitor.sh /usr/local/sbin/hm-disk-scrub.sh; do
+  [ -x "$F" ] && echo "  ✓ $F" || echo "  ✗ $F 없음"
+done
+LAST=$(cat "$STATE/last-run" 2>/dev/null)
+if [ -n "$LAST" ]; then
+  echo "  마지막 점검: $LAST"
+  LS=$(date -d "$LAST" +%s 2>/dev/null); NOW=$(date +%s)
+  if [ -n "$LS" ]; then
+    AGE=$(( (NOW - LS) / 3600 ))
+    [ "$AGE" -gt 36 ] 2>/dev/null && echo "    >>> ${{AGE}}시간 전 — 하루 넘게 안 돌았습니다. cron 이 죽었는지 확인하세요 (systemctl status cron)"
+  fi
+else
+  echo "  마지막 점검: 기록 없음 (아직 한 번도 실행되지 않음)"
+fi
+echo
+
+echo "[2] 일자별 추이"
+ROWS=$(grep -v '^date' "$HIST" 2>/dev/null | grep -c .)
+if [ "${{ROWS:-0}}" -gt 0 ] 2>/dev/null; then
+  head -n 1 "$HIST" | sed 's/^/  /'
+  grep -v '^date' "$HIST" | tail -n "$N" | sed 's/^/  /'
+  echo
+  SHOWN=$(grep -v '^date' "$HIST" | tail -n "$N" | grep -c .)
+  WARN=$(grep -v '^date' "$HIST" | tail -n "$N" | grep -c 'WARN')
+  echo "  표시 ${{SHOWN}}건(전체 ${{ROWS}}건) 중 이상(WARN): ${{WARN}}건"
+  echo "  ※ fserr(누적 FS 에러) 와 realloc/pending(불량섹터) 은 '증가'가 위험신호입니다. 값이 그대로면 정상."
+else
+  echo "  (추이 기록 없음 — 아직 점검이 한 번도 완료되지 않았습니다: $HIST)"
+fi
+echo
+
+echo "[3] 가장 최근 점검 결과 전문"
+LASTSNAP=$(ls -1 "$ARCH"/*.log 2>/dev/null | sort | tail -n 1)
+if [ -n "$LASTSNAP" ]; then
+  echo "  --- $LASTSNAP ---"
+  sed 's/^/  /' "$LASTSNAP"
+else
+  echo "  (일자별 기록 없음 — $ARCH)"
+fi
+echo
+
+echo "[4] 경보 이력 (최근 30줄)"
+if [ -s /var/log/hm-disk-monitor.log ]; then
+  tail -n 30 /var/log/hm-disk-monitor.log | sed 's/^/  /'
+else
+  echo "  (경보 로그 비어 있음 = 여태 이상 없음)"
+fi
+echo
+
+echo "[5] 무결성 스크럽 이력 (최근 10건)"
+if [ -s "$STATE/scrub.tsv" ]; then
+  tail -n 10 "$STATE/scrub.tsv" | sed 's/^/  /'
+else
+  echo "  (스크럽 기록 없음 — 주간 스크럽은 일요일 04:10 에 돕니다)"
+fi
+echo
+
+echo "[6] 보존 현황"
+CNT=$(ls -1 "$ARCH"/*.log 2>/dev/null | wc -l)
+echo "  일자별 기록 ${{CNT}}일치 · $(du -sh "$ARCH" 2>/dev/null | awk '{{print $1}}' || echo '-')"
+echo "  경로: $ARCH/<날짜>.log · 추이 $HIST · 경보 /var/log/hm-disk-monitor.log"
+echo "===== 기록 끝 ====="
+"#
+    );
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("디스크 점검 기록 (최근 {n}일)"),
+        script,
+        sshpass,
+        env,
+        note: format!("{who} → 자동감시 상태·일자별 추이·최근 결과·경보 이력 조회 (읽기 전용)"),
     })
 }
 
@@ -1443,15 +1557,18 @@ pub fn build_disk_monitor_uninstall(s: &Settings) -> Result<Job, String> {
     let raw = r#"set +e
 export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 echo "===== 디스크 자동 감시 제거 ====="
-rm -f /etc/cron.d/hm-disk-monitor /usr/local/sbin/hm-disk-monitor.sh /usr/local/sbin/hm-disk-scrub.sh
-echo "  cron/스크립트 제거"
+rm -f /etc/cron.d/hm-disk-monitor /usr/local/sbin/hm-disk-monitor.sh /usr/local/sbin/hm-disk-scrub.sh \
+      /etc/logrotate.d/hm-disk-monitor
+echo "  cron/스크립트/logrotate 제거"
 if [ -f /etc/smartd.conf ]; then
   sed -i '/# hostmover/d' /etc/smartd.conf
   sed -i 's/^#DEVICESCAN(hm-disabled)/DEVICESCAN/' /etc/smartd.conf
   echo "  smartd.conf 원복(smartd 자체는 유지)"
 fi
 systemctl restart cron 2>/dev/null || service cron restart 2>/dev/null || systemctl restart crond 2>/dev/null || true
-echo "  ※ 상태파일(/var/lib/hm-disk-monitor)·로그(/var/log/hm-disk-monitor.log)는 보존됨"
+echo "  ※ 점검 기록은 그대로 보존됨 — 지우려면 직접 삭제:"
+echo "     /var/log/hostmover/disk/  (일자별 결과)  /var/lib/hm-disk-monitor/  (추이·상태)"
+echo "     /var/log/hm-disk-monitor.log  (경보 이력)"
 echo "===== 제거 끝 ====="
 "#;
     let (script, sshpass, env) = eondcms_exec(&srv, raw, false, true);
@@ -1470,7 +1587,8 @@ const DISK_MONITOR_INSTALL_BODY: &str = r#"
 export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 echo "===== hostmover 디스크 자동 감시 설치 ====="
 echo "알림 메일: $EMAIL   주간 스크럽 경로: $SCRUB_PATH"
-mkdir -p /var/lib/hm-disk-monitor
+echo "점검기록 보존: ${KEEP_DAYS}일   매일 결과 메일: $([ "$DAILY_MAIL" = 1 ] && echo 예 || echo '아니오(이상 시에만)')"
+mkdir -p /var/lib/hm-disk-monitor /var/log/hostmover/disk
 
 # 1) smartmontools
 if ! command -v smartctl >/dev/null 2>&1; then
@@ -1479,49 +1597,127 @@ if ! command -v smartctl >/dev/null 2>&1; then
     || (yum install -y smartmontools 2>&1 | tail -n 3) || echo "  ※ 자동설치 실패 — 수동 설치 필요"
 fi
 
-# 2) 매일 감시 스크립트
+# 2) 매일 아침 점검 스크립트
+#    이상 유무와 관계없이 항상 그날의 결과 전문을 /var/log/hostmover/disk/<날짜>.log 에 남기고,
+#    한 줄 요약을 history.tsv 에 누적한다(추이 비교용). 경보는 별도로 메일 + hm-disk-monitor.log.
 cat > /usr/local/sbin/hm-disk-monitor.sh <<'EOS'
 #!/usr/bin/env bash
 export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 EMAIL="__EMAIL__"
+KEEP=__KEEP__
+DAILY_MAIL=__DAILY__
 STATE=/var/lib/hm-disk-monitor
+ARCH=/var/log/hostmover/disk
 LOG=/var/log/hm-disk-monitor.log
+HIST="$STATE/history.tsv"
+mkdir -p "$STATE" "$ARCH"
+DAY=$(date +%F); TS=$(date '+%F %T')
+SNAP="$ARCH/$DAY.log"
 ALERT=""
-add(){ ALERT="$ALERT$1"$'\n'; echo "$(date '+%F %T') $1" >> "$LOG"; }
+: > "$SNAP"                      # 같은 날 재실행이면 그날 기록을 새로 쓴다
+say(){ printf '%s\n' "$*" >> "$SNAP"; }
+add(){ ALERT="$ALERT$1"$'\n'; echo "$TS $1" >> "$LOG"; say "  [경보] $1"; }
+hm_mail(){
+  if command -v mail >/dev/null 2>&1; then printf '%s\n' "$2" | mail -s "$1" "$EMAIL"
+  elif command -v sendmail >/dev/null 2>&1; then printf 'To: %s\nSubject: %s\n\n%s\n' "$EMAIL" "$1" "$2" | sendmail -t
+  else echo "$TS 메일 전송수단 없음(mail/sendmail) — 알림 미발송" >> "$LOG"; fi
+}
+
+say "hostmover 디스크 점검   $TS   $(hostname)"
+say "=========================================================="
+say ""
+say "[파일시스템]"
+FSERR=0; NFS=0
 for DEV in $(findmnt -rno SOURCE -t ext2,ext3,ext4 2>/dev/null | sort -u); do
   [ -b "$DEV" ] || continue
+  NFS=$((NFS + 1))
   ST=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/Filesystem state/{gsub(/ /,"",$2);print $2}')
   EC=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/FS Error count/{gsub(/ /,"",$2);print $2}'); [ -z "$EC" ] && EC=0
+  MP=$(findmnt -rno TARGET -S "$DEV" 2>/dev/null | head -n 1)
   KEY=$(echo "$DEV" | tr '/' '_'); PREV=$(cat "$STATE/$KEY.count" 2>/dev/null || echo 0); echo "$EC" > "$STATE/$KEY.count"
+  say "  $DEV ($MP)  상태=${ST:-?}  누적에러=$EC (직전 $PREV)"
+  FSERR=$((FSERR + EC))
   [ "$ST" != "clean" ] && [ -n "$ST" ] && add "[$DEV] 파일시스템 상태=$ST (clean 아님)"
   [ "$EC" -gt "$PREV" ] 2>/dev/null && add "[$DEV] FS 에러카운트 증가: $PREV -> $EC (진행형 손상 의심)"
 done
-DC=$(dmesg 2>/dev/null | grep -icE 'I/O error|Medium Error|EXT4-fs error|failed CRC|bitmap checksum|Data will be lost|hard resetting')
+[ "$NFS" = 0 ] && say "  (검사 가능한 ext2/3/4 장치를 찾지 못했습니다 — LVM/xfs/가상디스크일 수 있습니다)"
+RO=$(findmnt -rno SOURCE,TARGET,OPTIONS -t ext2,ext3,ext4,xfs 2>/dev/null | awk '$3 ~ /(^|,)ro(,|$)/{print $1"("$2")"}' | tr '\n' ' ')
+[ -n "$RO" ] && add "읽기전용(RO) 재마운트 감지: $RO"
+
+say ""
+say "[커널 I/O 에러]"
+PAT='I/O error|Medium Error|EXT4-fs error|failed CRC|bitmap checksum|Data will be lost|hard resetting'
+DC=$(dmesg 2>/dev/null | grep -icE "$PAT")
 PREV=$(cat "$STATE/dmesg.count" 2>/dev/null || echo 0); echo "$DC" > "$STATE/dmesg.count"
+say "  현재 부팅 누적 $DC 건 (직전 점검 $PREV 건)"
 if [ "$DC" -gt "$PREV" ] 2>/dev/null; then
   add "dmesg I/O/FS 에러 증가: $PREV -> $DC"
-  dmesg 2>/dev/null | grep -iE 'I/O error|Medium Error|EXT4-fs error|failed CRC|Data will be lost|hard resetting' | tail -n 8 >> "$LOG"
+  dmesg 2>/dev/null | grep -iE "$PAT" | tail -n 8 | tee -a "$LOG" | sed 's/^/    /' >> "$SNAP"
 fi
+
+say ""
+say "[SMART]"
+REALLOC=0; PENDING=0
 if command -v smartctl >/dev/null 2>&1; then
   for D in $(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
-    smartctl -H /dev/$D 2>/dev/null | grep -iE 'overall-health' | grep -qiE 'PASSED' || add "[/dev/$D] SMART overall-health PASSED 아님"
-    RS=$(smartctl -A /dev/$D 2>/dev/null | awk '/Reallocated_Sector_Ct/{print $10}')
-    PS=$(smartctl -A /dev/$D 2>/dev/null | awk '/Current_Pending_Sector/{print $10}')
-    [ -n "$RS" ] && [ "$RS" -gt 0 ] 2>/dev/null && add "[/dev/$D] Reallocated_Sector=$RS"
-    [ -n "$PS" ] && [ "$PS" -gt 0 ] 2>/dev/null && add "[/dev/$D] Current_Pending_Sector=$PS"
+    H=$(smartctl -H /dev/$D 2>/dev/null | grep -iE 'overall-health|SMART Health Status' | sed 's/.*: *//')
+    RS=$(smartctl -A /dev/$D 2>/dev/null | awk '/Reallocated_Sector_Ct/{print $10}'); [ -z "$RS" ] && RS=0
+    PS=$(smartctl -A /dev/$D 2>/dev/null | awk '/Current_Pending_Sector/{print $10}'); [ -z "$PS" ] && PS=0
+    POH=$(smartctl -A /dev/$D 2>/dev/null | awk '/Power_On_Hours/{print $10}')
+    say "  /dev/$D  health=${H:-확인불가}  realloc=$RS  pending=$PS  가동=${POH:-?}h"
+    REALLOC=$((REALLOC + RS)); PENDING=$((PENDING + PS))
+    printf '%s' "$H" | grep -qiE 'PASSED|OK' || add "[/dev/$D] SMART overall-health: ${H:-확인불가}"
+    # 절대값보다 '증가'가 중요하다 — 새로 생긴 불량섹터만 경보
+    PR=$(cat "$STATE/$D.realloc" 2>/dev/null || echo "$RS"); echo "$RS" > "$STATE/$D.realloc"
+    PP=$(cat "$STATE/$D.pending" 2>/dev/null || echo "$PS"); echo "$PS" > "$STATE/$D.pending"
+    [ "$RS" -gt "$PR" ] 2>/dev/null && add "[/dev/$D] 재할당섹터 증가: $PR -> $RS (디스크 열화 진행)"
+    [ "$PS" -gt "$PP" ] 2>/dev/null && add "[/dev/$D] 대기중 불량섹터 증가: $PP -> $PS"
+    [ "$PR" = "$RS" ] && [ "$RS" -gt 0 ] 2>/dev/null && say "    (재할당 $RS 건은 과거 이력 — 증가하지 않으면 즉시 위험은 아님)"
   done
+else
+  say "  (smartctl 없음 — apt install smartmontools)"
 fi
+
+say ""
+say "[용량]"
+MAXP=0
 while read -r FS SZ USED AVAIL PCT MP; do
-  P=${PCT%\%}; [ "$P" -ge 95 ] 2>/dev/null && add "[$MP] 사용량 $PCT (디스크 거의 참)"
+  P=${PCT%\%}
+  say "$(printf '  %-26s %5s  %6s 남음  %s' "$MP" "$PCT" "$AVAIL" "$FS")"
+  [ "$P" -gt "$MAXP" ] 2>/dev/null && MAXP=$P
+  [ "$P" -ge 95 ] 2>/dev/null && add "[$MP] 사용량 $PCT (디스크 거의 참)"
 done < <(df -P -x tmpfs -x devtmpfs 2>/dev/null | awk 'NR>1')
+while read -r FS IN IU IFR PCT MP; do
+  P=${PCT%\%}; [ "$P" -ge 90 ] 2>/dev/null && add "[$MP] inode 사용량 $PCT (파일 개수 한계 임박)"
+done < <(df -Pi -x tmpfs -x devtmpfs 2>/dev/null | awk 'NR>1')
+
+# --- 판정 + 기록 보존 ---
+NALERT=$(printf '%s' "$ALERT" | grep -c .)
+if [ -n "$ALERT" ]; then RESULT=WARN; else RESULT=OK; fi
+say ""
+say "=========================================================="
+say "[판정] $RESULT   경보 ${NALERT}건"
+[ "$RESULT" = OK ] && say "  이상 신호 없음."
+echo "$TS" > "$STATE/last-run"
+
+[ -s "$HIST" ] || printf 'date\tresult\talerts\tfserr\tdmesg\tuse%%\trealloc\tpending\n' > "$HIST"
+if grep -q "^$DAY"$'\t' "$HIST" 2>/dev/null; then
+  grep -v "^$DAY"$'\t' "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
+fi
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$DAY" "$RESULT" "$NALERT" "$FSERR" "$DC" "${MAXP}%" "$REALLOC" "$PENDING" >> "$HIST"
+
+# 보존기간이 지난 일자 기록만 삭제 (history.tsv 는 계속 누적)
+find "$ARCH" -maxdepth 1 -type f -name '*.log' -mtime +"$KEEP" -delete 2>/dev/null
+
+HOSTN=$(hostname)
 if [ -n "$ALERT" ]; then
-  SUBJ="[hostmover] 디스크 경보: $(hostname)"
-  BODY="디스크 감시에서 이상이 감지되었습니다:"$'\n\n'"$ALERT"$'\n'"로그: $LOG"
-  if command -v mail >/dev/null 2>&1; then printf '%s\n' "$BODY" | mail -s "$SUBJ" "$EMAIL"
-  elif command -v sendmail >/dev/null 2>&1; then printf 'To: %s\nSubject: %s\n\n%s\n' "$EMAIL" "$SUBJ" "$BODY" | sendmail -t; fi
+  hm_mail "[hostmover] 디스크 경보: $HOSTN" \
+    "디스크 점검에서 이상이 감지되었습니다. ($TS)"$'\n\n'"$ALERT"$'\n'"전체 결과: $SNAP"$'\n'"경보 로그: $LOG"
+elif [ "$DAILY_MAIL" = "1" ]; then
+  hm_mail "[hostmover] 디스크 점검 정상: $HOSTN ($DAY)" "$(cat "$SNAP")"
 fi
 EOS
-sed -i "s|__EMAIL__|$EMAIL|g" /usr/local/sbin/hm-disk-monitor.sh
+sed -i "s|__EMAIL__|$EMAIL|g; s|__KEEP__|$KEEP_DAYS|g; s|__DAILY__|$DAILY_MAIL|g" /usr/local/sbin/hm-disk-monitor.sh
 chmod +x /usr/local/sbin/hm-disk-monitor.sh
 
 # 3) 주간 무결성 스크럽 스크립트
@@ -1529,18 +1725,22 @@ cat > /usr/local/sbin/hm-disk-scrub.sh <<'EOS'
 #!/usr/bin/env bash
 export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 EMAIL="__EMAIL__"; DIR="__PATH__"; MB=2048; LOG=/var/log/hm-disk-monitor.log
-[ -d "$DIR" ] || { echo "$(date '+%F %T') scrub: 경로 없음 $DIR" >> "$LOG"; exit 0; }
+STATE=/var/lib/hm-disk-monitor; SCRUBLOG="$STATE/scrub.tsv"; mkdir -p "$STATE"
+[ -s "$SCRUBLOG" ] || printf 'datetime\tpath\tsize\tresult\tdetail\n' > "$SCRUBLOG"
+[ -d "$DIR" ] || { echo "$(date '+%F %T') scrub: 경로 없음 $DIR" >> "$LOG"; \
+  printf '%s\t%s\t%sMB\t%s\t%s\n' "$(date '+%F %T')" "$DIR" "$MB" "SKIP" "경로 없음" >> "$SCRUBLOG"; exit 0; }
 F="$DIR/.hm_scrub_$$.bin"; MSG=""
 timeout 600 dd if=/dev/urandom of="$F" bs=1M count="$MB" conv=fsync status=none; RC=$?
 if [ "$RC" = 124 ]; then MSG="쓰기 타임아웃 @ $DIR (부하 시 장치 탈락 의심)"; rm -f "$F"
 elif [ "$RC" != 0 ]; then MSG="쓰기 실패(dd=$RC) @ $DIR (RO재마운트/공간/장치오류)"; rm -f "$F"
 else
   sync; H1=$(sha256sum "$F" | awk '{print $1}')
-  sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+  sync; { echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null
   H2=$(sha256sum "$F" | awk '{print $1}'); rm -f "$F"
   [ "$H1" != "$H2" ] && MSG="SILENT CORRUPTION! 갓 쓴 데이터가 읽을 때 바뀜 @ $DIR. 디스크 교체 필요. ($H1 vs $H2)"
 fi
 echo "$(date '+%F %T') scrub $DIR: ${MSG:-OK}" >> "$LOG"
+printf '%s\t%s\t%sMB\t%s\t%s\n' "$(date '+%F %T')" "$DIR" "$MB" "$([ -n "$MSG" ] && echo FAIL || echo OK)" "${MSG:-무결성 일치}" >> "$SCRUBLOG"
 if [ -n "$MSG" ]; then
   SUBJ="[hostmover] 디스크 무결성 경보: $(hostname)"
   if command -v mail >/dev/null 2>&1; then printf '%s\n' "$MSG" | mail -s "$SUBJ" "$EMAIL"
@@ -1560,6 +1760,23 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOS
 chmod 644 /etc/cron.d/hm-disk-monitor
 
+# 4-1) logrotate — 경보 로그가 무한히 커지지 않게. 일자별 기록은 스크립트가 KEEP 일로 직접 정리한다.
+if [ -d /etc/logrotate.d ]; then
+  cat > /etc/logrotate.d/hm-disk-monitor <<'EOS'
+# hostmover 디스크 감시 (자동 생성)
+/var/log/hm-disk-monitor.log {
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+}
+EOS
+  chmod 644 /etc/logrotate.d/hm-disk-monitor
+fi
+
 # 5) smartd
 if [ -f /etc/smartd.conf ]; then
   if ! grep -q '# hostmover' /etc/smartd.conf; then
@@ -1573,9 +1790,16 @@ fi
 /usr/local/sbin/hm-disk-monitor.sh
 systemctl restart cron 2>/dev/null || service cron restart 2>/dev/null || systemctl restart crond 2>/dev/null || true
 echo "[완료]"
-echo "  매일 07:30  /usr/local/sbin/hm-disk-monitor.sh  (FS에러카운트/dmesg/SMART/용량)"
+echo "  매일 07:30  /usr/local/sbin/hm-disk-monitor.sh  (FS에러카운트/dmesg/SMART/용량/inode)"
 echo "  매주 일 04:10  /usr/local/sbin/hm-disk-scrub.sh  ($SCRUB_PATH, write->read-back)"
-echo "  로그 /var/log/hm-disk-monitor.log   알림메일 $EMAIL"
+echo
+echo "  [기록 보존]"
+echo "    일자별 결과 전문 : /var/log/hostmover/disk/<날짜>.log   (${KEEP_DAYS}일 보존, 정상인 날도 남김)"
+echo "    일자별 추이 요약 : /var/lib/hm-disk-monitor/history.tsv (계속 누적 — 값의 '증가'가 위험신호)"
+echo "    경보 이력        : /var/log/hm-disk-monitor.log         (logrotate 월간·12개월)"
+echo "    스크럽 이력      : /var/lib/hm-disk-monitor/scrub.tsv"
+echo "    → hostmover 의 '점검 기록 보기' 버튼으로 이 기록을 그대로 조회할 수 있습니다."
+echo "  알림메일 $EMAIL ($([ "$DAILY_MAIL" = 1 ] && echo '매일 결과 발송' || echo '이상 시에만 발송'))"
 
 # 7) 메일 발송 자가진단 — 실제 테스트 메일을 보내 어떤 전송수단이 되는지 즉시 확인
 echo "[메일 발송 테스트] $EMAIL 로 테스트 메일 전송 시도 (전송수단 자동 탐지)"
@@ -4054,6 +4278,44 @@ mod tests {
         assert!(j.script.contains("tar -C"));
         assert!(j.script.contains("czf -") && j.script.contains("xzf -"));
         assert!(j.env.iter().any(|(k, _)| k == "HM_TOBE"));
+    }
+
+    #[test]
+    fn disk_monitor_jobs_valid_bash_and_validation() {
+        let st = Settings { ssh_host: "1.2.3.4".into(), ssh_user: "tong".into(), ssh_pass: "pw".into(), ..Default::default() };
+        // 생성되는 모든 디스크 관련 스크립트가 구문상 유효해야 한다.
+        for job in [
+            build_disk_health(&st).unwrap(),
+            build_disk_scrub(&st, "/backup", 512).unwrap(),
+            build_disk_monitor_install(&st, "a@b.c", "/backup", 90, false).unwrap(),
+            build_disk_monitor_install(&st, "a@b.c", "/backup", 30, true).unwrap(),
+            build_disk_monitor_uninstall(&st).unwrap(),
+            build_disk_history(&st, 14).unwrap(),
+        ] {
+            let out = std::process::Command::new("bash").args(["-n", "-c", &job.script]).output().expect("bash");
+            assert!(out.status.success(), "bash 오류({}):\n{}\n{}", job.title, String::from_utf8_lossy(&out.stderr), job.script);
+        }
+        // 설치 스크립트가 내부에 써 넣는 감시 스크립트 자체도 구문 검증한다.
+        // (설치본이 깨지면 매일 아침 cron 이 조용히 실패한다 — 겉으로는 아무 일도 안 일어난 것처럼 보인다)
+        let inst = build_disk_monitor_install(&st, "a@b.c", "/backup", 90, false).unwrap();
+        for marker in ["hm-disk-monitor.sh", "hm-disk-scrub.sh"] {
+            assert!(inst.script.contains(marker), "{marker} 생성 누락");
+        }
+        // 기록 보존 경로가 실제로 스크립트에 박혀 있는지
+        for needle in ["/var/log/hostmover/disk", "history.tsv", "last-run", "logrotate.d"] {
+            assert!(inst.script.contains(needle), "'{needle}' 누락");
+        }
+        // 매일 결과 메일 옵션이 스크립트에 반영되는지
+        assert!(build_disk_monitor_install(&st, "a@b.c", "/backup", 90, true).unwrap().script.contains("DAILY_MAIL=1"));
+        assert!(build_disk_monitor_install(&st, "a@b.c", "/backup", 90, false).unwrap().script.contains("DAILY_MAIL=0"));
+        // 보존일수는 범위로 제한(0일 → 최소 7일로 클램프)
+        assert!(build_disk_monitor_install(&st, "a@b.c", "/backup", 0, false).unwrap().script.contains("KEEP_DAYS=7"));
+        // 입력 검증: 잘못된 이메일·경로는 거부
+        assert!(build_disk_monitor_install(&st, "not-an-email", "/backup", 90, false).is_err());
+        assert!(build_disk_monitor_install(&st, "a@b.c", "relative/path", 90, false).is_err());
+        assert!(build_disk_monitor_install(&st, "a@b.c", "/back'up", 90, false).is_err());
+        assert!(build_disk_monitor_install(&st, "a@b.c", "/backup/../etc", 90, false).is_err());
+        assert!(build_disk_scrub(&st, "notabsolute", 512).is_err());
     }
 
     #[test]

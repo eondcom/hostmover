@@ -415,6 +415,10 @@ pub struct App {
     bulk_mail: String,
     disk_path: String,
     disk_alert_email: String,
+    /// 일자별 점검기록 보존일수 (문자열 입력 → 파싱, 빈 값이면 기본 90)
+    disk_keep_days: String,
+    /// 이상이 없어도 매일 결과 메일을 받을지
+    disk_daily_mail: bool,
     /// WordPress 플러그인/테마 버전비교 스캔 결과 캐시 — (도메인id, 종류) → 행들.
     /// 재방문·플러그인↔테마 전환 시 네트워크 재조회 없이 즉시 표시(스캔 버튼=강제 새로고침).
     wp_cache: std::collections::HashMap<(u64, ops::WpAssetKind), Vec<ops::WpPluginRow>>,
@@ -510,6 +514,8 @@ impl App {
             bulk_mail: String::new(),
             disk_path: "/backup".to_string(),
             disk_alert_email: "eond@eond.com".to_string(),
+            disk_keep_days: "90".to_string(),
+            disk_daily_mail: false,
             wp_cache: std::collections::HashMap::new(),
             wp_sel: std::collections::HashSet::new(),
             wp_kind: ops::WpAssetKind::Plugin,
@@ -754,6 +760,7 @@ impl App {
         let mut do_disk_health = false;
         let mut do_disk_scrub: Option<u32> = None;
         let mut do_disk_monitor: Option<bool> = None;
+        let mut do_disk_history: Option<u32> = None;
         let mut do_bulk_update: Option<bool> = None;
         // (실행할지, 점검만인지) — 점검은 읽기 전용이라 확인 모달 없이 바로 돈다
         let mut do_wp_plugin: Option<(bool, bool)> = None;
@@ -1032,23 +1039,49 @@ impl App {
                         });
                         ui.add_space(8.0);
                         card(ui, |ui| {
-                            ui.strong(format!("{}  자동 감시 (사전 경보)", ph::BELL_RINGING));
-                            ui.label(egui::RichText::new("서버에 cron 감시를 설치합니다: smartd + 매일 FS에러카운트/dmesg/SMART/용량 점검 + 매주 무결성 스크럽(위 경로). 이상 시 이메일 경보.").weak());
+                            ui.strong(format!("{}  매일 아침 자동 점검 (사전 경보 + 기록 보존)", ph::BELL_RINGING));
+                            ui.label(egui::RichText::new("서버에 cron 감시를 설치합니다. 매일 07:30 에 FS에러카운트·dmesg I/O에러·SMART·용량·inode 를 점검하고, 매주 일요일 04:10 에 무결성 스크럽(위 경로)을 돌립니다. 이상이 생기면 이메일로 경보합니다.").weak());
+                            ui.label(egui::RichText::new("점검 결과는 이상이 없는 날에도 매일 서버에 보존됩니다 — /var/log/hostmover/disk/<날짜>.log (전문) 와 history.tsv (추이 한 줄 요약). 아래 '점검 기록 보기' 로 조회합니다.").weak());
                             ui.add_space(6.0);
                             egui::Grid::new("disk_monitor_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                                 grid_label(ui, "알림 이메일");
                                 ui.add(egui::TextEdit::singleline(&mut self.disk_alert_email).hint_text("eond@eond.com").desired_width(260.0).margin(FIELD_MARGIN));
                                 ui.end_row();
+                                grid_label(ui, "기록 보존일수");
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut self.disk_keep_days).hint_text("90").desired_width(70.0).margin(FIELD_MARGIN));
+                                    ui.label(egui::RichText::new("일 (일자별 전문 기준 · 추이 요약은 계속 누적)").weak());
+                                });
+                                ui.end_row();
                             });
+                            ui.checkbox(&mut self.disk_daily_mail, "이상이 없어도 매일 결과 메일 받기");
+                            ui.label(egui::RichText::new("끄면 이상이 감지된 날만 메일이 옵니다(권장). 켜면 매일 아침 점검 결과 전문이 메일로 옵니다.").weak());
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!running, btn_primary(format!("{}  자동 감시 설치", ph::BELL_RINGING)))
-                                    .on_hover_text("확인 후 서버에 cron/smartd 설치")
+                                    .on_hover_text("확인 후 서버에 cron/smartd 설치 (기존 설치 위에 다시 눌러 설정 변경 가능)")
                                     .clicked() { do_disk_monitor = Some(true); }
                                 if ui.add_enabled(!running, egui::Button::new(format!("{}  감시 제거", ph::BELL_SLASH)))
+                                    .on_hover_text("cron/스크립트만 제거 — 쌓인 점검 기록은 보존됩니다")
                                     .clicked() { do_disk_monitor = Some(false); }
                             });
                             ui.label(egui::RichText::new("설치 마지막에 위 주소로 테스트 메일을 자동 발송하고, 사용된 전송수단(mail/sendmail)을 로그에 표시합니다. 메일이 안 오면 서버 MTA(exim/postfix) 큐·스팸함을 점검하세요.").weak());
+                        });
+                        ui.add_space(8.0);
+                        card(ui, |ui| {
+                            ui.strong(format!("{}  점검 기록 보기", ph::CLOCK_COUNTER_CLOCKWISE));
+                            ui.label(egui::RichText::new("서버에 쌓인 매일 점검 결과를 조회합니다(읽기 전용). 자동 점검이 실제로 돌고 있는지(마지막 실행 시각), 일자별 추이, 가장 최근 점검 결과 전문, 경보·스크럽 이력을 함께 보여줍니다.").weak());
+                            ui.label(egui::RichText::new("※ 누적 FS 에러나 재할당섹터는 '값이 큰 것'보다 '늘어나는 것'이 위험 신호입니다. 추이 표에서 증가 여부를 보세요.").weak());
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!running, btn_primary(format!("{}  최근 14일", ph::CLOCK_COUNTER_CLOCKWISE)))
+                                    .clicked() { do_disk_history = Some(14); }
+                                if ui.add_enabled(!running, egui::Button::new("최근 90일"))
+                                    .clicked() { do_disk_history = Some(90); }
+                                if ui.add_enabled(!running, egui::Button::new("전체"))
+                                    .on_hover_text("보존된 추이 전부")
+                                    .clicked() { do_disk_history = Some(3650); }
+                            });
                         });
                     }
                     SettingsTab::Backup => {
@@ -1224,9 +1257,32 @@ impl App {
                 }
             }
         }
+        if let Some(days) = do_disk_history {
+            match ops::build_disk_history(&self.store.settings, days) {
+                Ok(job) => {
+                    self.running = true;
+                    self.last_ok = None;
+                    self.status = "점검 기록 조회 중...".into();
+                    let ctx2 = ctx.clone();
+                    ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
+                }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = format!("점검 기록 조회 실패: {e}");
+                    self.log.push(format!("디스크 점검 기록: {e}"));
+                }
+            }
+        }
         if let Some(install) = do_disk_monitor {
             let built = if install {
-                ops::build_disk_monitor_install(&self.store.settings, &self.disk_alert_email, &self.disk_path)
+                let keep = self.disk_keep_days.trim().parse::<u32>().unwrap_or(90);
+                ops::build_disk_monitor_install(
+                    &self.store.settings,
+                    &self.disk_alert_email,
+                    &self.disk_path,
+                    keep,
+                    self.disk_daily_mail,
+                )
             } else {
                 ops::build_disk_monitor_uninstall(&self.store.settings)
             };
