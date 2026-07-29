@@ -76,6 +76,7 @@ cargo build --release
 
 - **[docs/updating.md](docs/updating.md)** — hostmover 업데이트 절차, "고쳤는데 런처에서 안 바뀐다" 해결
 - **[docs/bulk-update.md](docs/bulk-update.md)** — 일괄 업데이트의 안정 릴리스 원칙, 결과 보고서/메일, 플러그인 골라 업데이트
+- **[docs/disk-check.md](docs/disk-check.md)** — 매일 아침 디스크 자동 점검, 결과 기록 보존과 추이 읽는 법
 - **[docs/rx-cli.md](docs/rx-cli.md)** — Rhymix 터미널 도구 rx-cli 배포와 사용
 
 ### macOS
