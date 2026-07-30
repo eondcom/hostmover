@@ -23,9 +23,33 @@ pub struct Store {
     pub domain_health: Vec<DomainHealth>,
     #[serde(default)]
     pub domain_health_at: i64,
+    /// 마지막 서버 스냅샷의 디스크별 헬스 결과.
+    #[serde(default)]
+    pub disk_health: Vec<DiskHealth>,
     /// 마지막 화면 상태 (재시작 시 복원)
     #[serde(default)]
     pub ui: UiState,
+}
+
+/// 디스크 1건의 헬스 (마커 HM_DISK 한 줄)
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct DiskHealth {
+    #[serde(default)] pub mount: String,
+    #[serde(default)] pub device: String,
+    #[serde(default)] pub disk: String,
+    #[serde(default)] pub role: String,
+    #[serde(default)] pub use_pct: String,
+    #[serde(default)] pub avail: String,
+    #[serde(default)] pub inode_pct: String,
+    #[serde(default)] pub fs_err: String,
+    #[serde(default)] pub smart: String,
+    #[serde(default)] pub realloc: String,
+    #[serde(default)] pub pending: String,
+    #[serde(default)] pub power_h: String,
+    #[serde(default)] pub temp_c: String,
+    #[serde(default)] pub rate: String,
+    #[serde(default)] pub eta: String,
+    #[serde(default)] pub span: String,
 }
 
 /// 도메인 1건의 헬스 (마커 HM_DOMH 한 줄)
@@ -65,6 +89,14 @@ pub struct ServerSnapshot {
     #[serde(default)] pub diskmon_last_ts: String,
     #[serde(default)] pub diskmon_result: String,
     #[serde(default)] pub trafficmon: String,
+    #[serde(default)] pub disk_rate: String,
+    #[serde(default)] pub disk_eta: String,
+    #[serde(default)] pub disk_span: String,
+    #[serde(default)] pub backup_same: String,
+    #[serde(default)] pub backup_src: String,
+    #[serde(default)] pub php_vers: String,
+    #[serde(default)] pub php_vern: String,
+    #[serde(default)] pub sock_dup: String,
 }
 
 /// 재시작 시 복원할 마지막 화면 위치 (인덱스 대신 id 로 저장해 정렬/추가에도 안정적)

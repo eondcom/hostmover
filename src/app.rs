@@ -1,4 +1,4 @@
-use crate::model::{ActivityLog, CachedSite, CmsAccess, CmsKind, Customer, CustomerNote, Domain, DomainAccess, DomainHealth, ServerSnapshot, Site, Store};
+use crate::model::{ActivityLog, CachedSite, CmsAccess, CmsKind, Customer, CustomerNote, DiskHealth, Domain, DomainAccess, DomainHealth, ServerSnapshot, Site, Store};
 use crate::ops::{self, LogMsg, OpKind};
 use crate::store;
 use egui_phosphor::regular as ph;
@@ -125,7 +125,27 @@ fn server_snapshot_from_markers(values: &HashMap<String, String>) -> ServerSnaps
         diskmon_last_ts: get("DISKMON_LAST_TS"),
         diskmon_result: get("DISKMON_RESULT"),
         trafficmon: get("TRAFFICMON"),
+        disk_rate: get("DISKRATE"),
+        disk_eta: get("DISKETA"),
+        disk_span: get("DISKSPAN"),
+        backup_same: get("BACKUPSAME"),
+        backup_src: get("BACKUPSRC"),
+        php_vers: get("PHPVERS"),
+        php_vern: get("PHPVERN"),
+        sock_dup: get("SOCKDUP"),
     }
+}
+
+fn parse_disk_health_marker(marker: &str) -> Option<DiskHealth> {
+    let fields: Vec<_> = marker.split_whitespace().collect();
+    if fields.len() != 16 { return None; }
+    Some(DiskHealth {
+        mount: fields[0].into(), device: fields[1].into(), disk: fields[2].into(),
+        role: fields[3].into(), use_pct: fields[4].into(), avail: fields[5].into(),
+        inode_pct: fields[6].into(), fs_err: fields[7].into(), smart: fields[8].into(),
+        realloc: fields[9].into(), pending: fields[10].into(), power_h: fields[11].into(),
+        temp_c: fields[12].into(), rate: fields[13].into(), eta: fields[14].into(), span: fields[15].into(),
+    })
 }
 
 /// 스펙 §2-4의 판정 규칙. 셸 스크립트 issue_of()와 동일하게 유지한다.
@@ -185,6 +205,27 @@ fn percent_grade(v: u32, bounds: [u32; 4]) -> Grade {
     else if v < bounds[2] { Grade::C } else if v < bounds[3] { Grade::D } else { Grade::E }
 }
 
+fn disk_grade(disk: &DiskHealth) -> Grade {
+    let mut grade = Grade::A;
+    if let Ok(value) = disk.use_pct.parse::<u32>() { grade = grade.max(percent_grade(value, [70, 80, 88, 95])); }
+    if let Ok(value) = disk.inode_pct.parse::<u32>() { grade = grade.max(percent_grade(value, [70, 80, 88, 95])); }
+    grade = grade.max(match disk.smart.as_str() { "PASSED" => Grade::A, "-" => Grade::C, _ => Grade::E });
+    let sectors = disk.realloc.parse::<u32>().ok().unwrap_or(0) + disk.pending.parse::<u32>().ok().unwrap_or(0);
+    grade = grade.max(match sectors { 0 => Grade::A, 1..=9 => Grade::C, 10..=49 => Grade::D, _ => Grade::E });
+    if let Ok(errors) = disk.fs_err.parse::<u32>() {
+        grade = grade.max(match errors { 0 => Grade::A, 1..=9 => Grade::C, _ => Grade::D });
+    }
+    grade
+}
+
+fn disk_overall_grade(disks: &[DiskHealth]) -> Option<Grade> {
+    disks.iter().map(disk_grade).max()
+}
+
+fn role_label(role: &str) -> &'static str {
+    match role { "main" => "운영", "backup" => "백업", _ => "기타" }
+}
+
 /// 총합 등급은 항목 중 최악이다. 자동 감시는 총합을 C보다 나쁘게 만들지 않는다.
 fn overall_grade(items: &[(String, Grade, bool)]) -> Option<Grade> {
     items.iter().map(|(_, grade, monitoring)| if *monitoring { (*grade).min(Grade::C) } else { *grade }).max()
@@ -206,9 +247,12 @@ fn grade_items(store: &Store) -> Vec<(String, Grade, bool, String)> {
             items.push(("메모리".into(), percent_grade(mem, [60, 75, 85, 93]), false,
                 format!("메모리 {mem}% (기준: A<60 B<75 C<85 D<93 E≥93)")));
         }
-        if let Ok(disk) = s.disk_max.parse::<u32>() {
+        if let Some(grade) = disk_overall_grade(&store.disk_health) {
+            items.push(("디스크".into(), grade, false,
+                format!("디스크 {}개 중 최악 {} {} (사용률·inode·SMART·섹터·FS 오류별 평가)", store.disk_health.len(), grade.letter(), grade.label())));
+        } else if let Ok(disk) = s.disk_max.parse::<u32>() {
             items.push(("디스크".into(), percent_grade(disk, [70, 80, 88, 95]), false,
-                format!("디스크 {}% ({}) (기준: A<70 B<80 C<88 D<95 E≥95)", s.disk_max, s.disk_max_mp)));
+                format!("구버전 캐시: 디스크 {}% ({}) (기준: A<70 B<80 C<88 D<95 E≥95)", s.disk_max, s.disk_max_mp)));
         }
         let services = s.svc_fail.split_whitespace().count();
         items.push(("서비스".into(), if services == 0 { Grade::A } else { Grade::E }, false,
@@ -241,6 +285,69 @@ fn grade_items(store: &Store) -> Vec<(String, Grade, bool, String)> {
         items.push(("인증서".into(), grade, false, format!("만료 {expired}건 · 14일 이내 {soon}건")));
     }
     items
+}
+
+/// 캐시된 결과만으로 실행 가능한 권고를 만든다(SSH 없음).
+fn advisories(store: &Store) -> Vec<(String, Option<&'static str>)> {
+    let mut out = Vec::new();
+    let s = &store.server_snapshot;
+    if s.at > 0 {
+        let mut has_disk_eta = false;
+        for disk in &store.disk_health {
+            if let Ok(eta) = disk.eta.parse::<u32>() {
+                has_disk_eta = true;
+                if eta <= 30 {
+                    out.push((format!("{} 디스크가 약 {eta}일 후 95% 도달 예상 (하루 {}%p) — 정리가 시급합니다", disk.mount, disk.rate), Some("디스크 점검")));
+                } else if eta <= 90 {
+                    out.push((format!("{} 디스크가 약 {eta}일 후 95% 도달 예상 — 정리 계획이 필요합니다", disk.mount), Some("디스크 점검")));
+                }
+            }
+            let grade = disk_grade(disk);
+            if disk.role == "backup" && grade >= Grade::D {
+                out.push((format!("백업 디스크 {} 상태 {} — 백업이 실패하면 복구 경로가 막힙니다", disk.mount, grade.letter()), Some("디스크 점검")));
+            }
+            if disk.role == "backup" && disk.use_pct.parse::<u32>().is_ok_and(|v| v >= 90) {
+                out.push((format!("백업 디스크 {} 사용률 {}% — v-backup-user가 곧 실패합니다", disk.mount, disk.use_pct), Some("디스크 점검")));
+            }
+            if disk.smart != "PASSED" {
+                out.push((format!("디스크 {} SMART 이상({}) — 교체를 검토하세요", disk.disk, disk.smart), Some("디스크 점검")));
+            }
+            let sectors = disk.realloc.parse::<u32>().ok().unwrap_or(0) + disk.pending.parse::<u32>().ok().unwrap_or(0);
+            if sectors >= 10 {
+                out.push((format!("디스크 {} 불량섹터 {sectors}개 — 늘어나면 교체 신호입니다", disk.disk), Some("점검 기록 보기")));
+            }
+        }
+        if !has_disk_eta && s.disk_eta.parse::<u32>().is_ok_and(|eta| eta <= 60) {
+            out.push((format!("디스크({} 기준)가 약 {}일 후 95% 도달 예상", s.disk_max_mp, s.disk_eta), Some("디스크 점검")));
+        }
+        if s.disk_rate.is_empty() && s.diskmon == "1" {
+            out.push(("디스크 추이 데이터가 부족합니다 — 며칠 더 쌓이면 증가 속도를 알 수 있습니다".into(), None));
+        }
+        if s.backup_src.is_empty() {
+            out.push(("/backup이 없습니다 — 계정 백업(v-backup-user)이 실패할 수 있습니다".into(), None));
+        } else if s.backup_same == "1" {
+            out.push(("/backup이 /home과 같은 파티션입니다 — 큰 계정 백업 시 디스크를 채울 수 있습니다".into(), None));
+        }
+        if let Ok(count) = s.php_vern.parse::<u32>() {
+            if count >= 2 {
+                out.push((format!("PHP-FPM 버전이 {count}개 공존합니다 ({}) — 도메인 버전 변경 후 구버전도 재시작하세요", s.php_vers), Some("PHP-FPM 진단")));
+            }
+        }
+        if let Ok(count) = s.sock_dup.parse::<u32>() {
+            if count > 0 {
+                out.push((format!("PHP-FPM 소켓 중복 정의 {count}건 — 2026-07-25 장애의 원인이었습니다"), Some("PHP-FPM 진단")));
+            }
+        }
+        if s.diskmon == "0" { out.push(("디스크 자동 감시가 설치되지 않았습니다".into(), Some("디스크 점검"))); }
+        if s.trafficmon == "0" { out.push(("트래픽 감시가 설치되지 않았습니다".into(), None)); }
+    }
+    if store.domain_health.is_empty() {
+        out.push(("도메인 헬스를 아직 점검하지 않았습니다 — 서버가 멀쩡해도 개별 사이트는 죽어 있을 수 있습니다".into(), Some("도메인 점검")));
+    } else {
+        let soon = store.domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| (0..=14).contains(&d))).count();
+        if soon > 0 { out.push((format!("인증서 만료 임박 {soon}건 — 갱신 실패로 조용히 쌓입니다"), Some("아래 목록"))); }
+    }
+    out
 }
 
 /// 설정 페이지 내부 탭
@@ -611,6 +718,8 @@ pub struct App {
     dash_snapshot_buf: HashMap<String, String>,
     /// 성공 완료 전까지 마커를 모으는 도메인 헬스 임시 버퍼.
     dash_domain_buf: Vec<DomainHealth>,
+    /// 성공 완료 전까지 마커를 모으는 디스크별 헬스 임시 버퍼.
+    dash_disk_buf: Vec<DiskHealth>,
     /// 중앙 영역 화면 전환
     view: MainView,
     /// 설정 페이지 내부 탭
@@ -724,6 +833,7 @@ impl App {
             dash_running: None,
             dash_snapshot_buf: HashMap::new(),
             dash_domain_buf: Vec::new(),
+            dash_disk_buf: Vec::new(),
             view: MainView::Dashboard,
             settings_tab: SettingsTab::Connect,
             acct_tab: AcctTab::Sites,
@@ -1000,6 +1110,8 @@ impl App {
         let mut total_grade = overall_grade(&grade_keys);
         // 도메인을 점검하지 않은 A는 거짓 안심이므로 검증 전 상태인 B로 표시한다.
         if domain_health.is_empty() && total_grade == Some(Grade::A) { total_grade = Some(Grade::B); }
+        let advisory_data = advisories(&self.store);
+        let disks = self.store.disk_health.clone();
         let snapshot_running = self.dash_running == Some(DashRun::Snapshot);
         let domain_running = self.dash_running == Some(DashRun::DomainHealth);
         let ssh_ready = !settings.ssh_user.trim().is_empty()
@@ -1107,6 +1219,29 @@ impl App {
                 }
             });
             ui.add_space(10.0);
+            card(ui, |ui| {
+                ui.strong("권고");
+                if advisory_data.is_empty() {
+                    ui.colored_label(C_GREEN, "조치할 항목이 없습니다");
+                } else {
+                    for (message, target) in &advisory_data {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("{}  {message}", ph::INFO));
+                            if let Some(label) = target {
+                                if ui.small_button(*label).clicked() {
+                                    match *label {
+                                        "디스크 점검" | "점검 기록 보기" => go_disk = true,
+                                        "PHP-FPM 진단" => go_php = true,
+                                        "도메인 점검" => do_domain_health = true,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+            ui.add_space(10.0);
             ui.columns(3, |cols| {
                 card(&mut cols[0], |ui| {
                     ui.strong("등록 현황");
@@ -1190,6 +1325,41 @@ impl App {
                         ui.separator();
                         ui.label(format!("HestiaCP 계정 {} · 도메인 {}", snapshot.users, snapshot.domains));
                     });
+                    if !disks.is_empty() {
+                        ui.add_space(7.0);
+                        ui.strong("디스크");
+                        for disk in &disks {
+                            let grade = disk_grade(disk);
+                            let value = |v: &str| if v == "-" || v.is_empty() { "조회불가".to_string() } else { v.to_string() };
+                            ui.horizontal_wrapped(|ui| {
+                                ui.colored_label(grade.color(), "●");
+                                ui.label(egui::RichText::new(&disk.mount).monospace().strong());
+                                ui.label(role_label(&disk.role));
+                                ui.label(format!("{}% · {} 남음", disk.use_pct, disk.avail));
+                                ui.label(format!("inode {}%", value(&disk.inode_pct)));
+                                let sectors = match (disk.realloc.parse::<u32>(), disk.pending.parse::<u32>()) {
+                                    (Ok(a), Ok(b)) if a + b > 0 => format!(" · 섹터 {}", a + b),
+                                    _ => String::new(),
+                                };
+                                ui.label(format!("SMART {}{sectors}", value(&disk.smart)));
+                                if disk.rate == "-" || disk.rate.is_empty() {
+                                    ui.weak("추이 데이터 쌓이는 중");
+                                } else {
+                                    let rate = if disk.rate.starts_with('-') { disk.rate.clone() } else { format!("+{}", disk.rate) };
+                                    ui.label(format!("{rate}%p/일"));
+                                    if disk.eta != "-" && !disk.eta.is_empty() { ui.label(format!("· 95%까지 {}일", disk.eta)); }
+                                }
+                                ui.colored_label(grade.color(), format!("{} ({})", grade.letter(), grade.label()));
+                            }).response.on_hover_text(format!(
+                                "장치 {} · 물리 디스크 {} · 가동 {}시간 · 온도 {}°C · FS 오류 {} · 관측 {}일",
+                                disk.device, disk.disk, value(&disk.power_h), value(&disk.temp_c), value(&disk.fs_err), value(&disk.span)
+                            ));
+                        }
+                        if disks.iter().all(|d| d.rate == "-" || d.rate.is_empty()) && !snapshot.disk_rate.is_empty() {
+                            ui.weak(format!("기존 전체 추이: {}일간 하루 {}%p{}", snapshot.disk_span, snapshot.disk_rate,
+                                if snapshot.disk_eta.is_empty() { String::new() } else { format!(" · 95%까지 약 {}일", snapshot.disk_eta) }));
+                        }
+                    }
                     ui.weak(format!("디스크 감시 {} · 트래픽 감시 {}", if snapshot.diskmon == "1" { "설치됨" } else { "미설치" }, if snapshot.trafficmon == "1" { "설치됨" } else { "미설치" }));
                 }
             });
@@ -1258,6 +1428,7 @@ impl App {
             match ops::build_server_snapshot(&self.store.settings) {
                 Ok(job) => {
                     self.dash_snapshot_buf.clear();
+                    self.dash_disk_buf.clear();
                     self.dash_running = Some(DashRun::Snapshot);
                     self.run_diagnostic(job, ctx);
                 }
@@ -2639,6 +2810,9 @@ impl App {
                                 self.dash_snapshot_buf.insert(key.to_string(), value.to_string());
                             }
                         }
+                        if let Some(marker) = l.strip_prefix("HM_DISK ") {
+                            if let Some(disk) = parse_disk_health_marker(marker) { self.dash_disk_buf.push(disk); }
+                        }
                     }
                     if self.dash_running == Some(DashRun::DomainHealth) {
                         if let Some(marker) = l.strip_prefix("HM_DOMH ") {
@@ -2689,8 +2863,11 @@ impl App {
                     if dash_run == Some(DashRun::Snapshot) {
                         if ok {
                             self.store.server_snapshot = server_snapshot_from_markers(&self.dash_snapshot_buf);
+                            self.store.disk_health = std::mem::take(&mut self.dash_disk_buf);
                             self.dirty = true;
                             self.save();
+                        } else {
+                            self.dash_disk_buf.clear();
                         }
                         self.dash_snapshot_buf.clear();
                     }
@@ -4908,5 +5085,57 @@ mod tests {
         failed.server_snapshot.svc_fail = "nginx".into();
         let keys: Vec<_> = grade_items(&failed).iter().map(|(n, g, m, _)| (n.clone(), *g, *m)).collect();
         assert_eq!(overall_grade(&keys), Some(Grade::E));
+    }
+
+    #[test]
+    fn disk_grade_rules() {
+        let mut disk = DiskHealth {
+            mount: "/home".into(), device: "/dev/sda1".into(), disk: "sda".into(), role: "main".into(),
+            use_pct: "94".into(), inode_pct: "1".into(), fs_err: "0".into(), smart: "PASSED".into(),
+            realloc: "0".into(), pending: "0".into(), ..Default::default()
+        };
+        assert_eq!(disk_grade(&disk), Grade::D);
+        disk.use_pct = "95".into(); assert_eq!(disk_grade(&disk), Grade::E);
+        disk.use_pct = "10".into(); disk.smart = "-".into(); assert_eq!(disk_grade(&disk), Grade::C);
+        disk.smart = "FAILED!".into(); assert_eq!(disk_grade(&disk), Grade::E);
+        disk.smart = "PASSED".into(); disk.realloc = "9".into(); assert_eq!(disk_grade(&disk), Grade::C);
+        disk.realloc = "10".into(); assert_eq!(disk_grade(&disk), Grade::D);
+        disk.realloc = "50".into(); assert_eq!(disk_grade(&disk), Grade::E);
+        disk.realloc = "-".into(); disk.pending = "-".into(); disk.fs_err = "-".into();
+        assert_eq!(disk_grade(&disk), Grade::A, "미조회 세부만 건너뛰고 PASSED·사용률로 평가");
+
+        let good = DiskHealth { use_pct: "14".into(), inode_pct: "1".into(), smart: "PASSED".into(), realloc: "0".into(), pending: "0".into(), fs_err: "0".into(), ..Default::default() };
+        let bad = DiskHealth { use_pct: "7".into(), inode_pct: "1".into(), smart: "FAILED!".into(), realloc: "48".into(), pending: "12".into(), fs_err: "3".into(), role: "backup".into(), mount: "/backup".into(), ..Default::default() };
+        assert_eq!(disk_overall_grade(&[good, bad]), Some(Grade::E));
+    }
+
+    #[test]
+    fn actual_three_disk_layout_and_backup_advisory() {
+        let healthy = |mount: &str, disk: &str, role: &str, use_pct: &str| DiskHealth {
+            mount: mount.into(), disk: disk.into(), role: role.into(), use_pct: use_pct.into(),
+            inode_pct: "1".into(), fs_err: "0".into(), smart: "PASSED".into(), realloc: "0".into(), pending: "0".into(),
+            rate: "-".into(), eta: "-".into(), span: "-".into(), ..Default::default()
+        };
+        let mut store = Store {
+            server_snapshot: ServerSnapshot { at: 1, diskmon: "1".into(), disk_rate: "0.1".into(), backup_src: "/dev/sda1".into(), php_vern: "1".into(), trafficmon: "1".into(), ..Default::default() },
+            disk_health: vec![healthy("/", "nvme1n1", "main", "14"), healthy("/home", "nvme0n1", "main", "69"), healthy("/backup", "sda", "backup", "7")],
+            domain_health: vec![healthy_domain()],
+            ..Default::default()
+        };
+        assert_eq!(store.disk_health.len(), 3);
+        assert_eq!(disk_overall_grade(&store.disk_health), Some(Grade::A));
+        assert!(!advisories(&store).iter().any(|(text, _)| text.contains("백업 디스크")));
+
+        store.disk_health[2].use_pct = "94".into();
+        assert!(advisories(&store).iter().any(|(text, _)| text.contains("백업 디스크 /backup 사용률 94%")));
+    }
+
+    #[test]
+    fn disk_marker_requires_sixteen_fields() {
+        let disk = parse_disk_health_marker("/home /dev/nvme0n1p1 nvme0n1 main 69 142G 2 0 PASSED 0 0 9100 44 - - -").unwrap();
+        assert_eq!(disk.mount, "/home");
+        assert_eq!(disk.disk, "nvme0n1");
+        assert!(parse_disk_health_marker("/home /dev/sda1 too few").is_none());
+        assert!(parse_disk_health_marker("/path with-space /dev/sda1 sda main 1 1G 1 0 PASSED 0 0 1 1 - - -").is_none());
     }
 }
