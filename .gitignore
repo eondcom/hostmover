@@ -13,3 +13,10 @@ store.json
 
 # 대용량 패키지 아티팩트
 *.zip
+
+# Claude Code — plans/ 만 공유한다.
+# settings.local.json 은 승인한 명령 전문이 그대로 저장되므로(비밀번호·토큰이 섞일 수 있다)
+# 절대 커밋하지 않는다. worktrees/ 는 작업용 체크아웃 사본이다.
+.claude/*
+!.claude/plans/
+.omc/

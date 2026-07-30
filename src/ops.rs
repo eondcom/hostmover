@@ -2935,6 +2935,426 @@ pub fn resolve_a(domain: &str) -> String {
     "-".into()
 }
 
+/// 삭제하면 서버가 손상될 수 있는 계정. 입력 단계에서 먼저 막는다.
+fn is_protected_account(acct: &str, s: &Settings) -> bool {
+    const SYSTEM: &[&str] = &[
+        "admin", "root", "www-data", "mysql", "hestiaweb", "hestia", "daemon", "bin", "sys",
+        "nobody", "sshd", "systemd-network",
+    ];
+    let a = acct.trim();
+    if a.is_empty() { return true; }
+    if SYSTEM.iter().any(|p| p.eq_ignore_ascii_case(a)) { return true; }
+    !s.ssh_user.trim().is_empty() && s.ssh_user.trim().eq_ignore_ascii_case(a)
+}
+
+const DOMAIN_DELETE_PROBE_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+VUSER=__HM_USER__
+DOMAIN=__HM_DOMAIN__
+WR="/home/$VUSER/web/$DOMAIN/public_html"
+WEBDIR="/home/$VUSER/web/$DOMAIN"
+
+echo "===== 삭제 사전 점검: $VUSER / $DOMAIN ====="
+echo
+
+echo "[1] HestiaCP 등록 상태"
+if $VBIN/v-list-web-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN"; then
+  echo "  ✓ 웹도메인 등록됨"
+else
+  echo "  ✗ HestiaCP 에 이 웹도메인이 없습니다 — 삭제할 것이 없거나 계정/도메인이 틀렸습니다"
+fi
+$VBIN/v-list-dns-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN" \
+  && echo "  · DNS 도메인 있음 (함께 삭제됩니다)" || echo "  · DNS 도메인 없음"
+$VBIN/v-list-mail-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN" \
+  && echo "  · 메일 도메인 있음 (메일함까지 함께 삭제됩니다)" || echo "  · 메일 도메인 없음"
+echo
+
+echo "[2] 파일"
+if [ -d "$WEBDIR" ]; then
+  echo "  경로 $WEBDIR"
+  echo "  크기 $(du -sh "$WEBDIR" 2>/dev/null | cut -f1)"
+  echo "  파일수 $(find "$WEBDIR" -type f 2>/dev/null | wc -l)"
+else
+  echo "  (디렉터리 없음: $WEBDIR)"
+fi
+echo
+
+echo "[3] 데이터베이스"
+DB=""
+if [ -f "$WEBDIR/pythonapp/.env" ]; then
+  DB="$(grep -oP 'DATABASE_URL=.*/\K[^?[:space:]]+' "$WEBDIR/pythonapp/.env" 2>/dev/null | head -1)"
+  [ -z "$DB" ] && DB="$(grep -oP '^DB_NAME=\K.*' "$WEBDIR/pythonapp/.env" 2>/dev/null | head -1)"
+fi
+[ -z "$DB" ] && [ -f "$WR/wp-config.php" ] && DB="$(grep -oP "DB_NAME'?\s*,\s*'\K[^']+" "$WR/wp-config.php" 2>/dev/null | head -1)"
+for CF in "$WR/files/config/db.config.php" "$WR/config/db.config.php"; do
+  [ -n "$DB" ] && break
+  [ -f "$CF" ] || continue
+  DB="$(grep -oP "'database'\s*=>\s*'\K[^']+" "$CF" 2>/dev/null | head -1)"
+  [ -z "$DB" ] && DB="$(grep -oP "db_database'?\s*[=,]\s*[\"']\K[^\"']+" "$CF" 2>/dev/null | head -1)"
+done
+[ -z "$DB" ] && [ -f "$WR/data/dbconfig.php" ] && DB="$(grep -oP "mysql_db'?\s*[,=]\s*[\"']\K[^\"']+" "$WR/data/dbconfig.php" 2>/dev/null | head -1)"
+
+if [ -z "$DB" ]; then
+  echo "  DB 를 찾지 못했습니다 (설정파일 미검출) — DB 는 삭제되지 않습니다"
+  echo "HM_DB="
+  echo "HM_DBSHARED=0"
+else
+  SZ=$(mysql -N -B -e "SELECT IFNULL(ROUND(SUM(data_length+index_length)/1024/1024,1),0) FROM information_schema.tables WHERE table_schema='$DB'" 2>/dev/null)
+  EX=$(mysql -N -B -e "SHOW DATABASES LIKE '$DB'" 2>/dev/null | grep -c .)
+  echo "  이름 $DB   크기 ${SZ:-?}MB   실제존재 $([ "$EX" = 1 ] && echo 예 || echo '아니오(설정만 남음)')"
+  if $VBIN/v-list-databases "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DB"; then
+    echo "  HestiaCP 등록 ✓ (정상 삭제 가능)"
+  else
+    echo "  HestiaCP 등록 ✗ — 패널 밖에서 수동 생성된 DB 입니다"
+    echo "    → 패널 명령으로는 안 지워집니다. 이 경우 DB 는 건너뜁니다(수동 처리)"
+  fi
+
+  echo
+  echo "  [공유 검사] 이 DB 를 다른 도메인도 쓰고 있는지 (중요)"
+  HITS=0; SHARED=""
+  shopt -s nullglob
+  for OWR in /home/"$VUSER"/web/*/public_html; do
+    [ -d "$OWR" ] || continue
+    OD="$(basename "$(dirname "$OWR")")"
+    if grep -rqsF "$DB" "$OWR/wp-config.php" "$OWR/data/dbconfig.php" \
+         "$OWR/config/db.config.php" "$OWR/files/config/db.config.php" \
+         "$(dirname "$OWR")/pythonapp/.env" 2>/dev/null; then
+      HITS=$((HITS+1))
+      [ "$OD" != "$DOMAIN" ] && SHARED="$SHARED $OD"
+    fi
+  done
+  if [ -n "$SHARED" ]; then
+    echo "    ✗✗ 다른 도메인도 이 DB 를 참조합니다:$SHARED"
+    echo "       → DB 를 지우면 그 사이트들이 죽습니다. DB 삭제를 건너뛰어야 합니다."
+    echo "HM_DBSHARED=1"
+  else
+    echo "    ✓ 이 도메인만 사용 (참조 $HITS 곳)"
+    echo "HM_DBSHARED=0"
+  fi
+  echo "HM_DB=$DB"
+fi
+echo
+
+echo "[4] 백업 여유"
+df -h /backup 2>/dev/null | tail -1 | sed 's/^/  /' || df -h / | tail -1 | sed 's/^/  /'
+echo
+echo "===== 점검 끝 — 삭제하려면 백업 후 '서버에서 완전 삭제' ====="
+"#;
+
+const ACCOUNT_DELETE_PROBE_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+VUSER=__HM_USER__
+
+echo "===== 계정 삭제 사전 점검: $VUSER ====="
+echo
+if ! $VBIN/v-list-users plain 2>/dev/null | awk '{print $1}' | grep -qx "$VUSER"; then
+  echo "  ✗ HestiaCP 계정이 아닙니다: $VUSER — 중단하세요"
+  echo "===== 점검 끝 ====="
+  exit 0
+fi
+echo "[1] 계정 요약"
+$VBIN/v-list-user "$VUSER" plain 2>/dev/null | sed 's/^/  /'
+echo
+echo "[2] 웹 도메인 (전부 삭제됩니다)"
+$VBIN/v-list-web-domains "$VUSER" plain 2>/dev/null | awk '{print "  "$1}' | sort
+echo "  총 $($VBIN/v-list-web-domains "$VUSER" plain 2>/dev/null | grep -c .) 개"
+echo
+echo "[3] 데이터베이스 (전부 삭제됩니다)"
+$VBIN/v-list-databases "$VUSER" plain 2>/dev/null | awk '{print "  "$1}' | sort
+echo
+echo "[4] DNS / 메일 도메인"
+echo "  DNS  $($VBIN/v-list-dns-domains "$VUSER" plain 2>/dev/null | grep -c .) 개"
+echo "  메일 $($VBIN/v-list-mail-domains "$VUSER" plain 2>/dev/null | grep -c .) 개 (메일함 포함 삭제)"
+echo
+echo "[5] 디스크"
+[ -d "/home/$VUSER" ] && echo "  /home/$VUSER  $(du -sh "/home/$VUSER" 2>/dev/null | cut -f1)"
+echo
+echo "[6] 백업 여유"
+df -h /backup 2>/dev/null | tail -1 | sed 's/^/  /' || df -h / | tail -1 | sed 's/^/  /'
+echo
+echo "※ 계정 완전 삭제는 도메인·DB·메일·크론·/home 을 모두 지웁니다. 되돌릴 수 없습니다."
+echo "===== 점검 끝 ====="
+"#;
+
+/// 도메인 삭제 사전 점검 (SSH, sudo, 읽기 전용).
+pub fn build_domain_delete_probe(s: &Settings, account: &str, domain: &str) -> Result<Job, String> {
+    let acct = account.trim();
+    if !is_safe_name(acct) { return Err("계정 이름 형식 오류 (영숫자/._- 만)".into()); }
+    if is_protected_account(acct, s) { return Err(format!("보호 대상 계정입니다: {acct}")); }
+    let da = to_ascii_domain(domain);
+    if !is_safe_name(&da) { return Err(format!("도메인 형식 오류: {domain}")); }
+    let srv = ssh_admin_site(s)?;
+    let raw = DOMAIN_DELETE_PROBE_BODY
+        .replace("__HM_USER__", &sq(acct))
+        .replace("__HM_DOMAIN__", &sq(&da));
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("도메인 삭제 사전 점검 — {acct}/{da}"),
+        script,
+        sshpass,
+        env,
+        note: format!("{acct}/{da} 파일·DB·DNS·메일·공유 여부 조사 (읽기 전용)"),
+    })
+}
+
+/// 계정 삭제 사전 점검 (SSH, sudo, 읽기 전용).
+pub fn build_account_delete_probe(s: &Settings, account: &str) -> Result<Job, String> {
+    let acct = account.trim();
+    if !is_safe_name(acct) { return Err("계정 이름 형식 오류 (영숫자/._- 만)".into()); }
+    if is_protected_account(acct, s) { return Err(format!("보호 대상 계정입니다: {acct}")); }
+    let srv = ssh_admin_site(s)?;
+    let raw = ACCOUNT_DELETE_PROBE_BODY.replace("__HM_USER__", &sq(acct));
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("계정 삭제 사전 점검 — {acct}"),
+        script,
+        sshpass,
+        env,
+        note: format!("계정 {acct}의 도메인·DB·DNS·메일·디스크 조사 (읽기 전용)"),
+    })
+}
+
+const ACCOUNT_BACKUP_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+VUSER=__HM_USER__
+echo "===== 계정 백업: $VUSER ====="
+
+# 계정 크기와 백업 위치 여유를 비교한다. 1GB 안전 여유가 없으면 시작하지 않는다.
+NEED=$(du -sm "/home/$VUSER" 2>/dev/null | cut -f1); [ -z "$NEED" ] && NEED=0
+BD=/backup; [ -d "$BD" ] || BD=/
+FREE=$(df -Pm "$BD" 2>/dev/null | awk 'NR==2{print $4}'); [ -z "$FREE" ] && FREE=0
+echo "  계정 크기 약 ${NEED}MB · $BD 여유 ${FREE}MB"
+if [ "$FREE" -lt $((NEED + 1024)) ] 2>/dev/null; then
+  echo "  ✗ 여유 공간이 부족합니다 (필요 ${NEED}MB + 여유분 1GB) — 백업을 중단합니다"
+  echo "    공간을 확보한 뒤 다시 시도하세요. 백업 없이 삭제하지 마십시오."
+  exit 1
+fi
+
+$VBIN/v-backup-user "$VUSER"
+RC=$?
+echo
+if [ "$RC" = 0 ]; then
+  echo "  ✓ 백업 완료"
+  ls -lh /backup/"$VUSER".*.tar 2>/dev/null | tail -3 | sed 's/^/    /'
+else
+  echo "  ✗ 백업 실패 (v-backup-user=$RC) — 삭제로 넘어가지 마십시오"
+  exit 1
+fi
+echo "===== 백업 끝 ====="
+"#;
+
+/// 계정 전체 백업 (SSH, sudo). 메일·크론·DNS까지 포함하는 HestiaCP 표준 백업.
+pub fn build_account_backup(s: &Settings, account: &str) -> Result<Job, String> {
+    let acct = account.trim();
+    if !is_safe_name(acct) { return Err("계정 이름 형식 오류 (영숫자/._- 만)".into()); }
+    if is_protected_account(acct, s) { return Err(format!("보호 대상 계정입니다: {acct}")); }
+    let srv = ssh_admin_site(s)?;
+    let raw = ACCOUNT_BACKUP_BODY.replace("__HM_USER__", &sq(acct));
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("계정 전체 백업 — {acct}"),
+        script,
+        sshpass,
+        env,
+        note: format!("계정 {acct} → /backup HestiaCP 표준 백업 (여유 공간 1GB 확인)"),
+    })
+}
+
+const DOMAIN_DELETE_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+VUSER=__HM_USER__
+DOMAIN=__HM_DOMAIN__
+DB=__HM_DB__
+SSHUSER=__HM_SSH_USER__
+LOG=/var/log/hostmover/deletions.log
+mkdir -p /var/log/hostmover
+TS=$(date '+%F %T')
+
+echo "===== 서버에서 완전 삭제: $VUSER / $DOMAIN ====="
+
+# Rust 입력 검증을 우회해도 보호 계정에서는 실행되지 않는다.
+case "$VUSER" in
+  admin|root|www-data|mysql|hestia|hestiaweb|daemon|bin|sys|nobody|sshd|systemd-network)
+    echo "  ✗ 보호 대상 계정입니다 — 중단"; exit 1 ;;
+esac
+if [ -n "$SSHUSER" ] && [ "$VUSER" = "$SSHUSER" ]; then
+  echo "  ✗ 보호 대상 계정입니다 — SSH 접속 계정 삭제 중단"; exit 1
+fi
+
+# 등록 확인 — 없으면 아무것도 하지 않는다.
+if ! $VBIN/v-list-web-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN"; then
+  echo "  ✗ HestiaCP 에 웹도메인이 없습니다 — 중단 (계정/도메인을 확인하세요)"
+  exit 1
+fi
+
+SZ=$(du -sh "/home/$VUSER/web/$DOMAIN" 2>/dev/null | cut -f1)
+echo "  대상 파일 ${SZ:-?} · DB ${DB:-없음}"
+echo
+
+echo "[1] 웹도메인 삭제 (파일·nginx/apache 설정·SSL 포함)"
+$VBIN/v-delete-web-domain "$VUSER" "$DOMAIN"
+RC=$?
+if [ "$RC" != 0 ]; then
+  echo "  ✗ 실패 (v-delete-web-domain=$RC) — 이후 단계를 중단합니다"
+  echo "$TS FAIL domain $VUSER/$DOMAIN v-delete-web-domain=$RC" >> "$LOG"
+  exit 1
+fi
+echo "  ✓ 완료"
+
+echo "[2] DNS 도메인"
+if $VBIN/v-list-dns-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN"; then
+  $VBIN/v-delete-dns-domain "$VUSER" "$DOMAIN" && echo "  ✓ 삭제" || echo "  ✗ 실패(수동 확인 필요)"
+else
+  echo "  · 없음"
+fi
+
+echo "[3] 메일 도메인"
+if $VBIN/v-list-mail-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN"; then
+  $VBIN/v-delete-mail-domain "$VUSER" "$DOMAIN" && echo "  ✓ 삭제" || echo "  ✗ 실패(수동 확인 필요)"
+else
+  echo "  · 없음"
+fi
+
+echo "[4] 데이터베이스"
+if [ -z "$DB" ]; then
+  echo "  · 건너뜀 (대상 없음 — 미검출이거나 다른 도메인과 공유 중)"
+else
+  if $VBIN/v-list-databases "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DB"; then
+    $VBIN/v-delete-database "$VUSER" "$DB" && echo "  ✓ $DB 삭제" || echo "  ✗ $DB 삭제 실패(수동 확인 필요)"
+  else
+    echo "  ✗ $DB 는 HestiaCP 에 등록되어 있지 않습니다 — 건너뜁니다"
+    echo "    패널 밖에서 만든 DB 는 자동 삭제하지 않습니다. 필요하면 직접 처리하세요."
+  fi
+fi
+echo
+
+echo "[5] 삭제 검증"
+FAILED=0
+$VBIN/v-list-web-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN" \
+  && { echo "  ✗ 패널에 아직 남아 있음"; FAILED=1; } || echo "  ✓ 패널에서 사라짐"
+[ -d "/home/$VUSER/web/$DOMAIN" ] \
+  && { echo "  ✗ 디렉터리 잔존: /home/$VUSER/web/$DOMAIN"; FAILED=1; } || echo "  ✓ 디렉터리 제거됨"
+if [ -n "$DB" ]; then
+  if mysql -N -B -e "SHOW DATABASES LIKE '$DB'" 2>/dev/null | grep -q .; then
+    echo "  ✗ DB 잔존: $DB"; FAILED=1
+  else
+    echo "  ✓ DB 제거됨"
+  fi
+fi
+
+echo "$TS DELETE domain $VUSER/$DOMAIN files=${SZ:-?} db=${DB:-none} verify=$([ "$FAILED" = 0 ] && echo OK || echo INCOMPLETE)" >> "$LOG"
+echo
+if [ "$FAILED" = 0 ]; then
+  echo "===== 삭제 완료 ====="
+else
+  echo "===== 삭제 불완전 — 위 ✗ 항목을 수동 확인하세요 ====="
+fi
+echo "※ hostmover 사이드바의 기록은 그대로 남아 있습니다. 필요하면 🗑 로 정리하세요."
+echo "※ 이력: $LOG"
+[ "$FAILED" = 0 ]
+"#;
+
+/// 도메인 완전 삭제 (SSH, sudo, 되돌릴 수 없음 — 확인 모달 필수).
+/// `db`가 비어 있으면 DB는 건드리지 않는다.
+pub fn build_domain_delete(s: &Settings, account: &str, domain: &str, db: &str) -> Result<Job, String> {
+    let acct = account.trim();
+    if !is_safe_name(acct) { return Err("계정 이름 형식 오류".into()); }
+    if is_protected_account(acct, s) { return Err(format!("보호 대상 계정입니다: {acct}")); }
+    let da = to_ascii_domain(domain);
+    if !is_safe_name(&da) { return Err(format!("도메인 형식 오류: {domain}")); }
+    let dbn = db.trim();
+    if !dbn.is_empty() && !is_safe_name(dbn) { return Err(format!("DB 이름 형식 오류: {db}")); }
+    let srv = ssh_admin_site(s)?;
+    let raw = DOMAIN_DELETE_BODY
+        .replace("__HM_USER__", &sq(acct))
+        .replace("__HM_DOMAIN__", &sq(&da))
+        .replace("__HM_DB__", &sq(dbn))
+        .replace("__HM_SSH_USER__", &sq(s.ssh_user.trim()));
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("도메인 서버 완전 삭제 — {acct}/{da}"),
+        script,
+        sshpass,
+        env,
+        note: format!("{acct}/{da} 파일·패널 등록·DNS·메일{} 제거", if dbn.is_empty() { "" } else { "·DB" }),
+    })
+}
+
+const ACCOUNT_DELETE_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+VUSER=__HM_USER__
+SSHUSER=__HM_SSH_USER__
+LOG=/var/log/hostmover/deletions.log
+mkdir -p /var/log/hostmover
+TS=$(date '+%F %T')
+
+echo "===== 계정 완전 삭제: $VUSER ====="
+
+# Rust 검증을 우회해도 원격에서 다시 차단한다.
+case "$VUSER" in
+  admin|root|www-data|mysql|hestia|hestiaweb|daemon|bin|sys|nobody|sshd|systemd-network)
+    echo "  ✗ 보호 대상 계정입니다 — 중단"; exit 1 ;;
+esac
+if [ -n "$SSHUSER" ] && [ "$VUSER" = "$SSHUSER" ]; then
+  echo "  ✗ 보호 대상 계정입니다 — SSH 접속 계정 삭제 중단"; exit 1
+fi
+if ! $VBIN/v-list-users plain 2>/dev/null | awk '{print $1}' | grep -qx "$VUSER"; then
+  echo "  ✗ HestiaCP 계정이 아닙니다 — 중단"; exit 1
+fi
+
+ND=$($VBIN/v-list-web-domains "$VUSER" plain 2>/dev/null | grep -c .)
+SZ=$(du -sh "/home/$VUSER" 2>/dev/null | cut -f1)
+echo "  도메인 ${ND}개 · ${SZ:-?}"
+echo
+
+echo "[1] v-delete-user 실행"
+$VBIN/v-delete-user "$VUSER"
+RC=$?
+[ "$RC" = 0 ] && echo "  ✓ 완료" || echo "  ✗ 실패(v-delete-user=$RC)"
+echo
+
+echo "[2] 삭제 검증"
+FAILED=0
+[ "$RC" = 0 ] || FAILED=1
+$VBIN/v-list-users plain 2>/dev/null | awk '{print $1}' | grep -qx "$VUSER" \
+  && { echo "  ✗ 패널에 계정이 남아 있음"; FAILED=1; } || echo "  ✓ 패널에서 사라짐"
+[ -d "/home/$VUSER" ] \
+  && { echo "  ✗ /home/$VUSER 잔존"; FAILED=1; } || echo "  ✓ /home 제거됨"
+id "$VUSER" >/dev/null 2>&1 \
+  && { echo "  ✗ 시스템 사용자 잔존"; FAILED=1; } || echo "  ✓ 시스템 사용자 제거됨"
+
+echo "$TS DELETE user $VUSER domains=$ND size=${SZ:-?} rc=$RC verify=$([ "$FAILED" = 0 ] && echo OK || echo INCOMPLETE)" >> "$LOG"
+echo
+[ "$FAILED" = 0 ] && echo "===== 삭제 완료 =====" || echo "===== 삭제 불완전 — 위 ✗ 를 수동 확인 ====="
+echo "※ hostmover 사이드바 기록은 남아 있습니다."
+echo "※ 이력: $LOG"
+[ "$FAILED" = 0 ]
+"#;
+
+/// 계정 완전 삭제 (SSH, sudo, 되돌릴 수 없음). 도메인·DB·메일·크론·/home 전체가 대상이다.
+pub fn build_account_delete(s: &Settings, account: &str) -> Result<Job, String> {
+    let acct = account.trim();
+    if !is_safe_name(acct) { return Err("계정 이름 형식 오류 (영숫자/._- 만)".into()); }
+    if is_protected_account(acct, s) { return Err(format!("보호 대상 계정입니다: {acct}")); }
+    let srv = ssh_admin_site(s)?;
+    let raw = ACCOUNT_DELETE_BODY
+        .replace("__HM_USER__", &sq(acct))
+        .replace("__HM_SSH_USER__", &sq(s.ssh_user.trim()));
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("계정 서버 완전 삭제 — {acct}"),
+        script,
+        sshpass,
+        env,
+        note: format!("계정 {acct}의 도메인·DB·메일·DNS·크론·/home 전체 제거"),
+    })
+}
+
 /// 선택 사이트의 파일+DB를 로컬로 백업 — 사이트당 tar(웹루트/앱) + mysqldump 를 한 .tar.gz 로 받아 dest 에 저장.
 pub fn build_local_backup(s: &Settings, pairs: &[(String, String)], dest: &str) -> Result<Job, String> {
     if pairs.is_empty() { return Err("백업할 사이트를 선택하세요".into()); }
@@ -4867,6 +5287,120 @@ mod tests {
         assert!(job.script.contains("ADMINU='admin'"), "{}", job.script);
         assert!(job.script.contains("NEWPASS='p'\\''w \"x\"$(id)'"), "{}", job.script);
         assert!(job.script.contains("wp_pw_one \"$VUSER\" \"$DOMAIN\" \"$WEBROOT\""), "{}", job.script);
+    }
+
+    #[test]
+    fn delete_probe_jobs_valid_bash_and_validation() {
+        let st = Settings {
+            ssh_host: "1.2.3.4".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "pw".into(),
+            ..Default::default()
+        };
+        for job in [
+            build_domain_delete_probe(&st, "rokmc", "example.com").unwrap(),
+            build_account_delete_probe(&st, "rokmc").unwrap(),
+        ] {
+            let out = std::process::Command::new("bash")
+                .args(["-n", "-c", &job.script])
+                .output()
+                .expect("bash");
+            assert!(
+                out.status.success(),
+                "bash 오류({}):\n{}",
+                job.title,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        for job in [
+            build_domain_delete_probe(&st, "rokmc", "example.com").unwrap(),
+            build_account_delete_probe(&st, "rokmc").unwrap(),
+        ] {
+            for bad in ["v-delete-", "DROP DATABASE", "rm -rf"] {
+                assert!(!job.script.contains(bad), "점검에 파괴 명령 포함: {bad}");
+            }
+        }
+        for bad in ["admin", "root", "www-data", "mysql", "hestiaweb", "tong"] {
+            assert!(build_account_delete_probe(&st, bad).is_err(), "보호 계정 통과: {bad}");
+            assert!(build_domain_delete_probe(&st, bad, "example.com").is_err(), "보호 계정 통과: {bad}");
+        }
+        assert!(build_account_delete_probe(&st, "../etc").is_err());
+        assert!(build_domain_delete_probe(&st, "rokmc", "ex'ample.com").is_err());
+        assert!(build_domain_delete_probe(&st, "rokmc", "../../etc").is_err());
+    }
+
+    #[test]
+    fn account_backup_job_valid_bash_and_validation() {
+        let st = Settings {
+            ssh_host: "1.2.3.4".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "pw".into(),
+            ..Default::default()
+        };
+        let job = build_account_backup(&st, "rokmc").unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 오류:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(job.script.contains("v-backup-user"));
+        assert!(job.script.contains("NEED + 1024"), "1GB 안전 여유 검사 누락");
+        for bad in ["admin", "root", "mysql", "hestiaweb", "tong"] {
+            assert!(build_account_backup(&st, bad).is_err(), "보호 계정 통과: {bad}");
+        }
+        assert!(build_account_backup(&st, "../etc").is_err());
+    }
+
+    #[test]
+    fn domain_delete_job_safety() {
+        let st = Settings {
+            ssh_host: "1.2.3.4".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "pw".into(),
+            ..Default::default()
+        };
+        let job = build_domain_delete(&st, "rokmc", "example.com", "rokmc_wp").unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 오류:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(job.script.contains("v-delete-web-domain"));
+        assert!(!job.script.contains("rm -rf /home"), "웹루트 직접 삭제 금지");
+        assert!(job.script.contains("v-delete-database"));
+        assert!(job.script.contains("deletions.log"));
+        assert!(job.script.contains("보호 대상 계정입니다"), "원격 측 2차 방어 누락");
+        let without_db = build_domain_delete(&st, "rokmc", "example.com", "").unwrap();
+        assert!(without_db.script.contains("DB=''"), "빈 DB 주입 형식 확인");
+        for bad in ["admin", "root", "tong"] {
+            assert!(build_domain_delete(&st, bad, "example.com", "").is_err());
+        }
+        assert!(build_domain_delete(&st, "rokmc", "example.com", "db'x").is_err());
+        assert!(build_domain_delete(&st, "rokmc", "../etc", "").is_err());
+    }
+
+    #[test]
+    fn account_delete_job_safety() {
+        let st = Settings {
+            ssh_host: "1.2.3.4".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "pw".into(),
+            ..Default::default()
+        };
+        let job = build_account_delete(&st, "rokmc").unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 오류:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(job.script.contains("v-delete-user"));
+        assert!(job.script.contains("deletions.log"));
+        assert!(job.script.contains("보호 대상 계정입니다"), "원격 측 2차 방어 누락");
+        assert!(job.script.contains("v-list-users"), "원격 HestiaCP 계정 확인 누락");
+        for bad in ["admin", "root", "mysql", "hestiaweb", "tong"] {
+            assert!(build_account_delete(&st, bad).is_err(), "보호 계정 통과: {bad}");
+        }
+        assert!(build_account_delete(&st, "../etc").is_err());
     }
 
     #[test]
