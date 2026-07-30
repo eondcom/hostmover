@@ -2812,6 +2812,77 @@ pub fn build_domain_delete(s: &Settings, account: &str, domain: &str, db: &str) 
     })
 }
 
+const ACCOUNT_DELETE_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+VUSER=__HM_USER__
+SSHUSER=__HM_SSH_USER__
+LOG=/var/log/hostmover/deletions.log
+mkdir -p /var/log/hostmover
+TS=$(date '+%F %T')
+
+echo "===== 계정 완전 삭제: $VUSER ====="
+
+# Rust 검증을 우회해도 원격에서 다시 차단한다.
+case "$VUSER" in
+  admin|root|www-data|mysql|hestia|hestiaweb|daemon|bin|sys|nobody|sshd|systemd-network)
+    echo "  ✗ 보호 대상 계정입니다 — 중단"; exit 1 ;;
+esac
+if [ -n "$SSHUSER" ] && [ "$VUSER" = "$SSHUSER" ]; then
+  echo "  ✗ 보호 대상 계정입니다 — SSH 접속 계정 삭제 중단"; exit 1
+fi
+if ! $VBIN/v-list-users plain 2>/dev/null | awk '{print $1}' | grep -qx "$VUSER"; then
+  echo "  ✗ HestiaCP 계정이 아닙니다 — 중단"; exit 1
+fi
+
+ND=$($VBIN/v-list-web-domains "$VUSER" plain 2>/dev/null | grep -c .)
+SZ=$(du -sh "/home/$VUSER" 2>/dev/null | cut -f1)
+echo "  도메인 ${ND}개 · ${SZ:-?}"
+echo
+
+echo "[1] v-delete-user 실행"
+$VBIN/v-delete-user "$VUSER"
+RC=$?
+[ "$RC" = 0 ] && echo "  ✓ 완료" || echo "  ✗ 실패(v-delete-user=$RC)"
+echo
+
+echo "[2] 삭제 검증"
+FAILED=0
+[ "$RC" = 0 ] || FAILED=1
+$VBIN/v-list-users plain 2>/dev/null | awk '{print $1}' | grep -qx "$VUSER" \
+  && { echo "  ✗ 패널에 계정이 남아 있음"; FAILED=1; } || echo "  ✓ 패널에서 사라짐"
+[ -d "/home/$VUSER" ] \
+  && { echo "  ✗ /home/$VUSER 잔존"; FAILED=1; } || echo "  ✓ /home 제거됨"
+id "$VUSER" >/dev/null 2>&1 \
+  && { echo "  ✗ 시스템 사용자 잔존"; FAILED=1; } || echo "  ✓ 시스템 사용자 제거됨"
+
+echo "$TS DELETE user $VUSER domains=$ND size=${SZ:-?} rc=$RC verify=$([ "$FAILED" = 0 ] && echo OK || echo INCOMPLETE)" >> "$LOG"
+echo
+[ "$FAILED" = 0 ] && echo "===== 삭제 완료 =====" || echo "===== 삭제 불완전 — 위 ✗ 를 수동 확인 ====="
+echo "※ hostmover 사이드바 기록은 남아 있습니다."
+echo "※ 이력: $LOG"
+[ "$FAILED" = 0 ]
+"#;
+
+/// 계정 완전 삭제 (SSH, sudo, 되돌릴 수 없음). 도메인·DB·메일·크론·/home 전체가 대상이다.
+pub fn build_account_delete(s: &Settings, account: &str) -> Result<Job, String> {
+    let acct = account.trim();
+    if !is_safe_name(acct) { return Err("계정 이름 형식 오류 (영숫자/._- 만)".into()); }
+    if is_protected_account(acct, s) { return Err(format!("보호 대상 계정입니다: {acct}")); }
+    let srv = ssh_admin_site(s)?;
+    let raw = ACCOUNT_DELETE_BODY
+        .replace("__HM_USER__", &sq(acct))
+        .replace("__HM_SSH_USER__", &sq(s.ssh_user.trim()));
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("계정 서버 완전 삭제 — {acct}"),
+        script,
+        sshpass,
+        env,
+        note: format!("계정 {acct}의 도메인·DB·메일·DNS·크론·/home 전체 제거"),
+    })
+}
+
 /// 선택 사이트의 파일+DB를 로컬로 백업 — 사이트당 tar(웹루트/앱) + mysqldump 를 한 .tar.gz 로 받아 dest 에 저장.
 pub fn build_local_backup(s: &Settings, pairs: &[(String, String)], dest: &str) -> Result<Job, String> {
     if pairs.is_empty() { return Err("백업할 사이트를 선택하세요".into()); }
@@ -4796,6 +4867,30 @@ mod tests {
         }
         assert!(build_domain_delete(&st, "rokmc", "example.com", "db'x").is_err());
         assert!(build_domain_delete(&st, "rokmc", "../etc", "").is_err());
+    }
+
+    #[test]
+    fn account_delete_job_safety() {
+        let st = Settings {
+            ssh_host: "1.2.3.4".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "pw".into(),
+            ..Default::default()
+        };
+        let job = build_account_delete(&st, "rokmc").unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 오류:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(job.script.contains("v-delete-user"));
+        assert!(job.script.contains("deletions.log"));
+        assert!(job.script.contains("보호 대상 계정입니다"), "원격 측 2차 방어 누락");
+        assert!(job.script.contains("v-list-users"), "원격 HestiaCP 계정 확인 누락");
+        for bad in ["admin", "root", "mysql", "hestiaweb", "tong"] {
+            assert!(build_account_delete(&st, bad).is_err(), "보호 계정 통과: {bad}");
+        }
+        assert!(build_account_delete(&st, "../etc").is_err());
     }
 
     #[test]

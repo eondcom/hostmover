@@ -1364,6 +1364,7 @@ impl App {
         let mut do_danger_probe: Option<String> = None;
         let mut do_danger_backup: Option<String> = None;
         let mut do_danger_delete: Option<String> = None;
+        let mut do_danger_delete_account = false;
         let mut alias_loads: Vec<(String, String)> = Vec::new();
         let mut sel_all_sites: Option<bool> = None;
         let mut select_all = None;
@@ -1605,7 +1606,21 @@ impl App {
                                 ui.heading("3단계: 서버에서 완전 삭제");
                                 ui.separator();
                                 ui.colored_label(egui::Color32::from_rgb(220, 90, 90), "⚠ 되돌릴 수 없습니다.");
-                                ui.add_enabled(false, egui::Button::new("계정을 서버에서 완전 삭제"));
+                                ui.label("도메인·DB·메일·DNS·크론·/home 전체를 제거합니다.");
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("확인을 위해 {acct} 을(를) 입력하세요:"));
+                                    ui.add(egui::TextEdit::singleline(&mut self.danger_confirm_text).desired_width(220.0));
+                                });
+                                let armed = self.danger_probed
+                                    && self.danger_backed_up
+                                    && self.danger_confirm_text.trim() == acct;
+                                if ui.add_enabled(
+                                    !running && armed,
+                                    egui::Button::new(format!("{}  계정을 서버에서 완전 삭제", ph::WARNING))
+                                        .fill(egui::Color32::from_rgb(200, 70, 70)),
+                                ).clicked() {
+                                    do_danger_delete_account = true;
+                                }
                             });
                     } else {
                         if render_probe(ui, "선택 도메인 삭제 전 조사") {
@@ -1758,6 +1773,19 @@ impl App {
                     self.last_ok = Some(false);
                     self.status = format!("삭제 준비 실패: {e}");
                     self.log.push(format!("도메인 삭제: {e}"));
+                }
+            }
+        }
+        if do_danger_delete_account {
+            match ops::build_account_delete(&self.store.settings, &acct) {
+                Ok(job) => {
+                    self.danger_confirm_text.clear();
+                    self.danger_confirm = Some((job, acct.clone()));
+                }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = format!("삭제 준비 실패: {e}");
+                    self.log.push(format!("계정 삭제: {e}"));
                 }
             }
         }
