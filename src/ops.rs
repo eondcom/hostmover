@@ -2691,6 +2691,127 @@ pub fn build_account_backup(s: &Settings, account: &str) -> Result<Job, String> 
     })
 }
 
+const DOMAIN_DELETE_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+VUSER=__HM_USER__
+DOMAIN=__HM_DOMAIN__
+DB=__HM_DB__
+SSHUSER=__HM_SSH_USER__
+LOG=/var/log/hostmover/deletions.log
+mkdir -p /var/log/hostmover
+TS=$(date '+%F %T')
+
+echo "===== 서버에서 완전 삭제: $VUSER / $DOMAIN ====="
+
+# Rust 입력 검증을 우회해도 보호 계정에서는 실행되지 않는다.
+case "$VUSER" in
+  admin|root|www-data|mysql|hestia|hestiaweb|daemon|bin|sys|nobody|sshd|systemd-network)
+    echo "  ✗ 보호 대상 계정입니다 — 중단"; exit 1 ;;
+esac
+if [ -n "$SSHUSER" ] && [ "$VUSER" = "$SSHUSER" ]; then
+  echo "  ✗ 보호 대상 계정입니다 — SSH 접속 계정 삭제 중단"; exit 1
+fi
+
+# 등록 확인 — 없으면 아무것도 하지 않는다.
+if ! $VBIN/v-list-web-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN"; then
+  echo "  ✗ HestiaCP 에 웹도메인이 없습니다 — 중단 (계정/도메인을 확인하세요)"
+  exit 1
+fi
+
+SZ=$(du -sh "/home/$VUSER/web/$DOMAIN" 2>/dev/null | cut -f1)
+echo "  대상 파일 ${SZ:-?} · DB ${DB:-없음}"
+echo
+
+echo "[1] 웹도메인 삭제 (파일·nginx/apache 설정·SSL 포함)"
+$VBIN/v-delete-web-domain "$VUSER" "$DOMAIN"
+RC=$?
+if [ "$RC" != 0 ]; then
+  echo "  ✗ 실패 (v-delete-web-domain=$RC) — 이후 단계를 중단합니다"
+  echo "$TS FAIL domain $VUSER/$DOMAIN v-delete-web-domain=$RC" >> "$LOG"
+  exit 1
+fi
+echo "  ✓ 완료"
+
+echo "[2] DNS 도메인"
+if $VBIN/v-list-dns-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN"; then
+  $VBIN/v-delete-dns-domain "$VUSER" "$DOMAIN" && echo "  ✓ 삭제" || echo "  ✗ 실패(수동 확인 필요)"
+else
+  echo "  · 없음"
+fi
+
+echo "[3] 메일 도메인"
+if $VBIN/v-list-mail-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN"; then
+  $VBIN/v-delete-mail-domain "$VUSER" "$DOMAIN" && echo "  ✓ 삭제" || echo "  ✗ 실패(수동 확인 필요)"
+else
+  echo "  · 없음"
+fi
+
+echo "[4] 데이터베이스"
+if [ -z "$DB" ]; then
+  echo "  · 건너뜀 (대상 없음 — 미검출이거나 다른 도메인과 공유 중)"
+else
+  if $VBIN/v-list-databases "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DB"; then
+    $VBIN/v-delete-database "$VUSER" "$DB" && echo "  ✓ $DB 삭제" || echo "  ✗ $DB 삭제 실패(수동 확인 필요)"
+  else
+    echo "  ✗ $DB 는 HestiaCP 에 등록되어 있지 않습니다 — 건너뜁니다"
+    echo "    패널 밖에서 만든 DB 는 자동 삭제하지 않습니다. 필요하면 직접 처리하세요."
+  fi
+fi
+echo
+
+echo "[5] 삭제 검증"
+FAILED=0
+$VBIN/v-list-web-domains "$VUSER" plain 2>/dev/null | awk '{print $1}' | grep -qx "$DOMAIN" \
+  && { echo "  ✗ 패널에 아직 남아 있음"; FAILED=1; } || echo "  ✓ 패널에서 사라짐"
+[ -d "/home/$VUSER/web/$DOMAIN" ] \
+  && { echo "  ✗ 디렉터리 잔존: /home/$VUSER/web/$DOMAIN"; FAILED=1; } || echo "  ✓ 디렉터리 제거됨"
+if [ -n "$DB" ]; then
+  if mysql -N -B -e "SHOW DATABASES LIKE '$DB'" 2>/dev/null | grep -q .; then
+    echo "  ✗ DB 잔존: $DB"; FAILED=1
+  else
+    echo "  ✓ DB 제거됨"
+  fi
+fi
+
+echo "$TS DELETE domain $VUSER/$DOMAIN files=${SZ:-?} db=${DB:-none} verify=$([ "$FAILED" = 0 ] && echo OK || echo INCOMPLETE)" >> "$LOG"
+echo
+if [ "$FAILED" = 0 ]; then
+  echo "===== 삭제 완료 ====="
+else
+  echo "===== 삭제 불완전 — 위 ✗ 항목을 수동 확인하세요 ====="
+fi
+echo "※ hostmover 사이드바의 기록은 그대로 남아 있습니다. 필요하면 🗑 로 정리하세요."
+echo "※ 이력: $LOG"
+[ "$FAILED" = 0 ]
+"#;
+
+/// 도메인 완전 삭제 (SSH, sudo, 되돌릴 수 없음 — 확인 모달 필수).
+/// `db`가 비어 있으면 DB는 건드리지 않는다.
+pub fn build_domain_delete(s: &Settings, account: &str, domain: &str, db: &str) -> Result<Job, String> {
+    let acct = account.trim();
+    if !is_safe_name(acct) { return Err("계정 이름 형식 오류".into()); }
+    if is_protected_account(acct, s) { return Err(format!("보호 대상 계정입니다: {acct}")); }
+    let da = to_ascii_domain(domain);
+    if !is_safe_name(&da) { return Err(format!("도메인 형식 오류: {domain}")); }
+    let dbn = db.trim();
+    if !dbn.is_empty() && !is_safe_name(dbn) { return Err(format!("DB 이름 형식 오류: {db}")); }
+    let srv = ssh_admin_site(s)?;
+    let raw = DOMAIN_DELETE_BODY
+        .replace("__HM_USER__", &sq(acct))
+        .replace("__HM_DOMAIN__", &sq(&da))
+        .replace("__HM_DB__", &sq(dbn))
+        .replace("__HM_SSH_USER__", &sq(s.ssh_user.trim()));
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("도메인 서버 완전 삭제 — {acct}/{da}"),
+        script,
+        sshpass,
+        env,
+        note: format!("{acct}/{da} 파일·패널 등록·DNS·메일{} 제거", if dbn.is_empty() { "" } else { "·DB" }),
+    })
+}
+
 /// 선택 사이트의 파일+DB를 로컬로 백업 — 사이트당 tar(웹루트/앱) + mysqldump 를 한 .tar.gz 로 받아 dest 에 저장.
 pub fn build_local_backup(s: &Settings, pairs: &[(String, String)], dest: &str) -> Result<Job, String> {
     if pairs.is_empty() { return Err("백업할 사이트를 선택하세요".into()); }
@@ -4647,6 +4768,34 @@ mod tests {
             assert!(build_account_backup(&st, bad).is_err(), "보호 계정 통과: {bad}");
         }
         assert!(build_account_backup(&st, "../etc").is_err());
+    }
+
+    #[test]
+    fn domain_delete_job_safety() {
+        let st = Settings {
+            ssh_host: "1.2.3.4".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "pw".into(),
+            ..Default::default()
+        };
+        let job = build_domain_delete(&st, "rokmc", "example.com", "rokmc_wp").unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 오류:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(job.script.contains("v-delete-web-domain"));
+        assert!(!job.script.contains("rm -rf /home"), "웹루트 직접 삭제 금지");
+        assert!(job.script.contains("v-delete-database"));
+        assert!(job.script.contains("deletions.log"));
+        assert!(job.script.contains("보호 대상 계정입니다"), "원격 측 2차 방어 누락");
+        let without_db = build_domain_delete(&st, "rokmc", "example.com", "").unwrap();
+        assert!(without_db.script.contains("DB=''"), "빈 DB 주입 형식 확인");
+        for bad in ["admin", "root", "tong"] {
+            assert!(build_domain_delete(&st, bad, "example.com", "").is_err());
+        }
+        assert!(build_domain_delete(&st, "rokmc", "example.com", "db'x").is_err());
+        assert!(build_domain_delete(&st, "rokmc", "../etc", "").is_err());
     }
 
     #[test]

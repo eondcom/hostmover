@@ -81,6 +81,7 @@ enum AcctTab {
 enum DangerRun {
     Probe,
     Backup,
+    Delete,
 }
 
 /// 비번 변경 실행 경로 — 화면마다 접속 방식이 다르다
@@ -436,6 +437,8 @@ pub struct App {
     danger_db_shared: bool,
     /// 현재 실행 중인 위험 작업 단계
     danger_running: Option<DangerRun>,
+    /// 되돌릴 수 없는 삭제 전용 확인 모달 (작업, 타이핑할 대상명)
+    danger_confirm: Option<(ops::Job, String)>,
     /// WordPress 관리자 비번 변경 모달 (열려 있으면 Some)
     wp_pw_dlg: Option<WpPwDialog>,
     /// 생성일(HestiaCP DATE)을 이미 조회한 계정 집합(세션 중 중복조회 방지)
@@ -541,6 +544,7 @@ impl App {
             danger_db: String::new(),
             danger_db_shared: false,
             danger_running: None,
+            danger_confirm: None,
             wp_pw_dlg: None,
             site_dates_req: std::collections::HashSet::new(),
             site_perms_req: std::collections::HashSet::new(),
@@ -1330,6 +1334,7 @@ impl App {
         self.danger_confirm_text.clear();
         self.danger_db.clear();
         self.danger_db_shared = false;
+        self.danger_confirm = None;
     }
 
     /// 🧩 계정 관리 페이지 — 사이트 / 모듈 / 메모 / 위험 작업
@@ -1358,6 +1363,7 @@ impl App {
         let mut do_wp_pw = false;
         let mut do_danger_probe: Option<String> = None;
         let mut do_danger_backup: Option<String> = None;
+        let mut do_danger_delete: Option<String> = None;
         let mut alias_loads: Vec<(String, String)> = Vec::new();
         let mut sel_all_sites: Option<bool> = None;
         let mut select_all = None;
@@ -1627,7 +1633,30 @@ impl App {
                         ui.heading("3단계: 서버에서 완전 삭제");
                         ui.separator();
                         ui.colored_label(egui::Color32::from_rgb(220, 90, 90), "⚠ 되돌릴 수 없습니다.");
-                        ui.add_enabled(false, egui::Button::new("서버에서 완전 삭제"));
+                        if self.danger_db_shared {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 150, 60),
+                                "⚠ 이 DB는 다른 도메인도 사용 중 — DB는 삭제하지 않습니다",
+                            );
+                        } else if self.danger_db.is_empty() {
+                            ui.label("DB를 찾지 못해 삭제하지 않습니다.");
+                        } else {
+                            ui.label(format!("DB {}도 함께 삭제됩니다.", self.danger_db));
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(format!("확인을 위해 {} 을(를) 입력하세요:", self.danger_domain));
+                            ui.add(egui::TextEdit::singleline(&mut self.danger_confirm_text).desired_width(220.0));
+                        });
+                        let armed = self.danger_probed
+                            && self.danger_backed_up
+                            && self.danger_confirm_text.trim() == self.danger_domain;
+                        if ui.add_enabled(
+                            !running && armed,
+                            egui::Button::new(format!("{}  서버에서 완전 삭제", ph::WARNING))
+                                .fill(egui::Color32::from_rgb(200, 70, 70)),
+                        ).clicked() {
+                            do_danger_delete = Some(self.danger_domain.clone());
+                        }
                     }
                 }
             }
@@ -1714,6 +1743,21 @@ impl App {
                     self.last_ok = Some(false);
                     self.status = format!("백업 실패: {e}");
                     self.log.push(format!("삭제 전 백업: {e}"));
+                }
+            }
+        }
+        if let Some(domain) = do_danger_delete {
+            // 공유 중이면 DB 이름을 절대 전달하지 않는다.
+            let db = if self.danger_db_shared { "" } else { self.danger_db.as_str() };
+            match ops::build_domain_delete(&self.store.settings, &acct, &domain, db) {
+                Ok(job) => {
+                    self.danger_confirm_text.clear();
+                    self.danger_confirm = Some((job, domain));
+                }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = format!("삭제 준비 실패: {e}");
+                    self.log.push(format!("도메인 삭제: {e}"));
                 }
             }
         }
@@ -2320,6 +2364,11 @@ impl App {
                         Some(DangerRun::Backup) => {
                             self.danger_backed_up = ok;
                         }
+                        Some(DangerRun::Delete) => {
+                            if ok {
+                                self.reset_danger_progress();
+                            }
+                        }
                         None => {}
                     }
                     // 업데이트 작업 완료 → 선택 사이트 자동 재스캔 예약 (성공 시)
@@ -2476,6 +2525,9 @@ impl eframe::App for App {
         }
         if self.eond_confirm.is_some() {
             self.eond_confirm_modal(ctx);
+        }
+        if self.danger_confirm.is_some() {
+            self.danger_confirm_modal(ctx);
         }
         if self.pending_delete.is_some() {
             self.delete_modal(ctx);
@@ -4054,6 +4106,61 @@ impl App {
             }
         }
         if !close { self.wp_pw_dlg = Some(d); }
+    }
+
+    /// 되돌릴 수 없는 서버 삭제 전용 확인 모달.
+    fn danger_confirm_modal(&mut self, ctx: &egui::Context) {
+        let (title, note, expected) = match &self.danger_confirm {
+            Some((job, expected)) => (job.title.clone(), job.note.clone(), expected.clone()),
+            None => return,
+        };
+        let host = if self.store.settings.ssh_host.trim().is_empty() {
+            self.store.settings.hestia_host.trim().to_string()
+        } else {
+            self.store.settings.ssh_host.trim().to_string()
+        };
+        egui::Window::new("⚠ 되돌릴 수 없는 삭제")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.strong(title);
+                ui.label(format!("서버: {host}"));
+                ui.label(format!("대상: {expected}"));
+                ui.label(note);
+                ui.add_space(6.0);
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 80),
+                    "이 작업은 되돌릴 수 없습니다. 백업에서 복원하는 것만 가능합니다.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(format!("{expected} 입력:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.danger_confirm_text).desired_width(240.0));
+                });
+                let armed = self.danger_confirm_text.trim() == expected;
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(
+                        !self.running && armed,
+                        egui::Button::new(format!("{}  완전 삭제 실행", ph::WARNING))
+                            .fill(egui::Color32::from_rgb(200, 70, 70)),
+                    ).clicked() {
+                        if let Some((job, _)) = self.danger_confirm.take() {
+                            self.running = true;
+                            self.last_ok = None;
+                            self.danger_running = Some(DangerRun::Delete);
+                            self.status = "서버 완전 삭제 실행 중...".into();
+                            self.danger_confirm_text.clear();
+                            let ctx2 = ctx.clone();
+                            ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
+                        }
+                    }
+                    if ui.button("취소").clicked() {
+                        self.danger_confirm = None;
+                        self.danger_confirm_text.clear();
+                    }
+                });
+            });
     }
 
     fn eond_confirm_modal(&mut self, ctx: &egui::Context) {
