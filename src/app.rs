@@ -3,6 +3,7 @@ use crate::ops::{self, LogMsg, OpKind};
 use crate::store;
 use egui_phosphor::regular as ph;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 /// 묶음 이전 종류
@@ -2839,9 +2840,11 @@ impl App {
             let mut rx_upload: Option<bool> = None;
             let mut dryrun = false;
             let mut delete_domain = false;
+            let mut open_backup_dir = false;
 
             let domain = &mut self.store.customers[ci].domains[di];
             let domain_name = domain.name.clone();
+            let backup_dir = ops::domain_backup_dir(&customer_name, &domain_name);
             // 도메인마다 위젯 ID를 분리해 편집 상태(커서/IME)가 도메인 간 공유되는 버그 방지
             let did = domain.id;
 
@@ -2973,6 +2976,17 @@ impl App {
                             card(&mut cols[0], |ui| {
                                 ui.strong("개별 작업");
                                 ui.label(egui::RichText::new("백업: 현재→로컬 / 복원: 로컬→신규").weak());
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!(
+                                            "DB 저장: {}/db_<타임스탬프>.sql.gz",
+                                            backup_dir.display()
+                                        ))
+                                        .monospace()
+                                        .small(),
+                                    )
+                                    .wrap(),
+                                );
                                 ui.add_space(4.0);
                                 for (label, kind) in [
                                     (format!("{}  DB 백업", ph::ARROW_LINE_DOWN), OpKind::DbBackup),
@@ -2984,8 +2998,14 @@ impl App {
                                         if ui.add_enabled(!running, egui::Button::new(&label).min_size(egui::vec2(132.0, 0.0))).clicked() {
                                             request = Some((Req::Op(kind), customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
                                         }
-                                        if ui.button(ph::FILE_TEXT).on_hover_text("명령어만 보기/복사").clicked() {
+                                        if ui.button(format!("{}  명령어 보기/복사", ph::COPY)).on_hover_text("실행할 명령어 보기/복사").clicked() {
                                             view_request = Some((kind, customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
+                                        }
+                                        if ui.button(format!("{}  폴더 열기", ph::FOLDER_OPEN))
+                                            .on_hover_text(format!("백업 폴더 열기: {}", backup_dir.display()))
+                                            .clicked()
+                                        {
+                                            open_backup_dir = true;
                                         }
                                     });
                                 }
@@ -3423,6 +3443,20 @@ impl App {
             } else if changed {
                 self.dirty = true;
                 self.last_edit = ctx.input(|i| i.time);
+            }
+
+            if open_backup_dir {
+                match open_local_directory(&backup_dir) {
+                    Ok(()) => {
+                        self.status = format!("백업 폴더 열기: {}", backup_dir.display());
+                        self.last_ok = Some(true);
+                    }
+                    Err(e) => {
+                        self.status = format!("백업 폴더 열기 실패: {e}");
+                        self.log.push(self.status.clone());
+                        self.last_ok = Some(false);
+                    }
+                }
             }
 
             // 명령어 보기: 실행하지 않고 명령만 생성해 모달에 표시
@@ -4113,6 +4147,27 @@ fn puny_if_different(s: &str) -> Option<String> {
     } else {
         Some(p)
     }
+}
+
+/// 운영체제의 파일 관리자로 로컬 디렉터리를 연다. 아직 없으면 먼저 생성한다.
+fn open_local_directory(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| format!("폴더 생성 실패 ({}): {e}", path.display()))?;
+
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("explorer");
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    return Err("이 운영체제에서는 폴더 열기를 지원하지 않습니다".into());
+
+    command
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("파일 관리자 실행 실패: {e}"))
 }
 
 /// 도메인 입력 행: 한글 도메인(편집)+복사 + 퓨니코드(읽기전용, 복사 가능) 둘 다 표시
