@@ -154,9 +154,14 @@ fn overall_grade(items: &[(String, Grade, bool /*is_monitoring*/)]) -> Option<Gr
 
 ```
 디스크
-  ● /home    운영   82%  170G 남음   inode 9%   SMART PASSED            B
-  ● /backup  백업   94%  110G 남음   inode 1%   SMART FAILED! 섹터 60   E
+  ● /home    운영   82%  170G 남음  inode 9%  SMART PASSED           +0.21%p/일 · 95%까지 61일   B
+  ● /backup  백업   94%  110G 남음  inode 1%  SMART FAILED! 섹터 60  +0.43%p/일 · 95%까지 2일    E
 ```
+
+- **추이는 디스크마다 따로** 보여준다. 위 예에서 `/home` 은 두 달 여유인데 `/backup` 은 이틀 뒤
+  꽉 찬다 — 이 차이가 이 기능의 핵심이다
+- `rate` 가 `-` 면 `추이 데이터 쌓이는 중` (감시 설치 후 2일 필요)
+- `eta` 가 `-` 면 증가하지 않는 것이므로 예상일을 적지 않는다(감소 중일 수도 있다)
 
 - 앞의 `●` 를 디스크 등급 색으로 칠한다
 - 역할은 `운영`/`백업`/`기타` 로 한글 표시
@@ -269,11 +274,11 @@ echo "HM_DASH_SOCKDUP=$DUP"
 | 감소 추세(80→69%) | `하루 -1.10%p`, ETA 빈 값 |
 | 이미 95% 초과 | RATE 계산, ETA 빈 값 |
 
-**한계 (이번 범위 밖)**: 추이는 디스크 감시가 남기는 `history.tsv` 의 `use%` 컬럼을 쓰는데,
-이 값은 **그날의 최대 사용률 하나**다. 따라서 추이·95% 도달 예상은 "가장 많이 찬 디스크" 기준이고
-디스크별로 나뉘지 않는다. 디스크별 추이가 필요하면 감시 스크립트(`hm-disk-monitor.sh`)가
-`disk-usage.tsv`(`날짜 · 마운트포인트 · 사용률`)를 따로 남기도록 고쳐야 한다 — **별도 지시서로 다룬다.**
-지금은 추이 문구에 어느 마운트포인트 기준인지(`disk_max_mp`)를 함께 표시해 오해를 막는다.
+이 값(`HM_DASH_DISKRATE`)은 `history.tsv` 의 `use%` 를 쓰는데 그건 **그날의 최대 사용률 하나**라
+디스크별로 나뉘지 않는다. **디스크별 추이는 §3-1-2 에서 따로 만든다.**
+
+둘 다 유지한다: 감시가 오래 돌아 `history.tsv` 는 쌓였는데 `disk-usage.tsv` 는 이제 시작하는
+전환기가 있기 때문이다. **표시는 디스크별 추이를 우선**하고, 없을 때만 전체 추이를 쓴다.
 
 ### 3-1-1. 디스크별 수집 — 같은 스냅샷 안에 이어서 추가
 
@@ -312,6 +317,25 @@ smart_of() {   # $1=물리디스크명(sda) → "상태 realloc pending 가동h 
   printf '%s' "$H $RS $PS $POH $TMP"
 }
 
+DUSAGE=/var/lib/hm-disk-monitor/disk-usage.tsv
+trend_of() {   # $1=마운트포인트 → "하루당%p 95%도달일 관측일수" (없으면 "- - -")
+  local MP="$1" ROWS N F L D1 U1 D2 U2 S1 S2 DAYS RATE ETA
+  [ -s "$DUSAGE" ] || { printf -- '- - -'; return; }
+  ROWS=$(awk -F'\t' -v m="$MP" '$1!="date" && $2==m' "$DUSAGE" 2>/dev/null | tail -60)
+  N=$(printf '%s\n' "$ROWS" | grep -c .)
+  if [ "${N:-0}" -lt 2 ] 2>/dev/null; then printf -- '- - -'; return; fi
+  F=$(printf '%s\n' "$ROWS" | head -1); L=$(printf '%s\n' "$ROWS" | tail -1)
+  D1=$(printf '%s' "$F" | cut -f1); U1=$(printf '%s' "$F" | cut -f4)
+  D2=$(printf '%s' "$L" | cut -f1); U2=$(printf '%s' "$L" | cut -f4)
+  S1=$(date -d "$D1" +%s 2>/dev/null); S2=$(date -d "$D2" +%s 2>/dev/null)
+  if [ -z "$S1" ] || [ -z "$S2" ]; then printf -- '- - -'; return; fi
+  DAYS=$(( (S2 - S1) / 86400 ))
+  if [ "$DAYS" -le 0 ] 2>/dev/null; then printf -- '- - -'; return; fi
+  RATE=$(awk -v a="$U1" -v b="$U2" -v d="$DAYS" 'BEGIN{printf "%.2f", (b-a)/d}')
+  ETA=$(awk -v u="$U2" -v r="$RATE" 'BEGIN{ if (r > 0.02 && u < 95) printf "%d", (95-u)/r }')
+  printf -- '%s %s %s' "$RATE" "${ETA:--}" "$DAYS"
+}
+
 NDISK=0
 while read -r FS SZ USED AVAIL PCT MP; do
   case "$FS" in /dev/*) ;; *) continue ;; esac
@@ -335,10 +359,15 @@ while read -r FS SZ USED AVAIL PCT MP; do
     /|/home|/home/*|/var|/var/*) ROLE=main ;;
   esac
   SM=$(smart_of "$PK")
+  TR=$(trend_of "$MP")
   NDISK=$((NDISK + 1))
-  printf '  %-14s %-16s %-7s %4s%%  %6s 남음  inode %3s%%  %s\n' "$MP" "$FS" "$ROLE" "$P" "$AVAIL" "$IP" "$SM"
-  # 마커: 마운트포인트 장치 물리디스크 역할 사용% 남은 inode% FS에러 SMART realloc pending 가동h 온도
-  printf 'HM_DISK %s %s %s %s %s %s %s %s %s\n' "$MP" "$FS" "$PK" "$ROLE" "$P" "$AVAIL" "$IP" "$FE" "$SM"
+  RATE=$(printf '%s' "$TR" | awk '{print $1}'); ETA=$(printf '%s' "$TR" | awk '{print $2}')
+  TRTXT=""
+  [ "$RATE" != "-" ] && TRTXT="  추이 ${RATE}%p/일"
+  [ "$ETA" != "-" ] && [ -n "$ETA" ] && TRTXT="$TRTXT (95% 약 ${ETA}일 후)"
+  printf '  %-14s %-16s %-7s %4s%%  %6s 남음  inode %3s%%  %s%s\n' "$MP" "$FS" "$ROLE" "$P" "$AVAIL" "$IP" "$SM" "$TRTXT"
+  # 마커 16필드: 마운트포인트 장치 물리디스크 역할 사용% 남은 inode% FS에러 SMART realloc pending 가동h 온도 추이 95%도달일 관측일수
+  printf 'HM_DISK %s %s %s %s %s %s %s %s %s %s\n' "$MP" "$FS" "$PK" "$ROLE" "$P" "$AVAIL" "$IP" "$FE" "$SM" "$TR"
 done < <(df -hP 2>/dev/null | awk 'NR>1')
 
 [ "$NDISK" = 0 ] && echo "  (검사 가능한 디스크를 찾지 못했습니다)"
@@ -349,17 +378,20 @@ rm -f "$SMCACHE"
 검증한 동작 (운영 `/home` 82%, 백업 `/backup` 94% + SMART 불량 시나리오):
 
 ```
-  /home          /dev/sda1        main      82%    170G 남음  inode   9%  PASSED 0 0 43800 41
-HM_DISK /home /dev/sda1 sda main 82 170G 9 0 PASSED 0 0 43800 41
-  /backup        /dev/sdb1        backup    94%    110G 남음  inode   1%  FAILED! 48 12 43800 41
-HM_DISK /backup /dev/sdb1 sdb backup 94 110G 1 3 FAILED! 48 12 43800 41
+  /home     /dev/sda1  main    82%  170G 남음  inode  9%  PASSED  0  0 43800 41  추이 0.21%p/일 (95% 약 61일 후)
+HM_DISK /home /dev/sda1 sda main 82 170G 9 0 PASSED 0 0 43800 41 0.21 61 14
+  /backup   /dev/sdb1  backup  94%  110G 남음  inode  1%  FAILED! 48 12 43800 41  추이 0.43%p/일 (95% 약 2일 후)
+HM_DISK /backup /dev/sdb1 sdb backup 94 110G 1 3 FAILED! 48 12 43800 41 0.43 2 14
 HM_DASH_DISKN=2
 ```
+
+**디스크마다 증가 속도가 다르게 나온다** — 같은 서버에서 `/home` 은 61일 여유인데
+`/backup` 은 2일 뒤 꽉 찬다. 최대값 하나로 뭉쳤다면 절대 드러나지 않을 정보다.
 
 설계 메모:
 
 - `HM_DISK` 는 도메인 헬스의 `HM_DOMH` 와 같은 "한 줄에 한 건" 형식이다. 파싱도 같은 방식.
-  필드는 `마운트포인트 장치 물리디스크 역할 사용% 남은용량 inode% FS에러 SMART realloc pending 가동h 온도` **13개**.
+  필드는 `마운트포인트 장치 물리디스크 역할 사용% 남은용량 inode% FS에러 SMART realloc pending 가동h 온도 추이 95%도달일 관측일수` **16개**.
 - SMART 는 **물리 디스크** 단위다. 파티션(`/dev/sda1`)에서 `lsblk -no PKNAME` 으로 부모(`sda`)를
   찾아 조회하고, 같은 디스크를 두 번 묻지 않도록 캐시한다(파티션이 여러 개면 느려진다).
 - `/boot`·`/efi` 는 운영 지표가 아니라 제외한다. 실측에서 `/boot/efi` 가 섞여 나왔다.
@@ -403,6 +435,9 @@ pub struct DiskHealth {
     #[serde(default)] pub pending: String,   // "-" 가능
     #[serde(default)] pub power_h: String,   // "-" 가능
     #[serde(default)] pub temp_c: String,    // "-" 가능
+    #[serde(default)] pub rate: String,      // 하루당 %p ("-" = 데이터 부족)
+    #[serde(default)] pub eta: String,       // 95% 도달 예상일 ("-" = 해당 없음)
+    #[serde(default)] pub span: String,      // 추이 관측 일수
 }
 ```
 
@@ -420,7 +455,9 @@ fn advisories(store: &Store) -> Vec<(String /*문구*/, Option<&'static str> /*�
 
 | 조건 | 문구 | 바로가기 |
 |---|---|---|
-| `disk_eta` 가 있고 ≤60 | `디스크가 약 N일 후 95% 도달 예상 (하루 R%p) — 정리 계획이 필요합니다` | 디스크 점검 |
+| 디스크별 `eta` 가 있고 <=30 | `M 디스크가 약 N일 후 95% 도달 예상 (하루 R%p) — 정리가 시급합니다` | 디스크 점검 |
+| 디스크별 `eta` 가 있고 <=90 | `M 디스크가 약 N일 후 95% 도달 예상 — 정리 계획이 필요합니다` | 디스크 점검 |
+| 위가 없고 `disk_eta` <=60 (전체 추이 폴백) | `디스크(M 기준)가 약 N일 후 95% 도달 예상` | 디스크 점검 |
 | `disk_rate` 가 비었고 `diskmon=="1"` | `디스크 추이 데이터가 부족합니다 — 며칠 더 쌓이면 증가 속도를 알 수 있습니다` | — |
 | `backup_src` 가 빈 문자열 | `/backup 이 없습니다 — 계정 백업(v-backup-user)이 실패할 수 있습니다` | — |
 | `backup_same == "1"` | `/backup 이 /home 과 같은 파티션입니다 — 큰 계정 백업 시 디스크를 채울 수 있습니다` | — |
@@ -440,6 +477,44 @@ fn advisories(store: &Store) -> Vec<(String /*문구*/, Option<&'static str> /*�
 - 권고 문구는 왜 문제인지까지 담는다. "디스크 69%" 만으로는 사용자가 판단할 수 없다.
 
 ---
+
+### 3-1-2. 디스크별 추이의 원천 — 감시 스크립트에 일일 기록 추가
+
+디스크별 추이를 내려면 **디스크마다 매일 사용률이 기록되어야** 한다. 지금 감시 스크립트
+(`hm-disk-monitor.sh`, `DISK_MONITOR_INSTALL_BODY` 안)는 `history.tsv` 에 최대값 하나만 남긴다.
+
+**`[용량]` 섹션에 아래를 추가한다.** 기존 `history.tsv` 는 건드리지 않는다(하위호환).
+
+```sh
+DUSAGE="$STATE/disk-usage.tsv"
+mkdir -p "$STATE"
+
+[ -s "$DUSAGE" ] || printf 'date\tmount\tdevice\tuse\tavail\n' > "$DUSAGE"
+# 같은 날 재실행이면 그날 줄을 갈아끼운다(하루 디스크당 1행 유지)
+if grep -q "^$DAY"$'\t' "$DUSAGE" 2>/dev/null; then
+  grep -v "^$DAY"$'\t' "$DUSAGE" > "$DUSAGE.tmp" && mv "$DUSAGE.tmp" "$DUSAGE"
+fi
+
+while read -r FS SZ USED AVAIL PCT MP; do
+  case "$FS" in /dev/*) ;; *) continue ;; esac
+  case "$MP" in /boot*|/efi*) continue ;; esac
+  printf '%s\t%s\t%s\t%s\t%s\n' "$DAY" "$MP" "$FS" "${PCT%\%}" "$AVAIL" >> "$DUSAGE"
+done < <(df -hP 2>/dev/null | awk 'NR>1')
+
+# 오래된 기록 정리 — 디스크 3개 * 3년이면 3천 줄 남짓이라 부담은 없지만 무한 증가는 막는다
+LINES=$(grep -c . "$DUSAGE" 2>/dev/null)
+if [ "${LINES:-0}" -gt 5000 ] 2>/dev/null; then
+  { head -n 1 "$DUSAGE"; tail -n 4000 "$DUSAGE" | grep -v '^date'; } > "$DUSAGE.tmp" && mv "$DUSAGE.tmp" "$DUSAGE"
+fi
+```
+
+- 파일: `/var/lib/hm-disk-monitor/disk-usage.tsv` — `날짜 · 마운트포인트 · 장치 · 사용률 · 남은용량`
+- 하루에 디스크당 1행. 같은 날 재실행하면 그날 줄을 갈아끼운다
+- 5000줄을 넘으면 최근 4000줄만 남긴다(디스크 3개 × 3년이면 3천 줄 남짓이라 여유롭다)
+- **감시를 다시 설치해야 적용된다.** 설치 후 최소 2일이 지나야 추이가 나온다
+  (그전에는 `-` 로 나오고 UI 는 "데이터 쌓이는 중" 으로 표시한다)
+
+검증한 동작: 1일차 기록 → 같은 날 재실행 시 줄 수 유지(중복 없음) → 2·3일차 누적.
 
 ## 4. Phase 6-C — 도메인 헬스 목록 UI (스크롤·복사)
 
@@ -521,7 +596,7 @@ fn domain_health_tsv_export() {
 8. **디스크를 최대값 하나로 뭉치지 말 것.** 운영과 백업은 성격이 다르고, 백업 디스크가 차면
    백업이 실패한다는 사실이 최대값 하나로는 드러나지 않는다.
 9. SMART 조회불가(`-`)를 A 로 처리하지 말 것. smartmontools 미설치 서버가 영원히 "우수"가 된다.
-10. `HM_DISK` 줄의 필드 수가 13이 아니면 그 줄을 **버린다**. 마운트포인트에 공백이 들어가면
+10. `HM_DISK` 줄의 필드 수가 16이 아니면 그 줄을 **버린다**. 마운트포인트에 공백이 들어가면
     열이 밀려 엉뚱한 값이 등급에 들어간다.
 
 ---
@@ -541,4 +616,7 @@ fn domain_health_tsv_export() {
 - [ ] 운영 A + 백업 E 상황에서 디스크 항목 등급이 **E** 가 된다(최대값 뭉개기 아님)
 - [ ] SMART `-` 인 디스크가 C 로 잡힌다(A 가 아님)
 - [ ] 백업 디스크가 90% 이상이거나 D 이하면 권고에 뜬다
+- [ ] **디스크마다 추이가 따로** 표시된다(운영 61일 / 백업 2일처럼 다른 값)
+- [ ] 감시 스크립트가 `disk-usage.tsv` 를 하루 디스크당 1행으로 남긴다(같은 날 재실행 시 중복 없음)
+- [ ] `disk-usage.tsv` 가 없거나 1일치뿐이면 `추이 데이터 쌓이는 중` 으로 표시된다
 - [ ] `docs/dashboard.md` 에 등급표(§2-2)·디스크별 규칙(§2-2-1)·총합 규칙(§2-3)·복사 형식을 추가
