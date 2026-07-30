@@ -2503,8 +2503,8 @@ issue_of() {
     case "$PH" in 2*|3*) ;; 000) M="$M${M:+ · }응답 없음(타임아웃/거부)" ;; *) M="$M${M:+ · }HTTP $PH" ;; esac
   fi
   if [ "$CD" != "-" ]; then
-    if [ "$CD" -lt 0 ] 2>/dev/null; then M="$M${M:+ · }인증서 만료됨"
-    elif [ "$CD" -le 14 ] 2>/dev/null; then M="$M${M:+ · }인증서 D-$CD"; fi
+    if [ "$CD" -lt 0 ] 2>/dev/null; then M="$M${M:+ · }인증서 만료 — 접속이 차단됩니다"
+    elif [ "$CD" -le 14 ] 2>/dev/null; then M="$M${M:+ · }인증서 D-$CD — 자동 갱신이 실패하고 있을 수 있습니다"; fi
   fi
   printf '%s' "$M"
 }
@@ -4851,6 +4851,7 @@ mod tests {
         }
         assert!(DOMAIN_HEALTH_BODY.contains("getent ahostsv4"));
         assert!(DOMAIN_HEALTH_BODY.contains("case \"$PH\" in 2*|3*)"));
+        assert!(DOMAIN_HEALTH_BODY.contains("자동 갱신이 실패하고 있을 수 있습니다"));
     }
 
     #[test]

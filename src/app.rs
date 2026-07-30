@@ -104,6 +104,54 @@ fn local_stats(store: &Store) -> LocalStats {
     }
 }
 
+fn dashboard_is_narrow(width: f32) -> bool {
+    width < 900.0
+}
+
+/// 등록·사이트·주의 카드 한 칸. 전체 사이트 이동 요청 여부를 반환한다.
+fn dashboard_stat_card(ui: &mut egui::Ui, index: usize, stats: &LocalStats, cache_at: i64) -> bool {
+    let mut go_all = false;
+    card(ui, |ui| match index {
+        0 => {
+            ui.strong("등록 현황");
+            ui.add_space(7.0);
+            egui::Grid::new(("dash_local_registered", index)).num_columns(2).show(ui, |ui| {
+                ui.label("고객"); ui.heading(stats.customers.to_string()); ui.end_row();
+                ui.label("도메인"); ui.heading(stats.domains.to_string()); ui.end_row();
+                ui.label("휴지통"); ui.heading(stats.customers_trash.to_string()); ui.end_row();
+            });
+        }
+        1 => {
+            ui.strong("서버 사이트");
+            ui.add_space(7.0);
+            if stats.sites == 0 {
+                ui.label("아직 스캔하지 않았습니다.");
+                if ui.link("전체 사이트에서 스캔").clicked() { go_all = true; }
+            } else {
+                ui.horizontal(|ui| { ui.label("사이트"); ui.heading(stats.sites.to_string()); });
+                for (kind, count) in stats.by_kind.iter().take(4) { ui.label(format!("{kind}  {count}")); }
+                ui.label(format!("파일 {} · DB {}", human_bytes(stats.file_bytes), human_bytes(stats.db_bytes)));
+                ui.weak(format!("{} 기준", ago_text(cache_at)));
+            }
+        }
+        _ => {
+            ui.strong("주의");
+            ui.add_space(7.0);
+            if stats.need_update == 0 && stats.no_cred == 0 {
+                ui.colored_label(C_GREEN, "이상 없음");
+            } else {
+                if stats.need_update > 0 {
+                    ui.colored_label(egui::Color32::from_rgb(220, 150, 60), format!("{}  업데이트 필요 {}", ph::WARNING, stats.need_update));
+                }
+                if stats.no_cred > 0 {
+                    ui.colored_label(egui::Color32::from_rgb(220, 150, 60), format!("{}  자격증명 미입력 {}", ph::WARNING, stats.no_cred));
+                }
+            }
+        }
+    });
+    go_all
+}
+
 fn server_snapshot_from_markers(values: &HashMap<String, String>) -> ServerSnapshot {
     let get = |key: &str| values.get(key).cloned().unwrap_or_default();
     ServerSnapshot {
@@ -166,8 +214,8 @@ fn domain_issue(h: &DomainHealth) -> Option<String> {
     }
     if h.cert_days != "-" {
         if let Ok(days) = h.cert_days.parse::<i32>() {
-            if days < 0 { issues.push("인증서 만료됨".to_string()); }
-            else if days <= 14 { issues.push(format!("인증서 D-{days}")); }
+            if days < 0 { issues.push("인증서 만료 — 접속이 차단됩니다".to_string()); }
+            else if days <= 14 { issues.push(format!("인증서 D-{days} — 자동 갱신이 실패하고 있을 수 있습니다")); }
         }
     }
     if issues.is_empty() { None } else { Some(issues.join(" · ")) }
@@ -301,8 +349,8 @@ fn grade_items(store: &Store) -> Vec<(String, Grade, bool, String)> {
         let expired = store.domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| d < 0)).count();
         let soon = store.domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| (0..=14).contains(&d))).count();
         let grade = if expired >= 2 { Grade::E } else if expired == 1 { Grade::D }
-            else if soon >= 3 { Grade::C } else if soon > 0 { Grade::B } else { Grade::A };
-        items.push(("인증서".into(), grade, false, format!("만료 {expired}건 · 14일 이내 {soon}건")));
+            else if soon > 0 { Grade::C } else { Grade::A };
+        items.push(("인증서".into(), grade, false, format!("만료 {expired}건 · 자동 갱신 실패 가능(D-14 이내) {soon}건")));
     }
     items
 }
@@ -365,7 +413,13 @@ fn advisories(store: &Store) -> Vec<(String, Option<&'static str>)> {
         out.push(("도메인 헬스를 아직 점검하지 않았습니다 — 서버가 멀쩡해도 개별 사이트는 죽어 있을 수 있습니다".into(), Some("도메인 점검")));
     } else {
         let soon = store.domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| (0..=14).contains(&d))).count();
-        if soon > 0 { out.push((format!("인증서 만료 임박 {soon}건 — 갱신 실패로 조용히 쌓입니다"), Some("아래 목록"))); }
+        if soon > 0 {
+            out.push((format!("인증서 D-14 이내 {soon}건 — 자동 갱신이 실패하고 있을 수 있습니다"), Some("아래 목록")));
+            let dns_other = store.domain_health.iter().filter(|h| h.dns == "other" && h.cert_days.parse::<i32>().is_ok_and(|d| (0..=14).contains(&d))).count();
+            if dns_other > 0 {
+                out.push((format!("{dns_other}건은 DNS가 다른 서버를 가리켜 갱신 검증이 실패한 것으로 보입니다"), Some("아래 목록")));
+            }
+        }
     }
     out
 }
@@ -1148,6 +1202,10 @@ impl App {
         let mut copy_domains: Option<bool> = None;
         let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+          egui::ScrollArea::vertical()
+            .id_salt("dashboard_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(format!("{}  대시보드", ph::GAUGE));
                 ui.label(egui::RichText::new(version_line()).weak().small().monospace());
@@ -1263,46 +1321,18 @@ impl App {
                 }
             });
             ui.add_space(10.0);
-            ui.columns(3, |cols| {
-                card(&mut cols[0], |ui| {
-                    ui.strong("등록 현황");
-                    ui.add_space(7.0);
-                    egui::Grid::new("dash_local_registered").num_columns(2).show(ui, |ui| {
-                        ui.label("고객"); ui.heading(stats.customers.to_string()); ui.end_row();
-                        ui.label("도메인"); ui.heading(stats.domains.to_string()); ui.end_row();
-                        ui.label("휴지통"); ui.heading(stats.customers_trash.to_string()); ui.end_row();
-                    });
-                });
-                card(&mut cols[1], |ui| {
-                    ui.strong("서버 사이트");
-                    ui.add_space(7.0);
-                    if stats.sites == 0 {
-                        ui.label("아직 스캔하지 않았습니다.");
-                        if ui.link("전체 사이트에서 스캔").clicked() { go_all = true; }
-                    } else {
-                        ui.horizontal(|ui| { ui.label("사이트"); ui.heading(stats.sites.to_string()); });
-                        for (kind, count) in stats.by_kind.iter().take(4) {
-                            ui.label(format!("{kind}  {count}"));
-                        }
-                        ui.label(format!("파일 {} · DB {}", human_bytes(stats.file_bytes), human_bytes(stats.db_bytes)));
-                        ui.weak(format!("{} 기준", ago_text(cache_at)));
+            if dashboard_is_narrow(ui.available_width()) {
+                for index in 0..3 {
+                    go_all |= dashboard_stat_card(ui, index, &stats, cache_at);
+                    if index < 2 { ui.add_space(8.0); }
+                }
+            } else {
+                ui.columns(3, |cols| {
+                    for (index, col) in cols.iter_mut().enumerate() {
+                        go_all |= dashboard_stat_card(col, index, &stats, cache_at);
                     }
                 });
-                card(&mut cols[2], |ui| {
-                    ui.strong("주의");
-                    ui.add_space(7.0);
-                    if stats.need_update == 0 && stats.no_cred == 0 {
-                        ui.colored_label(C_GREEN, "이상 없음");
-                    } else {
-                        if stats.need_update > 0 {
-                            ui.colored_label(egui::Color32::from_rgb(220, 150, 60), format!("{}  업데이트 필요 {}", ph::WARNING, stats.need_update));
-                        }
-                        if stats.no_cred > 0 {
-                            ui.colored_label(egui::Color32::from_rgb(220, 150, 60), format!("{}  자격증명 미입력 {}", ph::WARNING, stats.no_cred));
-                        }
-                    }
-                });
-            });
+            }
             ui.add_space(10.0);
             card(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1441,6 +1471,7 @@ impl App {
                 if ui.button("디스크 점검").clicked() { go_disk = true; }
                 if ui.button("설정").clicked() { go_settings = true; }
             });
+          });
         });
         if go_all { self.view = MainView::AllSites; }
         if go_bulk { self.view = MainView::Settings; self.settings_tab = SettingsTab::BulkUpdate; }
@@ -5061,12 +5092,32 @@ mod tests {
         let mut h = healthy_domain(); h.cert_days = "-1".into();
         assert!(domain_issue(&h).is_some());
         let mut h = healthy_domain(); h.cert_days = "3".into();
-        assert!(domain_issue(&h).is_some());
+        assert!(domain_issue(&h).is_some_and(|reason| reason.contains("자동 갱신이 실패")));
 
         // 기본 vhost가 로컬 200을 돌려줘도 DNS가 없으면 정상으로 오인하면 안 된다.
         let mut h = healthy_domain();
         h.dns = "none".into(); h.local_code = "200".into();
         assert!(domain_issue(&h).is_some());
+    }
+
+    #[test]
+    fn dashboard_layout_and_certificate_guidance() {
+        assert!(dashboard_is_narrow(899.9));
+        assert!(!dashboard_is_narrow(900.0));
+
+        let mut cert = healthy_domain();
+        cert.cert_days = "14".into();
+        cert.dns = "other".into();
+        let store = Store { domain_health: vec![cert], ..Default::default() };
+        let cert_grade = grade_items(&store).into_iter().find(|(name, _, _, _)| name == "인증서").map(|(_, grade, _, _)| grade);
+        assert_eq!(cert_grade, Some(Grade::C), "임박 1건부터 자동 갱신 실패 가능성으로 주의");
+        let advice = advisories(&store);
+        assert!(advice.iter().any(|(text, _)| text.contains("자동 갱신이 실패")));
+        assert!(advice.iter().any(|(text, _)| text.contains("DNS가 다른 서버")));
+
+        let mut expired = healthy_domain();
+        expired.cert_days = "-1".into();
+        assert!(domain_issue(&expired).is_some_and(|reason| reason.contains("접속이 차단")));
     }
 
     #[test]

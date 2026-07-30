@@ -14,7 +14,7 @@ Codex 에 넘기는 작업 지시서를 모아둔 곳. **각 문서는 자기완
 | 1 | [account-domain-delete-SPEC.md](2026-07-30-account-domain-delete-SPEC.md) | 계정/도메인 서버 완전 삭제 | ✅ **구현됨** (PR #8) · 실서버 검증 전 |
 | 2 | [dashboard-SPEC.md](2026-07-30-dashboard-SPEC.md) | 시작 대시보드 Phase 1~4 | ✅ **구현됨** (PR #11) |
 | 3 | [dashboard-PHASE5.md](2026-07-30-dashboard-PHASE5.md) | 디스크 감시 시각 타임존 수정 | ✅ **구현됨** (PR #11) |
-| 4 | [dashboard-PHASE6.md](2026-07-30-dashboard-PHASE6.md) | 상태 등급(A~E) · 디스크별 헬스 · 목록 UI | ⬜ **미구현** |
+| 4 | [dashboard-PHASE6.md](2026-07-30-dashboard-PHASE6.md) | 상태 등급(A~E) · 디스크별 헬스 · 반응형/목록 UI | ✅ **구현됨** (PR #11 후속) |
 | 5 | [upkeep-SPEC.md](2026-07-31-upkeep-SPEC.md) | 백업 현황 · 휴면 사이트 점검 | ⬜ **미구현** |
 
 참고 문서(구현 지시서 아님): [account-domain-delete.md](2026-07-30-account-domain-delete.md) — 삭제 기능의 배경·판단 근거
@@ -23,18 +23,7 @@ Codex 에 넘기는 작업 지시서를 모아둔 곳. **각 문서는 자기완
 
 ## 남은 작업 (Codex 에 넘길 순서)
 
-### 1순위 — [dashboard-PHASE6.md](2026-07-30-dashboard-PHASE6.md)
-
-대시보드에 **상태 등급**과 **디스크별 헬스**를 넣고, 도메인 목록 UI 를 고친다.
-
-- 6-A: A~E 등급 (총합 = 최악 항목, 미조회를 A 로 표시 금지)
-- 6-B: 디스크별 헬스 + 추이 (운영·백업 디스크를 따로 본다) + 구성 점검(백업 파티션·PHP 버전)
-- 6-C: 도메인 헬스 목록 스크롤 + TSV 복사 + 텍스트 선택
-
-**선행 조건**: 6-B 의 `disk-usage.tsv` 기록은 디스크 감시 스크립트 수정이라,
-적용 후 서버에서 "자동 감시 설치" 를 다시 눌러야 기록이 시작되고 **2일 뒤부터** 추이가 나온다.
-
-### 2순위 — [upkeep-SPEC.md](2026-07-31-upkeep-SPEC.md)
+### 1순위 — [upkeep-SPEC.md](2026-07-31-upkeep-SPEC.md)
 
 - 7-A: 백업 현황 (백업 없는 계정 감지가 핵심)
 - 7-B: 휴면 사이트 점검 (오판 방향을 "살아있음" 으로 고정)
