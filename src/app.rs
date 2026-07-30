@@ -382,6 +382,27 @@ fn fmt_kst(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, (secs % 3600) / 60)
 }
 
+/// 서버 감시가 남긴 `YYYY-MM-DD HH:MM[:SS]`(KST)를 unix초로 해석한다.
+fn parse_kst_datetime(value: &str) -> Option<i64> {
+    if let Ok(ts) = value.trim().parse::<i64>() { return Some(ts); }
+    let mut parts = value.split_whitespace();
+    let date = parts.next()?;
+    let time = parts.next().unwrap_or("00:00:00");
+    let mut d = date.split('-').map(|v| v.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let mut t = time.split(':').map(|v| v.parse::<i64>().ok());
+    let (hour, min, sec) = (t.next()??, t.next()??, t.next().flatten().unwrap_or(0));
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 { return None; }
+    let y0 = y - i64::from(m <= 2);
+    let era = if y0 >= 0 { y0 } else { y0 - 399 } / 400;
+    let yoe = y0 - era * 400;
+    let mp = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hour * 3600 + min * 60 + sec - 9 * 3600)
+}
+
 /// unix초 → "YYYY-MM-DD" (KST). 0 이하면 "-".
 fn short_date(ts: i64) -> String {
     if ts <= 0 { return "-".into(); }
@@ -902,6 +923,54 @@ impl App {
                         ui.label(format!("{}@{}", settings.ssh_user.trim(), host));
                     }
                 });
+            });
+            ui.add_space(10.0);
+            card(ui, |ui| {
+                let mut alerts: Vec<(String, egui::Color32, &'static str)> = Vec::new();
+                if !snapshot.svc_fail.trim().is_empty() {
+                    alerts.push((format!("서비스 정지: {}", snapshot.svc_fail), C_RED, "서버 설정"));
+                }
+                let phpfpm_bad = snapshot.phpfpm_bad.parse::<u32>().unwrap_or(0);
+                if phpfpm_bad > 0 {
+                    alerts.push((format!("PHP-FPM 실패 {phpfpm_bad}개"), C_RED, "PHP-FPM 진단"));
+                }
+                let disk = snapshot.disk_max.parse::<u32>().unwrap_or(0);
+                if disk >= 95 {
+                    alerts.push((format!("디스크 {}% ({})", snapshot.disk_max, snapshot.disk_max_mp), C_RED, "디스크 점검"));
+                } else if disk >= 90 {
+                    alerts.push((format!("디스크 {}%", snapshot.disk_max), egui::Color32::from_rgb(220, 150, 60), "디스크 점검"));
+                }
+                let cert_exp = domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| d < 0)).count();
+                if cert_exp > 0 {
+                    alerts.push((format!("인증서 만료 {cert_exp}건"), C_RED, "아래 보기"));
+                }
+                let dom_issues = domain_health.iter().filter(|h| domain_issue(h).is_some()).count();
+                if dom_issues > 0 {
+                    alerts.push((format!("도메인 이상 {dom_issues}건"), egui::Color32::from_rgb(220, 150, 60), "아래 보기"));
+                }
+                if snapshot.diskmon == "1" {
+                    if parse_kst_datetime(&snapshot.diskmon_last).is_some_and(|at| now_unix() - at > 36 * 3600) {
+                        alerts.push(("디스크 감시가 하루 넘게 안 돌았습니다".into(), egui::Color32::from_rgb(220, 150, 60), "디스크 점검"));
+                    }
+                } else if snapshot.at > 0 && snapshot.diskmon == "0" {
+                    alerts.push(("디스크 자동 감시 미설치".into(), egui::Color32::GRAY, "디스크 점검"));
+                }
+                if alerts.is_empty() {
+                    ui.colored_label(C_GREEN, format!("{}  이상 없음", ph::CHECK_CIRCLE));
+                } else {
+                    for (message, color, target) in alerts {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(color, format!("{}  {message}", ph::WARNING));
+                            if ui.small_button(target).clicked() {
+                                match target {
+                                    "PHP-FPM 진단" | "서버 설정" => go_php = true,
+                                    "디스크 점검" => go_disk = true,
+                                    _ => {}
+                                }
+                            }
+                        });
+                    }
+                }
             });
             ui.add_space(10.0);
             ui.columns(3, |cols| {
@@ -4652,5 +4721,12 @@ mod tests {
         let mut h = healthy_domain();
         h.dns = "none".into(); h.local_code = "200".into();
         assert!(domain_issue(&h).is_some());
+    }
+
+    #[test]
+    fn disk_monitor_time_parsing() {
+        assert_eq!(parse_kst_datetime("1970-01-01 09:00:00"), Some(0));
+        assert_eq!(parse_kst_datetime("3600"), Some(3600));
+        assert!(parse_kst_datetime("기록없음").is_none());
     }
 }
