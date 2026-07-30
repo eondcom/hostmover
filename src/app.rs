@@ -80,6 +80,7 @@ enum AcctTab {
 #[derive(Clone, Copy, PartialEq)]
 enum DangerRun {
     Probe,
+    Backup,
 }
 
 /// 비번 변경 실행 경로 — 화면마다 접속 방식이 다르다
@@ -1356,6 +1357,7 @@ impl App {
         let mut do_permfix = false;
         let mut do_wp_pw = false;
         let mut do_danger_probe: Option<String> = None;
+        let mut do_danger_backup: Option<String> = None;
         let mut alias_loads: Vec<(String, String)> = Vec::new();
         let mut sel_all_sites: Option<bool> = None;
         let mut select_all = None;
@@ -1583,7 +1585,16 @@ impl App {
                                 ui.add_space(12.0);
                                 ui.heading("2단계: 백업");
                                 ui.separator();
-                                ui.add_enabled(false, egui::Button::new("백업 (점검 완료 후 활성)"));
+                                ui.label("HestiaCP 표준 계정 백업을 /backup에 만듭니다. 계정 크기 + 1GB 여유가 필요합니다.");
+                                if ui.add_enabled(
+                                    !running && self.danger_probed,
+                                    egui::Button::new(format!("{}  계정 전체 백업", ph::DOWNLOAD_SIMPLE)),
+                                ).clicked() {
+                                    do_danger_backup = Some(String::new());
+                                }
+                                if self.danger_backed_up {
+                                    ui.colored_label(egui::Color32::from_rgb(80, 180, 110), "✓ 현재 계정 백업 완료");
+                                }
                                 ui.add_space(12.0);
                                 ui.heading("3단계: 서버에서 완전 삭제");
                                 ui.separator();
@@ -1602,7 +1613,16 @@ impl App {
                         ui.add_space(12.0);
                         ui.heading("2단계: 백업");
                         ui.separator();
-                        ui.add_enabled(false, egui::Button::new("백업 (점검 완료 후 활성)"));
+                        ui.label(format!("{}/{}의 파일과 DB를 로컬 백업 폴더에 저장합니다.", acct, self.danger_domain));
+                        if ui.add_enabled(
+                            !running && self.danger_probed,
+                            egui::Button::new(format!("{}  파일·DB 백업", ph::DOWNLOAD_SIMPLE)),
+                        ).clicked() {
+                            do_danger_backup = Some(self.danger_domain.clone());
+                        }
+                        if self.danger_backed_up {
+                            ui.colored_label(egui::Color32::from_rgb(80, 180, 110), "✓ 현재 도메인 백업 완료");
+                        }
                         ui.add_space(12.0);
                         ui.heading("3단계: 서버에서 완전 삭제");
                         ui.separator();
@@ -1664,6 +1684,36 @@ impl App {
                     self.last_ok = Some(false);
                     self.status = format!("점검 실패: {e}");
                     self.log.push(format!("삭제 점검: {e}"));
+                }
+            }
+        }
+        if let Some(domain) = do_danger_backup {
+            self.danger_backed_up = false;
+            let built = if domain.is_empty() {
+                ops::build_account_backup(&self.store.settings, &acct)
+            } else {
+                let dest = store::backups_root().join("sites");
+                let dest_s = dest.to_string_lossy().to_string();
+                ops::build_local_backup(&self.store.settings, &[(acct.clone(), domain)], &dest_s)
+                    .map(|mut job| {
+                        // 기존 백업 빌더는 부분 실패 수를 FAIL에 남긴다. 위험 작업에서는 하나라도 실패하면 실패 상태로 끝낸다.
+                        job.script.push_str("\n[ \"$FAIL\" = 0 ]\n");
+                        job
+                    })
+            };
+            match built {
+                Ok(job) => {
+                    self.running = true;
+                    self.last_ok = None;
+                    self.danger_running = Some(DangerRun::Backup);
+                    self.status = "삭제 전 백업 중...".into();
+                    let ctx2 = ctx.clone();
+                    ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
+                }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = format!("백업 실패: {e}");
+                    self.log.push(format!("삭제 전 백업: {e}"));
                 }
             }
         }
@@ -2262,9 +2312,15 @@ impl App {
                     self.running = false;
                     self.last_ok = Some(ok);
                     self.status = if ok { "성공".into() } else { "실패 (로그 확인)".into() };
-                    if self.danger_running.take() == Some(DangerRun::Probe) {
-                        self.danger_probed = ok;
-                        self.danger_backed_up = false;
+                    match self.danger_running.take() {
+                        Some(DangerRun::Probe) => {
+                            self.danger_probed = ok;
+                            self.danger_backed_up = false;
+                        }
+                        Some(DangerRun::Backup) => {
+                            self.danger_backed_up = ok;
+                        }
+                        None => {}
                     }
                     // 업데이트 작업 완료 → 선택 사이트 자동 재스캔 예약 (성공 시)
                     if ok && !self.pending_rescan.is_empty() {

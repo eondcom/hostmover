@@ -2644,6 +2644,53 @@ pub fn build_account_delete_probe(s: &Settings, account: &str) -> Result<Job, St
     })
 }
 
+const ACCOUNT_BACKUP_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+VUSER=__HM_USER__
+echo "===== 계정 백업: $VUSER ====="
+
+# 계정 크기와 백업 위치 여유를 비교한다. 1GB 안전 여유가 없으면 시작하지 않는다.
+NEED=$(du -sm "/home/$VUSER" 2>/dev/null | cut -f1); [ -z "$NEED" ] && NEED=0
+BD=/backup; [ -d "$BD" ] || BD=/
+FREE=$(df -Pm "$BD" 2>/dev/null | awk 'NR==2{print $4}'); [ -z "$FREE" ] && FREE=0
+echo "  계정 크기 약 ${NEED}MB · $BD 여유 ${FREE}MB"
+if [ "$FREE" -lt $((NEED + 1024)) ] 2>/dev/null; then
+  echo "  ✗ 여유 공간이 부족합니다 (필요 ${NEED}MB + 여유분 1GB) — 백업을 중단합니다"
+  echo "    공간을 확보한 뒤 다시 시도하세요. 백업 없이 삭제하지 마십시오."
+  exit 1
+fi
+
+$VBIN/v-backup-user "$VUSER"
+RC=$?
+echo
+if [ "$RC" = 0 ]; then
+  echo "  ✓ 백업 완료"
+  ls -lh /backup/"$VUSER".*.tar 2>/dev/null | tail -3 | sed 's/^/    /'
+else
+  echo "  ✗ 백업 실패 (v-backup-user=$RC) — 삭제로 넘어가지 마십시오"
+  exit 1
+fi
+echo "===== 백업 끝 ====="
+"#;
+
+/// 계정 전체 백업 (SSH, sudo). 메일·크론·DNS까지 포함하는 HestiaCP 표준 백업.
+pub fn build_account_backup(s: &Settings, account: &str) -> Result<Job, String> {
+    let acct = account.trim();
+    if !is_safe_name(acct) { return Err("계정 이름 형식 오류 (영숫자/._- 만)".into()); }
+    if is_protected_account(acct, s) { return Err(format!("보호 대상 계정입니다: {acct}")); }
+    let srv = ssh_admin_site(s)?;
+    let raw = ACCOUNT_BACKUP_BODY.replace("__HM_USER__", &sq(acct));
+    let (script, sshpass, env) = eondcms_exec(&srv, &raw, false, true);
+    Ok(Job {
+        title: format!("계정 전체 백업 — {acct}"),
+        script,
+        sshpass,
+        env,
+        note: format!("계정 {acct} → /backup HestiaCP 표준 백업 (여유 공간 1GB 확인)"),
+    })
+}
+
 /// 선택 사이트의 파일+DB를 로컬로 백업 — 사이트당 tar(웹루트/앱) + mysqldump 를 한 .tar.gz 로 받아 dest 에 저장.
 pub fn build_local_backup(s: &Settings, pairs: &[(String, String)], dest: &str) -> Result<Job, String> {
     if pairs.is_empty() { return Err("백업할 사이트를 선택하세요".into()); }
@@ -4578,6 +4625,28 @@ mod tests {
         assert!(build_account_delete_probe(&st, "../etc").is_err());
         assert!(build_domain_delete_probe(&st, "rokmc", "ex'ample.com").is_err());
         assert!(build_domain_delete_probe(&st, "rokmc", "../../etc").is_err());
+    }
+
+    #[test]
+    fn account_backup_job_valid_bash_and_validation() {
+        let st = Settings {
+            ssh_host: "1.2.3.4".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "pw".into(),
+            ..Default::default()
+        };
+        let job = build_account_backup(&st, "rokmc").unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 오류:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(job.script.contains("v-backup-user"));
+        assert!(job.script.contains("NEED + 1024"), "1GB 안전 여유 검사 누락");
+        for bad in ["admin", "root", "mysql", "hestiaweb", "tong"] {
+            assert!(build_account_backup(&st, bad).is_err(), "보호 계정 통과: {bad}");
+        }
+        assert!(build_account_backup(&st, "../etc").is_err());
     }
 
     #[test]
