@@ -73,6 +73,13 @@ enum AcctTab {
     Sites,
     Modules,
     Notes,
+    Danger,
+}
+
+/// 위험 작업의 비동기 실행 종류. 일반 작업 성공과 삭제 준비 상태를 분리한다.
+#[derive(Clone, Copy, PartialEq)]
+enum DangerRun {
+    Probe,
 }
 
 /// 비번 변경 실행 경로 — 화면마다 접속 방식이 다르다
@@ -414,6 +421,20 @@ pub struct App {
     acct_mods_status: String,
     /// 고객 메모 탭: 새 메모 입력 버퍼
     acct_note_input: String,
+    /// 위험작업 탭: 대상 도메인 (빈 문자열이면 계정 전체)
+    danger_domain: String,
+    /// 삭제 전 확인 타이핑 입력값
+    danger_confirm_text: String,
+    /// 현재 대상을 점검했는지
+    danger_probed: bool,
+    /// 현재 대상을 백업했는지
+    danger_backed_up: bool,
+    /// 점검에서 감지한 DB 이름
+    danger_db: String,
+    /// 점검에서 감지한 DB가 다른 도메인과 공유되는지
+    danger_db_shared: bool,
+    /// 현재 실행 중인 위험 작업 단계
+    danger_running: Option<DangerRun>,
     /// WordPress 관리자 비번 변경 모달 (열려 있으면 Some)
     wp_pw_dlg: Option<WpPwDialog>,
     /// 생성일(HestiaCP DATE)을 이미 조회한 계정 집합(세션 중 중복조회 방지)
@@ -512,6 +533,13 @@ impl App {
             acct_mod_domain: String::new(),
             acct_mods_status: String::new(),
             acct_note_input: String::new(),
+            danger_domain: String::new(),
+            danger_confirm_text: String::new(),
+            danger_probed: false,
+            danger_backed_up: false,
+            danger_db: String::new(),
+            danger_db_shared: false,
+            danger_running: None,
             wp_pw_dlg: None,
             site_dates_req: std::collections::HashSet::new(),
             site_perms_req: std::collections::HashSet::new(),
@@ -1294,7 +1322,16 @@ impl App {
         ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
     }
 
-    /// 🧩 계정 관리 페이지 — 사이트(공유 캐시 필터) / 모듈(선택 삭제)
+    /// 대상 변경·재점검 때 이전 대상의 점검/백업/DB 상태를 모두 폐기한다.
+    fn reset_danger_progress(&mut self) {
+        self.danger_probed = false;
+        self.danger_backed_up = false;
+        self.danger_confirm_text.clear();
+        self.danger_db.clear();
+        self.danger_db_shared = false;
+    }
+
+    /// 🧩 계정 관리 페이지 — 사이트 / 모듈 / 메모 / 위험 작업
     fn account_modules_page(&mut self, ctx: &egui::Context, ci: usize) {
         let acct = match self.store.customers.get(ci) {
             Some(c) => c.name.clone(),
@@ -1318,11 +1355,13 @@ impl App {
         let mut do_perm = false;
         let mut do_permfix = false;
         let mut do_wp_pw = false;
+        let mut do_danger_probe: Option<String> = None;
         let mut alias_loads: Vec<(String, String)> = Vec::new();
         let mut sel_all_sites: Option<bool> = None;
         let mut select_all = None;
         let mut select_deprecated = false;
         let has_rows = self.all_sites.iter().any(|r| r.account == acct);
+        let danger_domain_before = self.danger_domain.clone();
         let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1340,6 +1379,7 @@ impl App {
                     (AcctTab::Sites, "  사이트 (CMS·버전·업데이트)  ".to_string()),
                     (AcctTab::Modules, "  모듈 (선택 삭제)  ".to_string()),
                     (AcctTab::Notes, notes_label),
+                    (AcctTab::Danger, "  ⚠ 위험 작업  ".to_string()),
                 ] {
                     if ui.selectable_label(self.acct_tab == t, label).clicked() { self.acct_tab = t; }
                 }
@@ -1492,8 +1532,89 @@ impl App {
                         }
                     }
                 }
+                AcctTab::Danger => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 150, 60),
+                        "서버의 파일·DB·HestiaCP 등록을 제거하는 작업입니다. 사이드바의 로컬 기록 삭제와 다릅니다.",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("대상:");
+                        ui.add_enabled_ui(!running, |ui| {
+                            let selected = if self.danger_domain.is_empty() { "계정 전체" } else { self.danger_domain.as_str() };
+                            egui::ComboBox::from_id_salt("danger_delete_target")
+                                .selected_text(selected)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.danger_domain, String::new(), "계정 전체");
+                                    for d in &dom_names {
+                                        ui.selectable_value(&mut self.danger_domain, d.clone(), d);
+                                    }
+                                });
+                        });
+                    });
+                    ui.add_space(10.0);
+
+                    let render_probe = |ui: &mut egui::Ui, label: &str| {
+                        ui.heading("1단계: 점검");
+                        ui.separator();
+                        ui.label("지워질 파일·DB·DNS·메일과 DB 공유 여부를 읽기 전용으로 조사합니다.");
+                        ui.add_space(4.0);
+                        if ui.add_enabled(!running, btn_primary(format!("{}  점검 (읽기 전용)", ph::MAGNIFYING_GLASS)))
+                            .on_hover_text(label)
+                            .clicked()
+                        {
+                            true
+                        } else {
+                            false
+                        }
+                    };
+
+                    if self.danger_domain.is_empty() {
+                        egui::CollapsingHeader::new("계정 전체 삭제")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 110, 90),
+                                    format!("{acct} 계정의 도메인·DB·메일·크론·/home 전체가 대상입니다."),
+                                );
+                                if render_probe(ui, "계정 전체 삭제 전 조사") {
+                                    do_danger_probe = Some(String::new());
+                                }
+                                ui.add_space(12.0);
+                                ui.heading("2단계: 백업");
+                                ui.separator();
+                                ui.add_enabled(false, egui::Button::new("백업 (점검 완료 후 활성)"));
+                                ui.add_space(12.0);
+                                ui.heading("3단계: 서버에서 완전 삭제");
+                                ui.separator();
+                                ui.colored_label(egui::Color32::from_rgb(220, 90, 90), "⚠ 되돌릴 수 없습니다.");
+                                ui.add_enabled(false, egui::Button::new("계정을 서버에서 완전 삭제"));
+                            });
+                    } else {
+                        if render_probe(ui, "선택 도메인 삭제 전 조사") {
+                            do_danger_probe = Some(self.danger_domain.clone());
+                        }
+                        if self.danger_probed {
+                            ui.colored_label(egui::Color32::from_rgb(80, 180, 110), "✓ 현재 대상 점검 완료");
+                        } else {
+                            ui.label(egui::RichText::new("결과는 아래 로그창에 표시됩니다.").weak());
+                        }
+                        ui.add_space(12.0);
+                        ui.heading("2단계: 백업");
+                        ui.separator();
+                        ui.add_enabled(false, egui::Button::new("백업 (점검 완료 후 활성)"));
+                        ui.add_space(12.0);
+                        ui.heading("3단계: 서버에서 완전 삭제");
+                        ui.separator();
+                        ui.colored_label(egui::Color32::from_rgb(220, 90, 90), "⚠ 되돌릴 수 없습니다.");
+                        ui.add_enabled(false, egui::Button::new("서버에서 완전 삭제"));
+                    }
+                }
             }
         });
+        if self.danger_domain != danger_domain_before {
+            self.reset_danger_progress();
+        }
         if let Some(v) = sel_all_sites { for r in self.all_sites.iter_mut().filter(|r| r.account == acct) { r.sel = v; } }
         if let Some(v) = select_all { for m in &mut self.acct_mods { m.2 = v; } }
         if select_deprecated { for m in &mut self.acct_mods { m.2 = is_deprecated_module(&m.0); } }
@@ -1522,6 +1643,29 @@ impl App {
                 .map(|r| (r.account.clone(), r.domain.clone(), r.kind.clone()))
                 .collect();
             self.open_wp_pw_dialog(WpPwScope::Accounts, targets, "admin".to_string());
+        }
+        if let Some(domain) = do_danger_probe {
+            self.reset_danger_progress();
+            let built = if domain.is_empty() {
+                ops::build_account_delete_probe(&self.store.settings, &acct)
+            } else {
+                ops::build_domain_delete_probe(&self.store.settings, &acct, &domain)
+            };
+            match built {
+                Ok(job) => {
+                    self.running = true;
+                    self.last_ok = None;
+                    self.danger_running = Some(DangerRun::Probe);
+                    self.status = "삭제 사전 점검 중...".into();
+                    let ctx2 = ctx.clone();
+                    ops::spawn(job, self.tx.clone(), move || ctx2.request_repaint());
+                }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = format!("점검 실패: {e}");
+                    self.log.push(format!("삭제 점검: {e}"));
+                }
+            }
         }
         if do_scan { self.site_dates_req.remove(&acct); self.site_perms_req.remove(&acct); self.rescan_account_into_all(acct.clone(), ctx); }
         if do_load_mods { self.load_account_modules(ci, ctx); }
@@ -2100,6 +2244,14 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 LogMsg::Line(l) => {
+                    if self.danger_running == Some(DangerRun::Probe) {
+                        if let Some(v) = l.strip_prefix("HM_DB=") {
+                            self.danger_db = v.trim().to_string();
+                        }
+                        if let Some(v) = l.strip_prefix("HM_DBSHARED=") {
+                            self.danger_db_shared = v.trim() == "1";
+                        }
+                    }
                     self.log.push(l);
                     if self.log.len() > 1000 {
                         let cut = self.log.len() - 1000;
@@ -2110,6 +2262,10 @@ impl App {
                     self.running = false;
                     self.last_ok = Some(ok);
                     self.status = if ok { "성공".into() } else { "실패 (로그 확인)".into() };
+                    if self.danger_running.take() == Some(DangerRun::Probe) {
+                        self.danger_probed = ok;
+                        self.danger_backed_up = false;
+                    }
                     // 업데이트 작업 완료 → 선택 사이트 자동 재스캔 예약 (성공 시)
                     if ok && !self.pending_rescan.is_empty() {
                         self.pending_rescan_ready = true;
@@ -2609,6 +2765,8 @@ impl App {
         self.acct_mods_status.clear();
         self.acct_mods_for = Some(ci);
         self.acct_note_input.clear();
+        self.danger_domain.clear();
+        self.reset_danger_progress();
         self.view = MainView::AccountModules(ci);
     }
 
