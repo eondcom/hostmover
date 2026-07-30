@@ -312,10 +312,10 @@ fn advisories(store: &Store) -> Vec<(String, Option<&'static str>)> {
     let mut out = Vec::new();
     let s = &store.server_snapshot;
     if s.at > 0 {
-        let mut has_disk_eta = false;
+        let mut has_disk_trend = false;
         for disk in &store.disk_health {
+            has_disk_trend |= disk.rate.parse::<f32>().is_ok();
             if let Ok(eta) = disk.eta.parse::<u32>() {
-                has_disk_eta = true;
                 if eta <= 30 {
                     out.push((format!("{} 디스크가 약 {eta}일 후 95% 도달 예상 (하루 {}%p) — 정리가 시급합니다", disk.mount, disk.rate), Some("디스크 점검")));
                 } else if eta <= 90 {
@@ -337,10 +337,10 @@ fn advisories(store: &Store) -> Vec<(String, Option<&'static str>)> {
                 out.push((format!("디스크 {} 불량섹터 {sectors}개 — 늘어나면 교체 신호입니다", disk.disk), Some("점검 기록 보기")));
             }
         }
-        if !has_disk_eta && s.disk_eta.parse::<u32>().is_ok_and(|eta| eta <= 60) {
+        if !has_disk_trend && s.disk_eta.parse::<u32>().is_ok_and(|eta| eta <= 60) {
             out.push((format!("디스크({} 기준)가 약 {}일 후 95% 도달 예상", s.disk_max_mp, s.disk_eta), Some("디스크 점검")));
         }
-        if s.disk_rate.is_empty() && s.diskmon == "1" {
+        if !has_disk_trend && s.disk_rate.is_empty() && s.diskmon == "1" {
             out.push(("디스크 추이 데이터가 부족합니다 — 며칠 더 쌓이면 증가 속도를 알 수 있습니다".into(), None));
         }
         if s.backup_src.is_empty() {
@@ -5163,6 +5163,11 @@ mod tests {
 
         store.disk_health[2].use_pct = "94".into();
         assert!(advisories(&store).iter().any(|(text, _)| text.contains("백업 디스크 /backup 사용률 94%")));
+
+        store.server_snapshot.disk_rate.clear();
+        store.disk_health[0].rate = "0.10".into();
+        assert!(!advisories(&store).iter().any(|(text, _)| text.contains("추이 데이터가 부족")),
+            "디스크별 추이가 있으면 구형 전체 추이 부재를 데이터 부족으로 보지 않음");
     }
 
     #[test]
