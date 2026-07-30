@@ -1,4 +1,4 @@
-use crate::model::{ActivityLog, CachedSite, CmsAccess, CmsKind, Customer, CustomerNote, Domain, DomainAccess, ServerSnapshot, Site, Store};
+use crate::model::{ActivityLog, CachedSite, CmsAccess, CmsKind, Customer, CustomerNote, Domain, DomainAccess, DomainHealth, ServerSnapshot, Site, Store};
 use crate::ops::{self, LogMsg, OpKind};
 use crate::store;
 use egui_phosphor::regular as ph;
@@ -29,6 +29,7 @@ enum Req {
 #[derive(Clone, Copy, PartialEq)]
 enum DashRun {
     Snapshot,
+    DomainHealth,
 }
 
 /// 실행할 작업 묶음 (요청, 고객명, 도메인명, 현재사이트, 신규사이트)
@@ -124,6 +125,31 @@ fn server_snapshot_from_markers(values: &HashMap<String, String>) -> ServerSnaps
         diskmon_result: get("DISKMON_RESULT"),
         trafficmon: get("TRAFFICMON"),
     }
+}
+
+/// 스펙 §2-4의 판정 규칙. 셸 스크립트 issue_of()와 동일하게 유지한다.
+fn domain_issue(h: &DomainHealth) -> Option<String> {
+    let mut issues = Vec::new();
+    if h.webroot == "no" {
+        issues.push("웹루트 없음".to_string());
+    }
+    match h.dns.as_str() {
+        "none" => issues.push("DNS 레코드 없음".to_string()),
+        "other" => issues.push(format!("DNS가 다른 서버({})", h.a_record)),
+        "ok" => match h.public_code.as_str() {
+            code if code.starts_with('2') || code.starts_with('3') => {}
+            "000" => issues.push("응답 없음(타임아웃/거부)".to_string()),
+            code => issues.push(format!("HTTP {code}")),
+        },
+        _ => issues.push("DNS 상태 불명".to_string()),
+    }
+    if h.cert_days != "-" {
+        if let Ok(days) = h.cert_days.parse::<i32>() {
+            if days < 0 { issues.push("인증서 만료됨".to_string()); }
+            else if days <= 14 { issues.push(format!("인증서 D-{days}")); }
+        }
+    }
+    if issues.is_empty() { None } else { Some(issues.join(" · ")) }
 }
 
 /// 설정 페이지 내부 탭
@@ -464,6 +490,8 @@ pub struct App {
     dash_running: Option<DashRun>,
     /// 성공 완료 전까지 마커를 모으는 서버 스냅샷 임시 버퍼.
     dash_snapshot_buf: HashMap<String, String>,
+    /// 성공 완료 전까지 마커를 모으는 도메인 헬스 임시 버퍼.
+    dash_domain_buf: Vec<DomainHealth>,
     /// 중앙 영역 화면 전환
     view: MainView,
     /// 설정 페이지 내부 탭
@@ -576,6 +604,7 @@ impl App {
             running_job: None,
             dash_running: None,
             dash_snapshot_buf: HashMap::new(),
+            dash_domain_buf: Vec::new(),
             view: MainView::Dashboard,
             settings_tab: SettingsTab::Connect,
             acct_tab: AcctTab::Sites,
@@ -845,12 +874,17 @@ impl App {
         let settings = self.store.settings.clone();
         let cache_at = self.store.scan_cache_at;
         let snapshot = self.store.server_snapshot.clone();
+        let domain_health = self.store.domain_health.clone();
+        let domain_health_at = self.store.domain_health_at;
         let snapshot_running = self.dash_running == Some(DashRun::Snapshot);
+        let domain_running = self.dash_running == Some(DashRun::DomainHealth);
         let ssh_ready = !settings.ssh_user.trim().is_empty()
             && !settings.ssh_pass.is_empty()
             && (!settings.ssh_host.trim().is_empty() || !settings.hestia_host.trim().is_empty());
         let mut do_snapshot = false;
+        let mut do_domain_health = false;
         let mut go_php = false;
+        let mut go_account: Option<String> = None;
         let mut go_all = false;
         let mut go_bulk = false;
         let mut go_disk = false;
@@ -958,8 +992,44 @@ impl App {
             });
             ui.add_space(8.0);
             card(ui, |ui| {
-                ui.horizontal(|ui| { ui.strong("도메인 헬스"); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.add_enabled(false, egui::Button::new("점검")); }); });
-                ui.weak("아직 점검하지 않았습니다 — 도메인 점검은 버튼을 눌렀을 때만 실행됩니다.");
+                ui.horizontal(|ui| {
+                    ui.strong("도메인 헬스");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(ssh_ready && !self.running, egui::Button::new("점검"))
+                            .on_hover_text("SSH 1회 · 8개 병렬 · 도메인 100개면 약 2분").clicked() { do_domain_health = true; }
+                        if domain_running { ui.spinner(); }
+                    });
+                });
+                if !ssh_ready {
+                    ui.weak("서버 SSH 설정이 필요합니다.");
+                } else if domain_health_at <= 0 {
+                    ui.weak("아직 점검하지 않았습니다 — 도메인 점검은 버튼을 눌렀을 때만 실행됩니다.");
+                } else {
+                    let issues: Vec<_> = domain_health.iter().filter_map(|h| domain_issue(h).map(|reason| (h, reason))).collect();
+                    let dns_bad = domain_health.iter().filter(|h| h.dns == "other" || h.dns == "none").count();
+                    let http_bad = domain_health.iter().filter(|h| h.dns == "ok" && !(h.public_code.starts_with('2') || h.public_code.starts_with('3'))).count();
+                    let no_root = domain_health.iter().filter(|h| h.webroot == "no").count();
+                    let cert_exp = domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| d < 0)).count();
+                    let cert_soon = domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| (0..=14).contains(&d))).count();
+                    ui.horizontal_wrapped(|ui| {
+                        let color = if issues.is_empty() { C_GREEN } else { C_RED };
+                        ui.colored_label(color, format!("이상 {}건 / 전체 {}건", issues.len(), domain_health.len()));
+                        ui.weak(format!("DNS {dns_bad} · HTTP {http_bad} · 웹루트 {no_root} · 인증서 임박 {cert_soon} / 만료 {cert_exp} · {} 기준", ago_text(domain_health_at)));
+                    });
+                    if !issues.is_empty() {
+                        ui.add_space(4.0);
+                        egui::Grid::new("dash_domain_health_header").num_columns(4).striped(true).show(ui, |ui| {
+                            ui.strong("도메인"); ui.strong("사유"); ui.strong("DNS"); ui.strong("인증서"); ui.end_row();
+                            for (health, reason) in issues {
+                                if ui.link(&health.domain).on_hover_text("계정 관리로 이동").clicked() { go_account = Some(health.account.clone()); }
+                                ui.label(reason);
+                                ui.label(format!("{} ({})", health.dns, health.a_record));
+                                ui.label(if health.cert_days == "-" { "-".into() } else { format!("D-{}", health.cert_days) });
+                                ui.end_row();
+                            }
+                        });
+                    }
+                }
             });
             ui.add_space(10.0);
             ui.horizontal_wrapped(|ui| {
@@ -975,6 +1045,12 @@ impl App {
         if go_disk { self.view = MainView::Settings; self.settings_tab = SettingsTab::Disk; }
         if go_settings { self.view = MainView::Settings; }
         if go_php { self.view = MainView::Settings; self.settings_tab = SettingsTab::Connect; }
+        if let Some(account) = go_account {
+            if let Some(ci) = self.store.customers.iter().position(|c| c.deleted_at.is_none() && c.name == account) {
+                self.sel_customer = Some(ci);
+                self.view = MainView::AccountModules(ci);
+            }
+        }
         if do_snapshot {
             match ops::build_server_snapshot(&self.store.settings) {
                 Ok(job) => {
@@ -986,6 +1062,20 @@ impl App {
                     self.last_ok = Some(false);
                     self.status = e.clone();
                     self.log.push(format!("서버 스냅샷: {e}"));
+                }
+            }
+        }
+        if do_domain_health {
+            match ops::build_domain_health(&self.store.settings) {
+                Ok(job) => {
+                    self.dash_domain_buf.clear();
+                    self.dash_running = Some(DashRun::DomainHealth);
+                    self.run_diagnostic(job, ctx);
+                }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = e.clone();
+                    self.log.push(format!("도메인 헬스: {e}"));
                 }
             }
         }
@@ -2347,6 +2437,23 @@ impl App {
                             }
                         }
                     }
+                    if self.dash_running == Some(DashRun::DomainHealth) {
+                        if let Some(marker) = l.strip_prefix("HM_DOMH ") {
+                            let fields: Vec<_> = marker.split_whitespace().collect();
+                            if fields.len() == 8 {
+                                self.dash_domain_buf.push(DomainHealth {
+                                    account: fields[0].into(),
+                                    domain: fields[1].into(),
+                                    local_code: fields[2].into(),
+                                    public_code: fields[3].into(),
+                                    dns: fields[4].into(),
+                                    cert_days: fields[5].into(),
+                                    webroot: fields[6].into(),
+                                    a_record: fields[7].into(),
+                                });
+                            }
+                        }
+                    }
                     self.log.push(l);
                     if self.log.len() > 1000 {
                         let cut = self.log.len() - 1000;
@@ -2383,6 +2490,16 @@ impl App {
                             self.save();
                         }
                         self.dash_snapshot_buf.clear();
+                    }
+                    if dash_run == Some(DashRun::DomainHealth) {
+                        if ok {
+                            self.store.domain_health = std::mem::take(&mut self.dash_domain_buf);
+                            self.store.domain_health_at = now_unix();
+                            self.dirty = true;
+                            self.save();
+                        } else {
+                            self.dash_domain_buf.clear();
+                        }
                     }
                 }
                 LogMsg::Detected { is_tobe, db } => {
@@ -4497,4 +4614,43 @@ fn row_secret(ui: &mut egui::Ui, label: &str, value: &mut String, show: bool) ->
     });
     ui.end_row();
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn healthy_domain() -> DomainHealth {
+        DomainHealth {
+            account: "acme".into(),
+            domain: "example.com".into(),
+            local_code: "200".into(),
+            public_code: "200".into(),
+            dns: "ok".into(),
+            cert_days: "90".into(),
+            webroot: "yes".into(),
+            a_record: "192.0.2.1".into(),
+        }
+    }
+
+    #[test]
+    fn domain_health_issue_rules() {
+        assert!(domain_issue(&healthy_domain()).is_none());
+
+        let mut h = healthy_domain(); h.dns = "other".into();
+        assert!(domain_issue(&h).is_some());
+        let mut h = healthy_domain(); h.webroot = "no".into();
+        assert!(domain_issue(&h).is_some());
+        let mut h = healthy_domain(); h.public_code = "500".into();
+        assert!(domain_issue(&h).is_some());
+        let mut h = healthy_domain(); h.cert_days = "-1".into();
+        assert!(domain_issue(&h).is_some());
+        let mut h = healthy_domain(); h.cert_days = "3".into();
+        assert!(domain_issue(&h).is_some());
+
+        // 기본 vhost가 로컬 200을 돌려줘도 DNS가 없으면 정상으로 오인하면 안 된다.
+        let mut h = healthy_domain();
+        h.dns = "none".into(); h.local_code = "200".into();
+        assert!(domain_issue(&h).is_some());
+    }
 }

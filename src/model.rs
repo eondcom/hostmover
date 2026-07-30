@@ -18,9 +18,29 @@ pub struct Store {
     /// 마지막 서버 스냅샷 (대시보드에서 즉시 표시)
     #[serde(default)]
     pub server_snapshot: ServerSnapshot,
+    /// 마지막 도메인별 헬스 결과.
+    #[serde(default)]
+    pub domain_health: Vec<DomainHealth>,
+    #[serde(default)]
+    pub domain_health_at: i64,
     /// 마지막 화면 상태 (재시작 시 복원)
     #[serde(default)]
     pub ui: UiState,
+}
+
+/// 도메인 1건의 헬스 (마커 HM_DOMH 한 줄)
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct DomainHealth {
+    #[serde(default)] pub account: String,
+    #[serde(default)] pub domain: String,
+    /// 참고값. 단독으로 정상 판정하지 않는다.
+    #[serde(default)] pub local_code: String,
+    /// DNS=ok 일 때 주 지표.
+    #[serde(default)] pub public_code: String,
+    #[serde(default)] pub dns: String,
+    #[serde(default)] pub cert_days: String,
+    #[serde(default)] pub webroot: String,
+    #[serde(default)] pub a_record: String,
 }
 
 /// 마지막 서버 스냅샷 (대시보드에서 즉시 표시)

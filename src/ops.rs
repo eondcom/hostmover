@@ -2251,6 +2251,147 @@ pub fn build_server_snapshot(s: &Settings) -> Result<Job, String> {
     })
 }
 
+const DOMAIN_HEALTH_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+PAR=8
+TMO=8
+
+echo "===== 도메인별 헬스 점검 ====="
+
+# 이 서버의 대표 IP — DNS 가 이 서버를 가리키는지 비교하는 기준
+MYIP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+[ -z "$MYIP" ] && MYIP=$(hostname -I 2>/dev/null | awk '{print $1}')
+echo "  서버 IP ${MYIP:-?} · 동시 ${PAR} · 타임아웃 ${TMO}s"
+echo "HM_DASH_MYIP=${MYIP:-}"
+echo
+
+# 검사 대상 수집: <계정> <도메인>
+LIST=$(mktemp)
+OUT=$(mktemp)
+if [ -x "$VBIN/v-list-users" ]; then
+  for U in $("$VBIN/v-list-users" plain 2>/dev/null | awk '{print $1}'); do
+    "$VBIN/v-list-web-domains" "$U" plain 2>/dev/null | awk -v u="$U" '{print u" "$1}'
+  done > "$LIST"
+fi
+NTOT=$(grep -c . "$LIST" 2>/dev/null); [ -z "$NTOT" ] && NTOT=0
+if [ "$NTOT" = 0 ]; then
+  echo "  검사할 도메인이 없습니다 (HestiaCP CLI 미검출 또는 도메인 0개)"
+  echo "HM_DASH_DOMTOTAL=0"
+  rm -f "$LIST" "$OUT"
+  echo "===== 점검 끝 ====="
+  exit 0
+fi
+
+# 도메인 1개 검사 — 병렬 실행되므로 한 줄로 결과를 출력한다
+CHK=$(mktemp)
+cat > "$CHK" <<'EOS'
+#!/usr/bin/env bash
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+U="$1"; D="$2"; MYIP="$HM_MYIP"; TMO="$HM_TMO"
+# 0) 웹루트 존재 — vhost 설정만 남고 파일이 없는 경우를 잡는다
+ROOT=no; [ -d "/home/$U/web/$D/public_html" ] && ROOT=yes
+# 1) 이 서버의 vhost 응답 (DNS 우회, 서버 자신에게 물어본다)
+#    ※ Host 매칭이 실패하면 기본 vhost 가 200 을 주므로 이 값만으로 정상 판정하지 않는다.
+LH=$(curl -sS -o /dev/null -m "$TMO" -k --resolve "$D:443:127.0.0.1" -w '%{http_code}' "https://$D/" 2>/dev/null)
+[ -z "$LH" ] && LH=000
+[ "$LH" = 000 ] && LH=$(curl -sS -o /dev/null -m "$TMO" --resolve "$D:80:127.0.0.1" -w '%{http_code}' "http://$D/" 2>/dev/null)
+[ -z "$LH" ] && LH=000
+# 2) 공개 경로 응답 (실제 방문자 관점 — DNS 를 따른다). 주 판정 지표.
+PH=$(curl -sS -o /dev/null -m "$TMO" -k -w '%{http_code}' "https://$D/" 2>/dev/null)
+[ -z "$PH" ] && PH=000
+[ "$PH" = 000 ] && PH=$(curl -sS -o /dev/null -m "$TMO" -w '%{http_code}' "http://$D/" 2>/dev/null)
+[ -z "$PH" ] && PH=000
+# 3) DNS A 레코드가 이 서버인지 (IPv4 만 비교 — MYIP 가 IPv4 다)
+A=$(dig +short +time=3 +tries=1 A "$D" 2>/dev/null | grep -E '^[0-9]+\.[0-9.]+$' | head -1)
+[ -z "$A" ] && A=$(getent ahostsv4 "$D" 2>/dev/null | awk '{print $1}' | grep -E '^[0-9]+\.[0-9.]+$' | head -1)
+if [ -z "$A" ]; then DNS=none; elif [ "$A" = "$MYIP" ]; then DNS=ok; else DNS=other; fi
+# 4) 인증서 만료 D-day — 파일에서 읽는다(네트워크 불필요, 훨씬 빠르다)
+CD=-
+for C in "/home/$U/conf/web/$D/ssl/$D.crt" "/home/$U/conf/web/$D/ssl/$D.pem"; do
+  [ -s "$C" ] || continue
+  E=$(openssl x509 -enddate -noout -in "$C" 2>/dev/null | cut -d= -f2)
+  [ -z "$E" ] && continue
+  ES=$(date -d "$E" +%s 2>/dev/null) || continue
+  CD=$(( (ES - $(date +%s)) / 86400 ))
+  break
+done
+printf 'HM_DOMH %s %s %s %s %s %s %s %s\n' "$U" "$D" "$LH" "$PH" "$DNS" "$CD" "$ROOT" "${A:--}"
+EOS
+chmod +x "$CHK"
+
+export HM_MYIP="$MYIP" HM_TMO="$TMO"
+awk '{print $1" "$2}' "$LIST" | xargs -P "$PAR" -n 2 "$CHK" > "$OUT" 2>/dev/null
+
+# 판정 규칙
+#   DNS=ok   → 공개응답(PH)이 주 지표 (실제 방문자가 보는 것)
+#   DNS=other/none → 그 자체가 이상. 이 경우 PH 는 남의 서버 응답이라 판정에 쓰지 않는다.
+#   LH 단독으로는 정상 판정하지 않는다 — Host 매칭 실패 시 기본 vhost 가 200 을 준다.
+issue_of() {
+  local LH="$1" PH="$2" DNS="$3" CD="$4" ROOT="$5" A="$6" M=""
+  [ "$ROOT" = no ] && M="웹루트 없음"
+  if [ "$DNS" = none ]; then M="$M${M:+ · }DNS 레코드 없음"
+  elif [ "$DNS" = other ]; then M="$M${M:+ · }DNS 가 다른 서버($A)"
+  else
+    case "$PH" in 2*|3*) ;; 000) M="$M${M:+ · }응답 없음(타임아웃/거부)" ;; *) M="$M${M:+ · }HTTP $PH" ;; esac
+  fi
+  if [ "$CD" != "-" ]; then
+    if [ "$CD" -lt 0 ] 2>/dev/null; then M="$M${M:+ · }인증서 만료됨"
+    elif [ "$CD" -le 14 ] 2>/dev/null; then M="$M${M:+ · }인증서 D-$CD"; fi
+  fi
+  printf '%s' "$M"
+}
+
+ISSUES=0; CERTSOON=0; CERTEXP=0; DNSBAD=0; HTTPBAD=0; NOROOT=0
+while read -r _ U D LH PH DNS CD ROOT A; do
+  [ -n "$(issue_of "$LH" "$PH" "$DNS" "$CD" "$ROOT" "$A")" ] && ISSUES=$((ISSUES+1))
+  { [ "$DNS" = other ] || [ "$DNS" = none ]; } && DNSBAD=$((DNSBAD+1))
+  [ "$ROOT" = no ] && NOROOT=$((NOROOT+1))
+  if [ "$DNS" = ok ]; then
+    case "$PH" in 2*|3*) ;; *) HTTPBAD=$((HTTPBAD+1)) ;; esac
+  fi
+  if [ "$CD" != "-" ]; then
+    if [ "$CD" -lt 0 ] 2>/dev/null; then CERTEXP=$((CERTEXP+1))
+    elif [ "$CD" -le 14 ] 2>/dev/null; then CERTSOON=$((CERTSOON+1)); fi
+  fi
+done < "$OUT"
+
+echo "[이상 감지]"
+while read -r _ U D LH PH DNS CD ROOT A; do
+  M=$(issue_of "$LH" "$PH" "$DNS" "$CD" "$ROOT" "$A")
+  [ -n "$M" ] && printf '  %-36s %s\n' "$D" "$M"
+done < "$OUT"
+[ "$ISSUES" = 0 ] && echo "  없음 — 전부 정상"
+echo
+
+echo "[원자료]"
+cat "$OUT"
+echo
+echo "HM_DASH_DOMTOTAL=$NTOT"
+echo "HM_DASH_DOMISSUES=$ISSUES"
+echo "HM_DASH_DOMOK=$((NTOT - ISSUES))"
+echo "HM_DASH_HTTPBAD=$HTTPBAD"
+echo "HM_DASH_DNSBAD=$DNSBAD"
+echo "HM_DASH_NOROOT=$NOROOT"
+echo "HM_DASH_CERTSOON=$CERTSOON"
+echo "HM_DASH_CERTEXP=$CERTEXP"
+rm -f "$LIST" "$OUT" "$CHK"
+echo "===== 점검 끝 =====""#;
+
+/// 도메인별 헬스 점검 (SSH, sudo, 읽기 전용).
+/// HestiaCP 웹도메인 전체를 병렬로: 웹루트 존재·서버응답·공개응답·DNS·인증서 만료.
+pub fn build_domain_health(s: &Settings) -> Result<Job, String> {
+    let srv = ssh_admin_site(s)?;
+    let (script, sshpass, env) = eondcms_exec(&srv, DOMAIN_HEALTH_BODY, false, true);
+    Ok(Job {
+        title: "도메인별 헬스 점검".into(),
+        script,
+        sshpass,
+        env,
+        note: "SSH 1회 · 도메인 8개 병렬 · 도메인 100개면 약 2분".into(),
+    })
+}
+
 /// 모듈 목록 조회 → (모듈명, 사용 도메인들) 정렬. domain=Some 이면 그 도메인만, None 이면 계정 전체.
 pub fn list_account_modules(s: &Settings, account: &str, domain: Option<&str>) -> Result<Vec<(String, Vec<String>)>, String> {
     let acct = account.trim();
@@ -4492,6 +4633,27 @@ mod tests {
         for destructive in ["rm -rf", "v-delete-", "DROP"] {
             assert!(!SERVER_SNAPSHOT_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
         }
+    }
+
+    #[test]
+    fn domain_health_is_safe_valid_bash() {
+        let st = Settings {
+            ssh_host: "10.0.0.1".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "tongpw".into(),
+            ..Default::default()
+        };
+        let job = build_domain_health(&st).unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        for destructive in ["rm -rf", "v-delete-", "DROP"] {
+            assert!(!DOMAIN_HEALTH_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
+        }
+        assert!(DOMAIN_HEALTH_BODY.contains("getent ahostsv4"));
+        assert!(DOMAIN_HEALTH_BODY.contains("case \"$PH\" in 2*|3*)"));
     }
 
     #[test]
