@@ -173,6 +173,26 @@ fn domain_issue(h: &DomainHealth) -> Option<String> {
     if issues.is_empty() { None } else { Some(issues.join(" · ")) }
 }
 
+fn tsv_cell(value: &str) -> String {
+    value.replace(['\t', '\r', '\n'], " ")
+}
+
+fn domain_health_tsv(rows: &[DomainHealth], issues_only: bool) -> String {
+    let mut out = String::from("계정\t도메인\t사유\tDNS\tA레코드\t공개응답\t인증서D-day\t웹루트\n");
+    for health in rows {
+        let reason = domain_issue(health);
+        if issues_only && reason.is_none() { continue; }
+        let fields = [
+            health.account.as_str(), health.domain.as_str(), reason.as_deref().unwrap_or(""),
+            health.dns.as_str(), health.a_record.as_str(), health.public_code.as_str(),
+            health.cert_days.as_str(), health.webroot.as_str(),
+        ];
+        out.push_str(&fields.iter().map(|value| tsv_cell(value)).collect::<Vec<_>>().join("\t"));
+        out.push('\n');
+    }
+    out
+}
+
 /// 서버 상태 등급. 낮을수록(A) 좋다.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Grade { A, B, C, D, E }
@@ -1125,6 +1145,7 @@ impl App {
         let mut go_bulk = false;
         let mut go_disk = false;
         let mut go_settings = false;
+        let mut copy_domains: Option<bool> = None;
         let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1370,6 +1391,8 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add_enabled(ssh_ready && !self.running, egui::Button::new("점검"))
                             .on_hover_text("SSH 1회 · 8개 병렬 · 도메인 100개면 약 2분").clicked() { do_domain_health = true; }
+                        if ui.add_enabled(domain_health_at > 0, egui::Button::new("전체 복사")).clicked() { copy_domains = Some(false); }
+                        if ui.add_enabled(domain_health_at > 0, egui::Button::new("이상만 복사")).clicked() { copy_domains = Some(true); }
                         if domain_running { ui.spinner(); }
                     });
                 });
@@ -1391,15 +1414,21 @@ impl App {
                     });
                     if !issues.is_empty() {
                         ui.add_space(4.0);
-                        egui::Grid::new("dash_domain_health_header").num_columns(4).striped(true).show(ui, |ui| {
-                            ui.strong("도메인"); ui.strong("사유"); ui.strong("DNS"); ui.strong("인증서"); ui.end_row();
-                            for (health, reason) in issues {
-                                if ui.link(&health.domain).on_hover_text("계정 관리로 이동").clicked() { go_account = Some(health.account.clone()); }
-                                ui.label(reason);
-                                ui.label(format!("{} ({})", health.dns, health.a_record));
-                                ui.label(if health.cert_days == "-" { "-".into() } else { format!("D-{}", health.cert_days) });
-                                ui.end_row();
-                            }
+                        egui::ScrollArea::vertical()
+                            .id_salt("dash_domain_health_scroll")
+                            .auto_shrink([false, false])
+                            .max_height(320.0)
+                            .show(ui, |ui| {
+                            egui::Grid::new("dash_domain_health_grid").num_columns(4).striped(true).show(ui, |ui| {
+                                ui.strong("도메인"); ui.strong("사유"); ui.strong("DNS"); ui.strong("인증서"); ui.end_row();
+                                for (health, reason) in issues {
+                                    if ui.link(&health.domain).on_hover_text("계정 관리로 이동").clicked() { go_account = Some(health.account.clone()); }
+                                    ui.add(egui::Label::new(reason).selectable(true));
+                                    ui.add(egui::Label::new(format!("{} ({})", health.dns, health.a_record)).selectable(true));
+                                    ui.add(egui::Label::new(if health.cert_days == "-" { "-".into() } else { format!("D-{}", health.cert_days) }).selectable(true));
+                                    ui.end_row();
+                                }
+                            });
                         });
                     }
                 }
@@ -1418,6 +1447,12 @@ impl App {
         if go_disk { self.view = MainView::Settings; self.settings_tab = SettingsTab::Disk; }
         if go_settings { self.view = MainView::Settings; }
         if go_php { self.view = MainView::Settings; self.settings_tab = SettingsTab::Connect; }
+        if let Some(issues_only) = copy_domains {
+            ctx.copy_text(domain_health_tsv(&domain_health, issues_only));
+            let count = if issues_only { domain_health.iter().filter(|h| domain_issue(h).is_some()).count() } else { domain_health.len() };
+            self.status = if issues_only { format!("이상 {count}건을 클립보드에 복사했습니다") } else { format!("전체 {count}건을 클립보드에 복사했습니다") };
+            self.last_ok = Some(true);
+        }
         if let Some(account) = go_account {
             if let Some(ci) = self.store.customers.iter().position(|c| c.deleted_at.is_none() && c.name == account) {
                 self.sel_customer = Some(ci);
@@ -5137,5 +5172,27 @@ mod tests {
         assert_eq!(disk.disk, "nvme0n1");
         assert!(parse_disk_health_marker("/home /dev/sda1 too few").is_none());
         assert!(parse_disk_health_marker("/path with-space /dev/sda1 sda main 1 1G 1 0 PASSED 0 0 1 1 - - -").is_none());
+    }
+
+    #[test]
+    fn domain_health_tsv_export() {
+        let healthy = healthy_domain();
+        let mut bad = healthy_domain();
+        bad.account = "bad\taccount".into();
+        bad.domain = "broken\n.example.com".into();
+        bad.dns = "none".into();
+        let rows = vec![healthy, bad];
+
+        let all = domain_health_tsv(&rows, false);
+        let lines: Vec<_> = all.lines().collect();
+        assert_eq!(lines[0].split('\t').count(), 8);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].split('\t').nth(2), Some(""), "정상 사유는 빈 칸");
+        assert!(!all.contains("bad\taccount"));
+        assert!(!all.contains("broken\n.example.com"));
+
+        let issues = domain_health_tsv(&rows, true);
+        assert_eq!(issues.lines().count(), 2, "헤더와 이상 도메인만 포함");
+        assert!(!issues.contains("example.com\t\tok"), "정상 도메인은 제외");
     }
 }

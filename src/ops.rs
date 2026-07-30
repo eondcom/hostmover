@@ -4274,6 +4274,11 @@ mod tests {
         }
     }
 
+    fn assert_bash_syntax(script: &str, label: &str) {
+        let out = std::process::Command::new("bash").args(["-n", "-c", script]).output().expect("bash");
+        assert!(out.status.success(), "{label} bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
     #[test]
     fn db_backup_script_shape() {
         std::env::set_var("HOME", std::env::temp_dir());
@@ -4797,6 +4802,7 @@ mod tests {
             .output()
             .expect("bash");
         assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        assert_bash_syntax(SERVER_SNAPSHOT_BODY, "서버 스냅샷 원문");
         for destructive in ["rm -rf", "v-delete-", "DROP"] {
             assert!(!SERVER_SNAPSHOT_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
         }
@@ -4816,6 +4822,10 @@ mod tests {
         let job = build_disk_monitor_install(&st, "admin@example.com", "/backup").unwrap();
         let out = std::process::Command::new("bash").args(["-n", "-c", &job.script]).output().expect("bash");
         assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        let daily = DISK_MONITOR_INSTALL_BODY
+            .split_once("cat > /usr/local/sbin/hm-disk-monitor.sh <<'EOS'\n").expect("일일 감시 시작").1
+            .split_once("\nEOS\n").expect("일일 감시 끝").0;
+        assert_bash_syntax(daily, "일일 디스크 감시 원문");
         assert!(DISK_MONITOR_INSTALL_BODY.contains("disk-usage.tsv"));
         assert!(DISK_MONITOR_INSTALL_BODY.contains("grep -v \"^$DAY\"$'\\t'"), "같은 날 기록 교체 필요");
         assert!(DISK_MONITOR_INSTALL_BODY.contains("tail -n 4000"), "기록 무한 증가 방지 필요");
@@ -4835,6 +4845,7 @@ mod tests {
             .output()
             .expect("bash");
         assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        assert_bash_syntax(DOMAIN_HEALTH_BODY, "도메인 헬스 원문");
         for destructive in ["rm -rf", "v-delete-", "DROP"] {
             assert!(!DOMAIN_HEALTH_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
         }
