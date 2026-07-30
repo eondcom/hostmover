@@ -49,12 +49,53 @@ enum Tab {
 /// 중앙 영역에 표시할 화면
 #[derive(Clone, Copy, PartialEq)]
 enum MainView {
+    Dashboard,
     Domain,
     Settings,
     /// 계정별 Rhymix 모듈 관리 (고객 인덱스)
     AccountModules(usize),
     /// 전체 사이트(모든 계정) 통합 리스트
     AllSites,
+}
+
+/// 대시보드 즉시 지표 — 로컬 데이터만으로 계산한다(SSH 없음).
+struct LocalStats {
+    customers: usize,
+    customers_trash: usize,
+    domains: usize,
+    sites: usize,
+    by_kind: Vec<(String, usize)>,
+    need_update: usize,
+    file_bytes: u64,
+    db_bytes: u64,
+    no_cred: usize,
+}
+
+fn local_stats(store: &Store) -> LocalStats {
+    let active = store.customers.iter().filter(|c| c.deleted_at.is_none());
+    let customers = active.clone().count();
+    let domains = active.clone().map(|c| c.domains.len()).sum();
+    let no_cred = active
+        .flat_map(|c| &c.domains)
+        .filter(|d| d.asis.ip.trim().is_empty() || d.asis.ftp_id.trim().is_empty())
+        .count();
+    let mut kinds = HashMap::<String, usize>::new();
+    for site in &store.scan_cache {
+        *kinds.entry(site.kind.clone()).or_default() += 1;
+    }
+    let mut by_kind: Vec<_> = kinds.into_iter().collect();
+    by_kind.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    LocalStats {
+        customers,
+        customers_trash: store.customers.iter().filter(|c| c.deleted_at.is_some()).count(),
+        domains,
+        sites: store.scan_cache.len(),
+        by_kind,
+        need_update: store.scan_cache.iter().filter(|s| s.status.starts_with("업데이트")).count(),
+        file_bytes: store.scan_cache.iter().map(|s| s.file_bytes).sum(),
+        db_bytes: store.scan_cache.iter().map(|s| s.db_bytes).sum(),
+        no_cred,
+    }
 }
 
 /// 설정 페이지 내부 탭
@@ -501,7 +542,7 @@ impl App {
             show_trash: false,
             pending_delete: None,
             running_job: None,
-            view: MainView::Domain,
+            view: MainView::Dashboard,
             settings_tab: SettingsTab::Connect,
             acct_tab: AcctTab::Sites,
             all_sites: Vec::new(),
@@ -560,6 +601,7 @@ impl App {
     /// 현재 화면 위치를 UiState 로 (재시작 복원용).
     fn current_ui(&self) -> crate::model::UiState {
         let view = match self.view {
+            MainView::Dashboard => "dashboard",
             MainView::Domain => "domain",
             MainView::Settings => "settings",
             MainView::AllSites => "allsites",
@@ -606,12 +648,15 @@ impl App {
             "ssh" => SettingsTab::Ssh, "bulk" => SettingsTab::BulkUpdate, "moddel" => SettingsTab::ModuleDelete,
             "disk" => SettingsTab::Disk, "backup" => SettingsTab::Backup, _ => SettingsTab::Connect,
         };
-        self.view = match ui.view.as_str() {
+        self.view = if self.store.settings.start_view == "dashboard" {
+            MainView::Dashboard
+        } else { match ui.view.as_str() {
+            "dashboard" => MainView::Dashboard,
             "settings" => MainView::Settings,
             "allsites" => MainView::AllSites,
             "account" => self.sel_customer.map(MainView::AccountModules).unwrap_or(MainView::Domain),
             _ => MainView::Domain,
-        };
+        }};
     }
 
     /// 현재 선택된 도메인의 id
@@ -760,6 +805,95 @@ impl App {
         }
     }
 
+    /// 시작 대시보드. 이 함수는 로컬 캐시만 읽으며 원격 작업을 시작하지 않는다.
+    fn dashboard_page(&mut self, ctx: &egui::Context) {
+        let stats = local_stats(&self.store);
+        let settings = self.store.settings.clone();
+        let cache_at = self.store.scan_cache_at;
+        let mut go_all = false;
+        let mut go_bulk = false;
+        let mut go_disk = false;
+        let mut go_settings = false;
+        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(format!("{}  대시보드", ph::GAUGE));
+                ui.label(egui::RichText::new(version_line()).weak().small().monospace());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let host = if settings.ssh_host.trim().is_empty() { settings.hestia_host.trim() } else { settings.ssh_host.trim() };
+                    if settings.ssh_user.trim().is_empty() || host.is_empty() {
+                        ui.weak("서버 SSH 미설정");
+                    } else {
+                        ui.label(format!("{}@{}", settings.ssh_user.trim(), host));
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            ui.columns(3, |cols| {
+                card(&mut cols[0], |ui| {
+                    ui.strong("등록 현황");
+                    ui.add_space(7.0);
+                    egui::Grid::new("dash_local_registered").num_columns(2).show(ui, |ui| {
+                        ui.label("고객"); ui.heading(stats.customers.to_string()); ui.end_row();
+                        ui.label("도메인"); ui.heading(stats.domains.to_string()); ui.end_row();
+                        ui.label("휴지통"); ui.heading(stats.customers_trash.to_string()); ui.end_row();
+                    });
+                });
+                card(&mut cols[1], |ui| {
+                    ui.strong("서버 사이트");
+                    ui.add_space(7.0);
+                    if stats.sites == 0 {
+                        ui.label("아직 스캔하지 않았습니다.");
+                        if ui.link("전체 사이트에서 스캔").clicked() { go_all = true; }
+                    } else {
+                        ui.horizontal(|ui| { ui.label("사이트"); ui.heading(stats.sites.to_string()); });
+                        for (kind, count) in stats.by_kind.iter().take(4) {
+                            ui.label(format!("{kind}  {count}"));
+                        }
+                        ui.label(format!("파일 {} · DB {}", human_bytes(stats.file_bytes), human_bytes(stats.db_bytes)));
+                        ui.weak(format!("{} 기준", ago_text(cache_at)));
+                    }
+                });
+                card(&mut cols[2], |ui| {
+                    ui.strong("주의");
+                    ui.add_space(7.0);
+                    if stats.need_update == 0 && stats.no_cred == 0 {
+                        ui.colored_label(C_GREEN, "이상 없음");
+                    } else {
+                        if stats.need_update > 0 {
+                            ui.colored_label(egui::Color32::from_rgb(220, 150, 60), format!("{}  업데이트 필요 {}", ph::WARNING, stats.need_update));
+                        }
+                        if stats.no_cred > 0 {
+                            ui.colored_label(egui::Color32::from_rgb(220, 150, 60), format!("{}  자격증명 미입력 {}", ph::WARNING, stats.no_cred));
+                        }
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            card(ui, |ui| {
+                ui.horizontal(|ui| { ui.strong("서버 헬스"); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.add_enabled(false, egui::Button::new("새로고침")); }); });
+                ui.weak("아직 조회하지 않았습니다 — 서버 조회는 버튼을 눌렀을 때만 실행됩니다.");
+            });
+            ui.add_space(8.0);
+            card(ui, |ui| {
+                ui.horizontal(|ui| { ui.strong("도메인 헬스"); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.add_enabled(false, egui::Button::new("점검")); }); });
+                ui.weak("아직 점검하지 않았습니다 — 도메인 점검은 버튼을 눌렀을 때만 실행됩니다.");
+            });
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("바로가기:");
+                if ui.button("전체 사이트").clicked() { go_all = true; }
+                if ui.button("일괄 업데이트").clicked() { go_bulk = true; }
+                if ui.button("디스크 점검").clicked() { go_disk = true; }
+                if ui.button("설정").clicked() { go_settings = true; }
+            });
+        });
+        if go_all { self.view = MainView::AllSites; }
+        if go_bulk { self.view = MainView::Settings; self.settings_tab = SettingsTab::BulkUpdate; }
+        if go_disk { self.view = MainView::Settings; self.settings_tab = SettingsTab::Disk; }
+        if go_settings { self.view = MainView::Settings; }
+    }
+
     /// ⚙ 설정 페이지 (탭: HestiaCP 연동 / 서버 SSH / 일괄 업데이트 / 모듈 일괄삭제)
     fn settings_page(&mut self, ctx: &egui::Context) {
         let mut show_pw = self.show_pw;
@@ -867,6 +1001,14 @@ impl App {
                             });
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("읽기 전용입니다. 비정상 버전이 있으면 그 버전을, 모두 정상이면 최신 버전을 상세 출력합니다.").weak());
+                        });
+                        card(ui, |ui| {
+                            ui.strong("시작 화면");
+                            ui.label(egui::RichText::new("앱 잠금 해제 직후 표시할 화면을 선택합니다.").weak());
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut self.store.settings.start_view, "dashboard".into(), "항상 대시보드");
+                                ui.radio_value(&mut self.store.settings.start_view, "last".into(), "마지막 화면 복원");
+                            });
                         });
                     }
                     SettingsTab::Ssh => {
@@ -2277,6 +2419,7 @@ impl eframe::App for App {
         }
         self.bottom_log(ctx);
         match self.view {
+            MainView::Dashboard => self.dashboard_page(ctx),
             MainView::Settings => self.settings_page(ctx),
             MainView::AccountModules(ci) => self.account_modules_page(ctx, ci),
             MainView::AllSites => self.all_sites_page(ctx),
@@ -2400,6 +2543,10 @@ impl App {
                 ui.checkbox(&mut self.use_root, "루트로 실행")
                     .on_hover_text("켜면 서버루트 계정(있으면)으로 SSH 접속. 명령어 보기에도 반영됨");
                 ui.separator();
+                let in_dashboard = self.view == MainView::Dashboard;
+                if ui.selectable_label(in_dashboard, format!("{}  대시보드", ph::GAUGE)).on_hover_text("로컬 현황과 서버·도메인 헬스").clicked() {
+                    self.view = if in_dashboard { MainView::Domain } else { MainView::Dashboard };
+                }
                 let in_all = self.view == MainView::AllSites;
                 if ui.selectable_label(in_all, format!("{}  전체 사이트", ph::LIST_BULLETS)).on_hover_text("모든 계정의 사이트 CMS/버전/용량 통합 리스트 + 일괄 업데이트").clicked() {
                     self.view = if in_all { MainView::Domain } else { MainView::AllSites };

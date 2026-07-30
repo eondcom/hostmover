@@ -69,8 +69,11 @@ pub struct CachedSite {
 }
 
 /// 앱 설정 (HestiaCP 연동 등). 암호화 저장.
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Settings {
+    /// 시작 화면: "dashboard"(항상 대시보드) | "last"(마지막 화면 복원)
+    #[serde(default = "default_start_view")]
+    pub start_view: String,
     #[serde(default)]
     pub hestia_host: String,
     #[serde(default)]
@@ -99,6 +102,28 @@ pub struct Settings {
     /// WordPress 플러그인 소스 (로컬 PC의 dev/wp 경로 — 하위에 wp-content/plugins/ 포함)
     #[serde(default)]
     pub wp_source_local: String,
+}
+
+fn default_start_view() -> String {
+    "dashboard".into()
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            start_view: default_start_view(),
+            hestia_host: String::new(),
+            hestia_port: String::new(),
+            hestia_hash: String::new(),
+            ssl_verify: false,
+            ssh_host: String::new(),
+            ssh_user: String::new(),
+            ssh_pass: String::new(),
+            ssh_port: String::new(),
+            rx_source_local: String::new(),
+            wp_source_local: String::new(),
+        }
+    }
 }
 
 impl Settings {
