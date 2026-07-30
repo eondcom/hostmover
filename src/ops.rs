@@ -2584,14 +2584,19 @@ echo "[자동 감시]"
 if [ -f /etc/cron.d/hm-disk-monitor ]; then
   DL=$(cat /var/lib/hm-disk-monitor/last-run 2>/dev/null)
   DR=$(grep -v '^date' /var/lib/hm-disk-monitor/history.tsv 2>/dev/null | tail -1 | awk '{print $2}')
+  # 서버 타임존으로 epoch 변환 — 앱이 타임존을 추측하지 않게 한다
+  DLTS=""
+  [ -n "$DL" ] && DLTS=$(date -d "$DL" +%s 2>/dev/null)
   echo "  디스크 감시 설치됨 · 마지막 ${DL:-기록없음} · 최근판정 ${DR:-?}"
   echo "HM_DASH_DISKMON=1"
   echo "HM_DASH_DISKMON_LAST=${DL:-}"
+  echo "HM_DASH_DISKMON_LAST_TS=${DLTS:-}"
   echo "HM_DASH_DISKMON_RESULT=${DR:-}"
 else
   echo "  디스크 감시 미설치"
   echo "HM_DASH_DISKMON=0"
   echo "HM_DASH_DISKMON_LAST="
+  echo "HM_DASH_DISKMON_LAST_TS="
   echo "HM_DASH_DISKMON_RESULT="
 fi
 if [ -f /etc/cron.d/hm-traffic-monitor ]; then
@@ -5677,6 +5682,9 @@ mod tests {
         for destructive in ["rm -rf", "v-delete-", "DROP"] {
             assert!(!SERVER_SNAPSHOT_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
         }
+        assert_eq!(SERVER_SNAPSHOT_BODY.matches("HM_DASH_DISKMON_LAST_TS=").count(), 2,
+            "설치·미설치 양쪽 분기에서 epoch 마커를 출력해야 함");
+        assert!(SERVER_SNAPSHOT_BODY.contains("date -d \"$DL\" +%s"));
     }
 
     #[test]

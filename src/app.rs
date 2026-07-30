@@ -122,6 +122,7 @@ fn server_snapshot_from_markers(values: &HashMap<String, String>) -> ServerSnaps
         domains: get("DOMAINS"),
         diskmon: get("DISKMON"),
         diskmon_last: get("DISKMON_LAST"),
+        diskmon_last_ts: get("DISKMON_LAST_TS"),
         diskmon_result: get("DISKMON_RESULT"),
         trafficmon: get("TRAFFICMON"),
     }
@@ -391,8 +392,9 @@ fn fmt_kst(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, (secs % 3600) / 60)
 }
 
-/// 서버 감시가 남긴 `YYYY-MM-DD HH:MM[:SS]`(KST)를 unix초로 해석한다.
-fn parse_kst_datetime(value: &str) -> Option<i64> {
+/// "YYYY-MM-DD HH:MM:SS" 또는 epoch 문자열을 unix초로. 날짜문자열은 KST(+9)로
+/// 가정하므로 폴백 전용이다. 정확한 값은 서버가 계산한 `*_TS` 마커를 쓴다(Phase 5 §1).
+fn parse_server_datetime(value: &str) -> Option<i64> {
     if let Ok(ts) = value.trim().parse::<i64>() { return Some(ts); }
     let mut parts = value.split_whitespace();
     let date = parts.next()?;
@@ -410,6 +412,12 @@ fn parse_kst_datetime(value: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
     Some(days * 86400 + hour * 3600 + min * 60 + sec - 9 * 3600)
+}
+
+/// 서버 epoch를 우선하고, 구버전 캐시에만 날짜문자열 폴백을 적용한다.
+fn diskmon_last_at(snapshot: &ServerSnapshot) -> Option<i64> {
+    snapshot.diskmon_last_ts.trim().parse::<i64>().ok()
+        .or_else(|| parse_server_datetime(&snapshot.diskmon_last))
 }
 
 /// unix초 → "YYYY-MM-DD" (KST). 0 이하면 "-".
@@ -996,7 +1004,7 @@ impl App {
                     alerts.push((format!("도메인 이상 {dom_issues}건"), egui::Color32::from_rgb(220, 150, 60), "아래 보기"));
                 }
                 if snapshot.diskmon == "1" {
-                    if parse_kst_datetime(&snapshot.diskmon_last).is_some_and(|at| now_unix() - at > 36 * 3600) {
+                    if diskmon_last_at(&snapshot).is_some_and(|at| now_unix() - at > 36 * 3600) {
                         alerts.push(("디스크 감시가 하루 넘게 안 돌았습니다".into(), egui::Color32::from_rgb(220, 150, 60), "디스크 점검"));
                     }
                 } else if snapshot.at > 0 && snapshot.diskmon == "0" {
@@ -5232,8 +5240,25 @@ mod tests {
 
     #[test]
     fn disk_monitor_time_parsing() {
-        assert_eq!(parse_kst_datetime("1970-01-01 09:00:00"), Some(0));
-        assert_eq!(parse_kst_datetime("3600"), Some(3600));
-        assert!(parse_kst_datetime("기록없음").is_none());
+        assert_eq!(parse_server_datetime("1970-01-01 09:00:00"), Some(0));
+        assert_eq!(parse_server_datetime("3600"), Some(3600));
+        assert!(parse_server_datetime("기록없음").is_none());
+    }
+
+    #[test]
+    fn diskmon_last_prefers_server_epoch() {
+        let with_epoch = ServerSnapshot {
+            diskmon_last_ts: "12345".into(),
+            diskmon_last: "1970-01-01 09:00:00".into(),
+            ..Default::default()
+        };
+        assert_eq!(diskmon_last_at(&with_epoch), Some(12345));
+
+        let fallback = ServerSnapshot {
+            diskmon_last: "1970-01-01 09:00:00".into(),
+            ..Default::default()
+        };
+        assert_eq!(diskmon_last_at(&fallback), Some(0));
+        assert_eq!(diskmon_last_at(&ServerSnapshot::default()), None);
     }
 }
