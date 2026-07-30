@@ -2135,6 +2135,122 @@ fn ssh_admin_site(s: &Settings) -> Result<Site, String> {
     })
 }
 
+const SERVER_SNAPSHOT_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+echo "===== 서버 상태 스냅샷 ====="
+
+echo "[호스트]"
+echo "  $(hostname) · $(uname -r)"
+UP=$(uptime -p 2>/dev/null | sed 's/^up //'); echo "  가동 ${UP:-?}"
+echo "HM_DASH_HOST=$(hostname)"
+echo "HM_DASH_UPTIME=${UP:-?}"
+
+echo "[부하]"
+read L1 L5 L15 REST < /proc/loadavg
+CORES=$(nproc 2>/dev/null); [ -z "$CORES" ] && CORES=1
+echo "  load $L1 / $L5 / $L15  (코어 ${CORES})"
+echo "HM_DASH_LOAD1=$L1"
+echo "HM_DASH_LOAD5=$L5"
+echo "HM_DASH_CORES=$CORES"
+
+echo "[메모리]"
+MT=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+MA=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+[ -z "$MT" ] && MT=0; [ -z "$MA" ] && MA=0
+MU=$((MT - MA)); MP=0; [ "$MT" -gt 0 ] && MP=$((MU * 100 / MT))
+echo "  ${MU}MB / ${MT}MB (${MP}%)"
+echo "HM_DASH_MEMPCT=$MP"
+echo "HM_DASH_MEMTOTAL=$MT"
+
+echo "[디스크]"
+MAXP=0; MAXMP="-"
+while read -r FS SZ USED AVAIL PCT MP; do
+  # 실제 블록장치만 (efivarfs·tmpfs·overlay 같은 가상 fs 가 최대치를 오염시킨다)
+  case "$FS" in /dev/*) ;; *) continue ;; esac
+  P=${PCT%\%}
+  printf '  %-24s %5s  %5s 남음\n' "$MP" "$PCT" "$AVAIL"
+  if [ "$P" -gt "$MAXP" ] 2>/dev/null; then MAXP=$P; MAXMP=$MP; fi
+done < <(df -hP 2>/dev/null | awk 'NR>1')
+echo "HM_DASH_DISKMAX=$MAXP"
+echo "HM_DASH_DISKMAXMP=$MAXMP"
+
+echo "[서비스]"
+SVCFAIL=""
+for S in nginx apache2 mysql mariadb exim4 dovecot cron; do
+  systemctl list-unit-files "$S.service" >/dev/null 2>&1 || continue
+  if systemctl is-active --quiet "$S" 2>/dev/null; then
+    echo "  ✓ $S"
+  else
+    echo "  ✗ $S 정지"
+    SVCFAIL="$SVCFAIL $S"
+  fi
+done
+for U in $(systemctl list-units --type=service --state=running,failed 'php*-fpm.service' --no-legend 2>/dev/null | awk '{print $1}'); do
+  systemctl is-active --quiet "$U" 2>/dev/null || SVCFAIL="$SVCFAIL ${U%.service}"
+done
+NPHP=$(systemctl list-units --type=service 'php*-fpm.service' --no-legend 2>/dev/null | grep -c .)
+NPHPBAD=$(systemctl list-units --type=service --state=failed 'php*-fpm.service' --no-legend 2>/dev/null | grep -c .)
+echo "  php-fpm ${NPHP}개 중 실패 ${NPHPBAD}개"
+echo "HM_DASH_SVCFAIL=$(echo $SVCFAIL | sed 's/^ *//')"
+echo "HM_DASH_PHPFPM=$NPHP"
+echo "HM_DASH_PHPFPMBAD=$NPHPBAD"
+
+echo "[HestiaCP]"
+if [ -x "$VBIN/v-list-users" ]; then
+  NU=$("$VBIN/v-list-users" plain 2>/dev/null | grep -c .)
+  ND=0
+  for U in $("$VBIN/v-list-users" plain 2>/dev/null | awk '{print $1}'); do
+    N=$("$VBIN/v-list-web-domains" "$U" plain 2>/dev/null | grep -c .)
+    ND=$((ND + N))
+  done
+  echo "  계정 ${NU} · 웹도메인 ${ND}"
+  echo "HM_DASH_USERS=$NU"
+  echo "HM_DASH_DOMAINS=$ND"
+else
+  echo "  (HestiaCP CLI 없음)"
+  echo "HM_DASH_USERS=-"
+  echo "HM_DASH_DOMAINS=-"
+fi
+
+echo "[자동 감시]"
+if [ -f /etc/cron.d/hm-disk-monitor ]; then
+  DL=$(cat /var/lib/hm-disk-monitor/last-run 2>/dev/null)
+  DR=$(grep -v '^date' /var/lib/hm-disk-monitor/history.tsv 2>/dev/null | tail -1 | awk '{print $2}')
+  echo "  디스크 감시 설치됨 · 마지막 ${DL:-기록없음} · 최근판정 ${DR:-?}"
+  echo "HM_DASH_DISKMON=1"
+  echo "HM_DASH_DISKMON_LAST=${DL:-}"
+  echo "HM_DASH_DISKMON_RESULT=${DR:-}"
+else
+  echo "  디스크 감시 미설치"
+  echo "HM_DASH_DISKMON=0"
+  echo "HM_DASH_DISKMON_LAST="
+  echo "HM_DASH_DISKMON_RESULT="
+fi
+if [ -f /etc/cron.d/hm-traffic-monitor ]; then
+  echo "  트래픽 감시 설치됨"
+  echo "HM_DASH_TRAFFICMON=1"
+else
+  echo "  트래픽 감시 미설치"
+  echo "HM_DASH_TRAFFICMON=0"
+fi
+
+echo "===== 스냅샷 끝 =====""#;
+
+/// 서버 상태 스냅샷 (SSH, sudo, 읽기 전용).
+/// 부하·메모리·디스크·서비스·HestiaCP 규모·감시 설치 상태를 한 번에 모은다.
+pub fn build_server_snapshot(s: &Settings) -> Result<Job, String> {
+    let srv = ssh_admin_site(s)?;
+    let (script, sshpass, env) = eondcms_exec(&srv, SERVER_SNAPSHOT_BODY, false, true);
+    Ok(Job {
+        title: "서버 상태 스냅샷".into(),
+        script,
+        sshpass,
+        env,
+        note: "SSH 1회 · 읽기 전용 서버 상태 조회".into(),
+    })
+}
+
 /// 모듈 목록 조회 → (모듈명, 사용 도메인들) 정렬. domain=Some 이면 그 도메인만, None 이면 계정 전체.
 pub fn list_account_modules(s: &Settings, account: &str, domain: Option<&str>) -> Result<Vec<(String, Vec<String>)>, String> {
     let acct = account.trim();
@@ -4357,6 +4473,25 @@ mod tests {
         assert!(job.script.contains("ADMINU='admin'"), "{}", job.script);
         assert!(job.script.contains("NEWPASS='p'\\''w \"x\"$(id)'"), "{}", job.script);
         assert!(job.script.contains("wp_pw_one \"$VUSER\" \"$DOMAIN\" \"$WEBROOT\""), "{}", job.script);
+    }
+
+    #[test]
+    fn server_snapshot_is_safe_valid_bash() {
+        let st = Settings {
+            ssh_host: "10.0.0.1".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "tongpw".into(),
+            ..Default::default()
+        };
+        let job = build_server_snapshot(&st).unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        for destructive in ["rm -rf", "v-delete-", "DROP"] {
+            assert!(!SERVER_SNAPSHOT_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
+        }
     }
 
     #[test]

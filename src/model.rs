@@ -15,9 +15,34 @@ pub struct Store {
     /// 스캔 캐시 시각 (unix초)
     #[serde(default)]
     pub scan_cache_at: i64,
+    /// 마지막 서버 스냅샷 (대시보드에서 즉시 표시)
+    #[serde(default)]
+    pub server_snapshot: ServerSnapshot,
     /// 마지막 화면 상태 (재시작 시 복원)
     #[serde(default)]
     pub ui: UiState,
+}
+
+/// 마지막 서버 스냅샷 (대시보드에서 즉시 표시)
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct ServerSnapshot {
+    #[serde(default)] pub at: i64,
+    #[serde(default)] pub host: String,
+    #[serde(default)] pub uptime: String,
+    #[serde(default)] pub load1: String,
+    #[serde(default)] pub cores: String,
+    #[serde(default)] pub mem_pct: String,
+    #[serde(default)] pub disk_max: String,
+    #[serde(default)] pub disk_max_mp: String,
+    #[serde(default)] pub svc_fail: String,
+    #[serde(default)] pub phpfpm: String,
+    #[serde(default)] pub phpfpm_bad: String,
+    #[serde(default)] pub users: String,
+    #[serde(default)] pub domains: String,
+    #[serde(default)] pub diskmon: String,
+    #[serde(default)] pub diskmon_last: String,
+    #[serde(default)] pub diskmon_result: String,
+    #[serde(default)] pub trafficmon: String,
 }
 
 /// 재시작 시 복원할 마지막 화면 위치 (인덱스 대신 id 로 저장해 정렬/추가에도 안정적)
