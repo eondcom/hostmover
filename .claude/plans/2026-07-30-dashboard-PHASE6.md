@@ -14,6 +14,8 @@
 1. **숫자만 보고는 좋은지 나쁜지 모른다.** 등급(A~E, 우수~위험)과 함께 무엇을 해야 하는지 안내.
 2. **"디스크 추이를 봐라", "`/backup` 파티션을 확인해라" 같은 조언을 앱이 직접 점검**해서 알려주기.
 3. **도메인 헬스 목록이 스크롤도 안 되고 복사도 안 된다.** 97개 도메인에서 쓸 수 없다.
+4. **디스크가 2개다(운영·백업).** 지금은 최대 사용률 하나만 보여준다.
+   **디스크마다 따로** 헬스를 검사해 보여줘야 한다.
 
 ---
 
@@ -71,12 +73,36 @@ impl Grade {
 |---|---|---|---|---|---|---|
 | **부하** `load1/cores` | <0.5 | <0.8 | <1.2 | <2.0 | ≥2.0 | 1.0 = 코어 포화 시작점. 2.0 이상은 대기가 쌓이는 상태 |
 | **메모리** | <60% | <75% | <85% | <93% | ≥93% | 93% 넘으면 스왑·OOM 위험 |
-| **디스크** 최대사용률 | <70% | <80% | <88% | <95% | ≥95% | 95%는 서비스 장애 임박. 88%는 대응 시간 확보선 |
+| **디스크** (디스크별, §2-2-1) | <70% | <80% | <88% | <95% | ≥95% | 95%는 서비스 장애 임박. 88%는 대응 시간 확보선 |
 | **서비스 정지** | 0개 | — | — | — | 1개 이상 | 하나라도 죽으면 그 자체로 장애다 |
 | **PHP-FPM 실패** | 0개 | — | — | 1개 | 2개 이상 | 실패 1개 = 일부 사이트 다운 |
 | **도메인 이상** 비율 | 0% | ≤2% | ≤5% | ≤15% | >15% | 테스트 도메인 등 1~2건은 흔한 잡음. 15% 초과는 구조적 문제 |
 | **인증서** | 만료0·임박0 | 임박≤2 | 임박≥3 | 만료1 | 만료≥2 | 만료는 즉시 접속 불가 |
 | **자동 감시** | 설치+최근 | 설치+지연(36h+) | 미설치 | — | — | 서버 건강이 아니라 운영 준비 상태 |
+
+### 2-2-1. 디스크는 **하나로 뭉치지 않는다**
+
+운영 디스크와 백업 디스크는 성격이 다르다. 운영이 60%인데 백업이 95%면 "디스크 95%" 하나로는
+어느 쪽이 위험한지 알 수 없고, **백업 디스크가 차면 백업이 실패**한다는 점이 드러나지 않는다.
+
+**디스크마다 등급을 매기고, 디스크 항목의 등급은 그중 최악을 쓴다.**
+
+한 디스크의 등급은 아래 중 **최악**이다:
+
+| 세부 | A | B | C | D | E |
+|---|---|---|---|---|---|
+| 사용률 | <70% | <80% | <88% | <95% | >=95% |
+| inode 사용률 | <70% | <80% | <88% | <95% | >=95% |
+| SMART 상태 | `PASSED` | - | 조회불가(`-`) | - | 그 외(`FAILED` 등) |
+| 재할당+대기 섹터 | 둘 다 0 | - | 합계 1~9 | 합계 10~49 | 합계 50+ |
+| FS 누적 에러 | 0 | - | 1~9 | 10+ | - |
+
+- SMART 조회불가(`-`)는 **C(주의)** 로 둔다. A 로 두면 smartmontools 미설치 서버가 영원히
+  "우수"로 보이고, E 로 두면 조회가 원래 안 되는 환경에서 계속 빨간불이라 무시하게 된다.
+- 값이 `-` 인 세부는 그 세부만 건너뛴다(디스크 전체를 미조회로 만들지 않는다).
+
+**백업 디스크 가중**: 역할이 `backup` 인 디스크가 **D 이하**면 권고에 반드시 넣는다(§3-3).
+백업이 실패하면 계정 삭제·복구 경로가 통째로 막힌다.
 
 ### 2-3. 총합 등급 = **최악 항목** (평균 금지)
 
@@ -122,6 +148,22 @@ fn overall_grade(items: &[(String, Grade, bool /*is_monitoring*/)]) -> Option<Gr
   (예: `"디스크 69% · C 주의 (기준: A<70 B<80 C<88 D<95 E≥95)"`)
 - 미조회 상태: 등급 자리에 `?` 회색 + `서버 헬스를 조회하면 등급이 표시됩니다`
 
+### 2-5-1. 디스크 목록 표시
+
+등급 카드 아래(또는 서버 헬스 카드 안)에 **디스크마다 한 줄**로 보여준다.
+
+```
+디스크
+  ● /home    운영   82%  170G 남음   inode 9%   SMART PASSED            B
+  ● /backup  백업   94%  110G 남음   inode 1%   SMART FAILED! 섹터 60   E
+```
+
+- 앞의 `●` 를 디스크 등급 색으로 칠한다
+- 역할은 `운영`/`백업`/`기타` 로 한글 표시
+- `-` 인 값은 칸을 비우지 말고 `조회불가` 로 적는다(빈칸은 "정상"으로 오해된다)
+- 디스크가 1개뿐이어도 같은 형식으로 보여준다(형식이 바뀌면 혼란)
+- 마우스를 올리면 물리 디스크명·가동시간·온도를 `on_hover_text` 로
+
 ### 2-6. 테스트
 
 ```rust
@@ -133,6 +175,16 @@ fn grade_rules_and_overall() {
     // 감시 미설치(C)만 나쁠 때 → 총합이 C 보다 나빠지지 않는다
     // 항목이 없으면 None (미조회)
     // 도메인 미점검이면 도메인·인증서 항목이 제외된다
+}
+
+#[test]
+fn disk_grade_rules() {
+    // 사용률 94% → D, 95% → E (경계)
+    // SMART "PASSED" → A, "FAILED!" → E, "-" → C (미조회를 A 로 두지 않는다)
+    // 재할당+대기 합계 9 → C, 10 → D, 50 → E
+    // 한 디스크의 등급 = 세부 중 최악
+    // 디스크 항목 등급 = 디스크들 중 최악 (운영 A + 백업 E → E)
+    // 세부값이 "-" 면 그 세부만 건너뛰고 나머지로 판정한다
 }
 ```
 
@@ -217,6 +269,105 @@ echo "HM_DASH_SOCKDUP=$DUP"
 | 감소 추세(80→69%) | `하루 -1.10%p`, ETA 빈 값 |
 | 이미 95% 초과 | RATE 계산, ETA 빈 값 |
 
+**한계 (이번 범위 밖)**: 추이는 디스크 감시가 남기는 `history.tsv` 의 `use%` 컬럼을 쓰는데,
+이 값은 **그날의 최대 사용률 하나**다. 따라서 추이·95% 도달 예상은 "가장 많이 찬 디스크" 기준이고
+디스크별로 나뉘지 않는다. 디스크별 추이가 필요하면 감시 스크립트(`hm-disk-monitor.sh`)가
+`disk-usage.tsv`(`날짜 · 마운트포인트 · 사용률`)를 따로 남기도록 고쳐야 한다 — **별도 지시서로 다룬다.**
+지금은 추이 문구에 어느 마운트포인트 기준인지(`disk_max_mp`)를 함께 표시해 오해를 막는다.
+
+### 3-1-1. 디스크별 수집 — 같은 스냅샷 안에 이어서 추가
+
+**실제 실행 검증했다(2디스크 시나리오 포함). 그대로 쓸 것.**
+
+```sh
+echo "[디스크별 헬스]"
+
+# 물리 디스크 SMART 는 파티션마다 다시 물으면 느리다. 한 번 조회해 캐시한다.
+SMCACHE=$(mktemp)
+smart_of() {   # $1=물리디스크명(sda) → "상태 realloc pending 가동h 온도"
+  local D="$1" line
+  line=$(grep -m1 "^$D " "$SMCACHE" 2>/dev/null)
+  if [ -n "$line" ]; then printf '%s' "${line#* }"; return; fi
+  local H="-" RS="-" PS="-" POH="-" TMP="-"
+  if command -v smartctl >/dev/null 2>&1 && [ -b "/dev/$D" ]; then
+    H=$(smartctl -H "/dev/$D" 2>/dev/null | grep -iE 'overall-health|SMART Health Status' | sed 's/.*: *//' | tr -d ' ')
+    [ -z "$H" ] && H="-"
+    local A
+    A=$(smartctl -A "/dev/$D" 2>/dev/null)
+    RS=$(printf '%s' "$A" | awk '/Reallocated_Sector_Ct/{print $10; exit}')
+    PS=$(printf '%s' "$A" | awk '/Current_Pending_Sector/{print $10; exit}')
+    POH=$(printf '%s' "$A" | awk '/Power_On_Hours/{print $10; exit}')
+    TMP=$(printf '%s' "$A" | awk '/Temperature_Celsius|Airflow_Temperature/{print $10; exit}')
+    # NVMe 는 속성 이름이 다르다
+    if [ "$RS" = "" ] || [ "$POH" = "" ]; then
+      local N
+      N=$(smartctl -A "/dev/$D" 2>/dev/null)
+      [ -z "$POH" ] && POH=$(printf '%s' "$N" | awk -F: '/Power On Hours/{gsub(/[ ,]/,"",$2); print $2; exit}')
+      [ -z "$TMP" ] && TMP=$(printf '%s' "$N" | awk -F: '/Temperature:/{gsub(/[^0-9]/,"",$2); print $2; exit}')
+      [ -z "$RS" ] && RS=$(printf '%s' "$N" | awk -F: '/Available Spare:/{gsub(/[^0-9]/,"",$2); print "spare"$2; exit}')
+    fi
+  fi
+  [ -z "$RS" ] && RS="-"; [ -z "$PS" ] && PS="-"; [ -z "$POH" ] && POH="-"; [ -z "$TMP" ] && TMP="-"
+  echo "$D $H $RS $PS $POH $TMP" >> "$SMCACHE"
+  printf '%s' "$H $RS $PS $POH $TMP"
+}
+
+NDISK=0
+while read -r FS SZ USED AVAIL PCT MP; do
+  case "$FS" in /dev/*) ;; *) continue ;; esac
+  case "$MP" in /boot*|/efi*) continue ;; esac      # 부팅 파티션은 운영 지표가 아니다
+  P=${PCT%\%}
+  # inode 사용률
+  IP=$(df -iP "$MP" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}'); [ -z "$IP" ] && IP="-"
+  # 물리 디스크
+  PK=$(lsblk -no PKNAME "$FS" 2>/dev/null | head -1 | tr -d ' ')
+  [ -z "$PK" ] && PK=$(basename "$FS")
+  # ext 계열이면 누적 FS 에러
+  FE="-"
+  if [ -b "$FS" ]; then
+    FE=$(tune2fs -l "$FS" 2>/dev/null | awk -F: '/FS Error count/{gsub(/ /,"",$2); print $2; exit}')
+    [ -z "$FE" ] && FE="-"
+  fi
+  # 역할 — 백업 디스크가 차면 백업이 실패하므로 구분해서 보여준다
+  ROLE=other
+  case "$MP" in
+    /backup*|*backup*|*Backup*) ROLE=backup ;;
+    /|/home|/home/*|/var|/var/*) ROLE=main ;;
+  esac
+  SM=$(smart_of "$PK")
+  NDISK=$((NDISK + 1))
+  printf '  %-14s %-16s %-7s %4s%%  %6s 남음  inode %3s%%  %s\n' "$MP" "$FS" "$ROLE" "$P" "$AVAIL" "$IP" "$SM"
+  # 마커: 마운트포인트 장치 물리디스크 역할 사용% 남은 inode% FS에러 SMART realloc pending 가동h 온도
+  printf 'HM_DISK %s %s %s %s %s %s %s %s %s\n' "$MP" "$FS" "$PK" "$ROLE" "$P" "$AVAIL" "$IP" "$FE" "$SM"
+done < <(df -hP 2>/dev/null | awk 'NR>1')
+
+[ "$NDISK" = 0 ] && echo "  (검사 가능한 디스크를 찾지 못했습니다)"
+echo "HM_DASH_DISKN=$NDISK"
+rm -f "$SMCACHE"
+```
+
+검증한 동작 (운영 `/home` 82%, 백업 `/backup` 94% + SMART 불량 시나리오):
+
+```
+  /home          /dev/sda1        main      82%    170G 남음  inode   9%  PASSED 0 0 43800 41
+HM_DISK /home /dev/sda1 sda main 82 170G 9 0 PASSED 0 0 43800 41
+  /backup        /dev/sdb1        backup    94%    110G 남음  inode   1%  FAILED! 48 12 43800 41
+HM_DISK /backup /dev/sdb1 sdb backup 94 110G 1 3 FAILED! 48 12 43800 41
+HM_DASH_DISKN=2
+```
+
+설계 메모:
+
+- `HM_DISK` 는 도메인 헬스의 `HM_DOMH` 와 같은 "한 줄에 한 건" 형식이다. 파싱도 같은 방식.
+  필드는 `마운트포인트 장치 물리디스크 역할 사용% 남은용량 inode% FS에러 SMART realloc pending 가동h 온도` **13개**.
+- SMART 는 **물리 디스크** 단위다. 파티션(`/dev/sda1`)에서 `lsblk -no PKNAME` 으로 부모(`sda`)를
+  찾아 조회하고, 같은 디스크를 두 번 묻지 않도록 캐시한다(파티션이 여러 개면 느려진다).
+- `/boot`·`/efi` 는 운영 지표가 아니라 제외한다. 실측에서 `/boot/efi` 가 섞여 나왔다.
+- 역할(`main`/`backup`/`other`)은 마운트포인트로 판별한다. 오판이 있어도 **표시용**이며
+  등급 계산은 역할과 무관하다(백업 가중은 권고에서만 쓴다).
+- NVMe 는 SMART 속성 이름이 SATA 와 달라 폴백을 넣었다. 값이 없으면 `-` 로 나가고
+  §2-2-1 규칙에 따라 그 세부만 건너뛴다.
+
 ### 3-2. `ServerSnapshot` 필드 추가
 
 ```rust
@@ -231,7 +382,32 @@ echo "HM_DASH_SOCKDUP=$DUP"
 ```
 
 마커 이름은 기존 파싱과 같은 방식(`HM_DASH_` 접두어 제거 후 키)으로 자동 매핑된다:
-`DISKRATE`, `DISKETA`, `DISKSPAN`, `BACKUPSAME`, `BACKUPSRC`, `PHPVERS`, `PHPVERN`, `SOCKDUP`.
+`DISKRATE`, `DISKETA`, `DISKSPAN`, `BACKUPSAME`, `BACKUPSRC`, `PHPVERS`, `PHPVERN`, `SOCKDUP`, `DISKN`.
+
+디스크별 항목은 별도 구조체로 받는다(`HM_DISK` 줄, `DomainHealth` 와 같은 패턴):
+
+```rust
+/// 디스크 1건의 헬스 (마커 HM_DISK 한 줄)
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct DiskHealth {
+    #[serde(default)] pub mount: String,     // /home
+    #[serde(default)] pub device: String,    // /dev/sda1
+    #[serde(default)] pub disk: String,      // sda (물리 디스크)
+    #[serde(default)] pub role: String,      // "main"|"backup"|"other"
+    #[serde(default)] pub use_pct: String,   // 82
+    #[serde(default)] pub avail: String,     // 170G
+    #[serde(default)] pub inode_pct: String, // 9   ("-" 가능)
+    #[serde(default)] pub fs_err: String,    // 0   ("-" 가능)
+    #[serde(default)] pub smart: String,     // PASSED / FAILED! / "-"
+    #[serde(default)] pub realloc: String,   // "-" 가능
+    #[serde(default)] pub pending: String,   // "-" 가능
+    #[serde(default)] pub power_h: String,   // "-" 가능
+    #[serde(default)] pub temp_c: String,    // "-" 가능
+}
+```
+
+`Store` 에 `#[serde(default)] pub disk_health: Vec<DiskHealth>` 추가.
+스냅샷 조회 성공 시(`Done{ok:true}`) 통째로 교체한다.
 
 ### 3-3. 권고 목록 (등급과 별개)
 
@@ -248,6 +424,10 @@ fn advisories(store: &Store) -> Vec<(String /*문구*/, Option<&'static str> /*�
 | `disk_rate` 가 비었고 `diskmon=="1"` | `디스크 추이 데이터가 부족합니다 — 며칠 더 쌓이면 증가 속도를 알 수 있습니다` | — |
 | `backup_src` 가 빈 문자열 | `/backup 이 없습니다 — 계정 백업(v-backup-user)이 실패할 수 있습니다` | — |
 | `backup_same == "1"` | `/backup 이 /home 과 같은 파티션입니다 — 큰 계정 백업 시 디스크를 채울 수 있습니다` | — |
+| 역할 `backup` 디스크가 D 이하 | `백업 디스크 M 상태 D — 백업이 실패하면 복구 경로가 막힙니다` | 디스크 점검 |
+| 역할 `backup` 사용률 >=90% | `백업 디스크 M 사용률 P% — v-backup-user 가 곧 실패합니다` | 디스크 점검 |
+| SMART 가 `PASSED` 아닌 디스크 | `디스크 D SMART 이상(S) — 교체를 검토하세요` | 디스크 점검 |
+| 재할당+대기 합계 >=10 | `디스크 D 불량섹터 N개 — 늘어나면 교체 신호입니다` | 점검 기록 보기 |
 | `php_vern` ≥ 2 | `PHP-FPM 버전이 N개 공존합니다 (V) — 도메인 버전 변경 후 구버전도 재시작하세요` | PHP-FPM 진단 |
 | `sock_dup` > 0 | `PHP-FPM 소켓 중복 정의 N건 — 2026-07-25 장애의 원인이었습니다` | PHP-FPM 진단 |
 | `diskmon == "0"` | `디스크 자동 감시가 설치되지 않았습니다` | 디스크 점검 |
@@ -338,6 +518,11 @@ fn domain_health_tsv_export() {
 6. 스크립트에 추가한 섹션은 `set +e` 환경이다. `date -d` 가 실패해도 빈 값으로 넘어가야 한다.
 7. 권고 문구를 UI 와 스크립트 양쪽에 쓰지 말 것. **문구는 Rust 한 곳**에만 둔다
    (스크립트는 수치만 출력). 두 곳에 있으면 어긋난다.
+8. **디스크를 최대값 하나로 뭉치지 말 것.** 운영과 백업은 성격이 다르고, 백업 디스크가 차면
+   백업이 실패한다는 사실이 최대값 하나로는 드러나지 않는다.
+9. SMART 조회불가(`-`)를 A 로 처리하지 말 것. smartmontools 미설치 서버가 영원히 "우수"가 된다.
+10. `HM_DISK` 줄의 필드 수가 13이 아니면 그 줄을 **버린다**. 마운트포인트에 공백이 들어가면
+    열이 밀려 엉뚱한 값이 등급에 들어간다.
 
 ---
 
@@ -352,4 +537,8 @@ fn domain_health_tsv_export() {
 - [ ] 권고 목록이 조건대로 뜨고, 없으면 초록 안내가 보인다
 - [ ] 도메인 헬스 목록이 **스크롤되고**, `이상만 복사`/`전체 복사` 가 TSV 로 동작한다
 - [ ] 셀 텍스트를 드래그로 선택할 수 있다
-- [ ] `docs/dashboard.md` 에 등급표(§2-2)와 총합 규칙(§2-3), 복사 형식을 추가
+- [ ] **디스크가 2개면 2줄로** 보이고 각각 등급·SMART·inode 가 표시된다
+- [ ] 운영 A + 백업 E 상황에서 디스크 항목 등급이 **E** 가 된다(최대값 뭉개기 아님)
+- [ ] SMART `-` 인 디스크가 C 로 잡힌다(A 가 아님)
+- [ ] 백업 디스크가 90% 이상이거나 D 이하면 권고에 뜬다
+- [ ] `docs/dashboard.md` 에 등급표(§2-2)·디스크별 규칙(§2-2-1)·총합 규칙(§2-3)·복사 형식을 추가
