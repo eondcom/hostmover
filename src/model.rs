@@ -61,6 +61,8 @@ pub struct ServerSnapshot {
     #[serde(default)] pub domains: String,
     #[serde(default)] pub diskmon: String,
     #[serde(default)] pub diskmon_last: String,
+    /// 디스크 감시 마지막 실행 시각(unix초, 서버가 계산). 빈 문자열이면 미상.
+    #[serde(default)] pub diskmon_last_ts: String,
     #[serde(default)] pub diskmon_result: String,
     #[serde(default)] pub trafficmon: String,
 }
