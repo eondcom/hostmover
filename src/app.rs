@@ -153,6 +153,96 @@ fn domain_issue(h: &DomainHealth) -> Option<String> {
     if issues.is_empty() { None } else { Some(issues.join(" · ")) }
 }
 
+/// 서버 상태 등급. 낮을수록(A) 좋다.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Grade { A, B, C, D, E }
+
+impl Grade {
+    fn label(self) -> &'static str {
+        match self { Grade::A => "우수", Grade::B => "양호", Grade::C => "주의", Grade::D => "경고", Grade::E => "위험" }
+    }
+    fn letter(self) -> &'static str {
+        match self { Grade::A => "A", Grade::B => "B", Grade::C => "C", Grade::D => "D", Grade::E => "E" }
+    }
+    fn color(self) -> egui::Color32 {
+        match self {
+            Grade::A => C_GREEN,
+            Grade::B => egui::Color32::from_rgb(0x6E, 0xA8, 0x4F),
+            Grade::C => egui::Color32::from_rgb(0xDC, 0x96, 0x3C),
+            Grade::D => egui::Color32::from_rgb(0xD1, 0x6B, 0x3E),
+            Grade::E => C_RED,
+        }
+    }
+}
+
+fn ratio_grade(v: f32, bounds: [f32; 4]) -> Grade {
+    if v < bounds[0] { Grade::A } else if v < bounds[1] { Grade::B }
+    else if v < bounds[2] { Grade::C } else if v < bounds[3] { Grade::D } else { Grade::E }
+}
+
+fn percent_grade(v: u32, bounds: [u32; 4]) -> Grade {
+    if v < bounds[0] { Grade::A } else if v < bounds[1] { Grade::B }
+    else if v < bounds[2] { Grade::C } else if v < bounds[3] { Grade::D } else { Grade::E }
+}
+
+/// 총합 등급은 항목 중 최악이다. 자동 감시는 총합을 C보다 나쁘게 만들지 않는다.
+fn overall_grade(items: &[(String, Grade, bool)]) -> Option<Grade> {
+    items.iter().map(|(_, grade, monitoring)| if *monitoring { (*grade).min(Grade::C) } else { *grade }).max()
+}
+
+/// (항목명, 등급, 자동감시 여부, 실제 수치·기준 설명)
+fn grade_items(store: &Store) -> Vec<(String, Grade, bool, String)> {
+    let mut items = Vec::new();
+    let s = &store.server_snapshot;
+    if s.at > 0 {
+        if let (Ok(load), Ok(cores)) = (s.load1.parse::<f32>(), s.cores.parse::<f32>()) {
+            if cores > 0.0 {
+                let ratio = load / cores;
+                items.push(("부하".into(), ratio_grade(ratio, [0.5, 0.8, 1.2, 2.0]), false,
+                    format!("load1 {} / {}코어 = {:.2} (기준: A<0.5 B<0.8 C<1.2 D<2.0 E≥2.0)", s.load1, s.cores, ratio)));
+            }
+        }
+        if let Ok(mem) = s.mem_pct.parse::<u32>() {
+            items.push(("메모리".into(), percent_grade(mem, [60, 75, 85, 93]), false,
+                format!("메모리 {mem}% (기준: A<60 B<75 C<85 D<93 E≥93)")));
+        }
+        if let Ok(disk) = s.disk_max.parse::<u32>() {
+            items.push(("디스크".into(), percent_grade(disk, [70, 80, 88, 95]), false,
+                format!("디스크 {}% ({}) (기준: A<70 B<80 C<88 D<95 E≥95)", s.disk_max, s.disk_max_mp)));
+        }
+        let services = s.svc_fail.split_whitespace().count();
+        items.push(("서비스".into(), if services == 0 { Grade::A } else { Grade::E }, false,
+            if services == 0 { "정지 서비스 없음".into() } else { format!("정지 서비스 {services}개: {}", s.svc_fail) }));
+        if let Ok(bad) = s.phpfpm_bad.parse::<u32>() {
+            let grade = match bad { 0 => Grade::A, 1 => Grade::D, _ => Grade::E };
+            items.push(("PHP-FPM".into(), grade, false, format!("PHP-FPM {}개 중 실패 {bad}개", s.phpfpm)));
+        }
+        let monitor_grade = if s.diskmon != "1" { Grade::C }
+            else if diskmon_last_at(s).is_some_and(|at| now_unix() - at > 36 * 3600) { Grade::B }
+            else { Grade::A };
+        let monitor_detail = match monitor_grade {
+            Grade::A => "디스크 감시 설치·최근 실행".into(),
+            Grade::B => "디스크 감시 설치·36시간 이상 지연".into(),
+            _ => "디스크 자동 감시 미설치".into(),
+        };
+        items.push(("감시".into(), monitor_grade, true, monitor_detail));
+    }
+    if !store.domain_health.is_empty() {
+        let total = store.domain_health.len();
+        let bad = store.domain_health.iter().filter(|h| domain_issue(h).is_some()).count();
+        let pct = bad as f32 * 100.0 / total as f32;
+        let grade = if bad == 0 { Grade::A } else if pct <= 2.0 { Grade::B } else if pct <= 5.0 { Grade::C }
+            else if pct <= 15.0 { Grade::D } else { Grade::E };
+        items.push(("도메인".into(), grade, false, format!("이상 {bad}/{total}건 ({pct:.1}%) (기준: A=0 B≤2% C≤5% D≤15% E>15%)")));
+        let expired = store.domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| d < 0)).count();
+        let soon = store.domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| (0..=14).contains(&d))).count();
+        let grade = if expired >= 2 { Grade::E } else if expired == 1 { Grade::D }
+            else if soon >= 3 { Grade::C } else if soon > 0 { Grade::B } else { Grade::A };
+        items.push(("인증서".into(), grade, false, format!("만료 {expired}건 · 14일 이내 {soon}건")));
+    }
+    items
+}
+
 /// 설정 페이지 내부 탭
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsTab {
@@ -905,6 +995,11 @@ impl App {
         let snapshot = self.store.server_snapshot.clone();
         let domain_health = self.store.domain_health.clone();
         let domain_health_at = self.store.domain_health_at;
+        let grade_data = grade_items(&self.store);
+        let grade_keys: Vec<_> = grade_data.iter().map(|(name, grade, monitor, _)| (name.clone(), *grade, *monitor)).collect();
+        let mut total_grade = overall_grade(&grade_keys);
+        // 도메인을 점검하지 않은 A는 거짓 안심이므로 검증 전 상태인 B로 표시한다.
+        if domain_health.is_empty() && total_grade == Some(Grade::A) { total_grade = Some(Grade::B); }
         let snapshot_running = self.dash_running == Some(DashRun::Snapshot);
         let domain_running = self.dash_running == Some(DashRun::DomainHealth);
         let ssh_ready = !settings.ssh_user.trim().is_empty()
@@ -931,6 +1026,37 @@ impl App {
                         ui.label(format!("{}@{}", settings.ssh_user.trim(), host));
                     }
                 });
+            });
+            ui.add_space(10.0);
+            card(ui, |ui| {
+                ui.strong("종합 상태");
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    match total_grade {
+                        Some(grade) => {
+                            ui.label(egui::RichText::new(grade.letter()).size(32.0).strong().color(grade.color()));
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(format!("{} ({})", grade.letter(), grade.label())).size(18.0).strong().color(grade.color()));
+                                ui.weak(format!("{} · {} 기준", if snapshot.host.is_empty() { "서버" } else { &snapshot.host }, ago_text(snapshot.at.max(domain_health_at))));
+                                if domain_health.is_empty() { ui.weak("도메인 미점검"); }
+                            });
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("?").size(32.0).strong().color(egui::Color32::GRAY));
+                            ui.weak("서버 헬스를 조회하면 등급이 표시됩니다");
+                        }
+                    }
+                });
+                if !grade_data.is_empty() {
+                    ui.add_space(5.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, grade, _, detail) in &grade_data {
+                            let color = if *grade >= Grade::C { grade.color() } else { ui.visuals().text_color() };
+                            ui.label(egui::RichText::new(format!("{name} {}", grade.letter())).color(color))
+                                .on_hover_text(detail);
+                        }
+                    });
+                }
             });
             ui.add_space(10.0);
             card(ui, |ui| {
@@ -4753,5 +4879,34 @@ mod tests {
         };
         assert_eq!(diskmon_last_at(&fallback), Some(0));
         assert_eq!(diskmon_last_at(&ServerSnapshot::default()), None);
+    }
+
+    #[test]
+    fn grade_rules_and_overall() {
+        assert_eq!(ratio_grade(0.79, [0.5, 0.8, 1.2, 2.0]), Grade::B);
+        assert_eq!(ratio_grade(0.80, [0.5, 0.8, 1.2, 2.0]), Grade::C);
+        assert_eq!(percent_grade(74, [60, 75, 85, 93]), Grade::B);
+        assert_eq!(percent_grade(75, [60, 75, 85, 93]), Grade::C);
+        assert_eq!(percent_grade(87, [70, 80, 88, 95]), Grade::C);
+        assert_eq!(percent_grade(88, [70, 80, 88, 95]), Grade::D);
+        assert_eq!(overall_grade(&[]), None);
+        assert_eq!(overall_grade(&[("부하".into(), Grade::A, false), ("서비스".into(), Grade::E, false)]), Some(Grade::E));
+        assert_eq!(overall_grade(&[("부하".into(), Grade::A, false), ("감시".into(), Grade::E, true)]), Some(Grade::C));
+
+        let store = Store {
+            server_snapshot: ServerSnapshot {
+                at: 1, load1: "0.1".into(), cores: "4".into(), mem_pct: "10".into(),
+                disk_max: "20".into(), phpfpm_bad: "0".into(), diskmon: "1".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let items = grade_items(&store);
+        assert!(!items.iter().any(|(name, _, _, _)| name == "도메인" || name == "인증서"));
+
+        let mut failed = store;
+        failed.server_snapshot.svc_fail = "nginx".into();
+        let keys: Vec<_> = grade_items(&failed).iter().map(|(n, g, m, _)| (n.clone(), *g, *m)).collect();
+        assert_eq!(overall_grade(&keys), Some(Grade::E));
     }
 }
