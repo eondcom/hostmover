@@ -1,6 +1,8 @@
 use crate::model::{ActivityLog, BackupStatus, BackupUser, CachedSite, CmsAccess, CmsKind, Customer, CustomerNote, DiskHealth, Domain, DomainAccess, DomainHealth, IdleSite, ServerSnapshot, Site, Store};
 use crate::ops::{self, LogMsg, OpKind};
 use crate::store;
+use crate::ui::{self as console_ui, color, space, SortState};
+use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as ph;
 use std::collections::HashMap;
 use std::path::Path;
@@ -114,38 +116,40 @@ fn dashboard_stat_card(ui: &mut egui::Ui, index: usize, stats: &LocalStats, cach
     let mut go_all = false;
     card(ui, |ui| match index {
         0 => {
-            ui.strong("등록 현황");
-            ui.add_space(7.0);
-            egui::Grid::new(("dash_local_registered", index)).num_columns(2).show(ui, |ui| {
-                ui.label("고객"); ui.heading(stats.customers.to_string()); ui.end_row();
-                ui.label("도메인"); ui.heading(stats.domains.to_string()); ui.end_row();
-                ui.label("휴지통"); ui.heading(stats.customers_trash.to_string()); ui.end_row();
+            console_ui::section(ui, "등록 현황", |_| {}, |ui| {
+                ui.horizontal(|ui| {
+                    console_ui::stat(ui, &stats.customers.to_string(), "고객", None);
+                    ui.separator();
+                    console_ui::stat(ui, &stats.domains.to_string(), "도메인", None);
+                    ui.separator();
+                    console_ui::stat(ui, &stats.customers_trash.to_string(), "휴지통", None);
+                });
             });
         }
         1 => {
             ui.strong("서버 사이트");
-            ui.add_space(7.0);
+            ui.add_space(space::SM);
             if stats.sites == 0 {
                 ui.label("아직 스캔하지 않았습니다.");
                 if ui.link("전체 사이트에서 스캔").clicked() { go_all = true; }
             } else {
-                ui.horizontal(|ui| { ui.label("사이트"); ui.heading(stats.sites.to_string()); });
+                console_ui::stat(ui, &stats.sites.to_string(), "사이트", None);
                 for (kind, count) in stats.by_kind.iter().take(4) { ui.label(format!("{kind}  {count}")); }
                 ui.label(format!("파일 {} · DB {}", human_bytes(stats.file_bytes), human_bytes(stats.db_bytes)));
-                ui.weak(format!("{} 기준", ago_text(cache_at)));
+                ui.weak(format!("{} 기준", observed_at(cache_at)));
             }
         }
         _ => {
             ui.strong("주의");
-            ui.add_space(7.0);
+            ui.add_space(space::SM);
             if stats.need_update == 0 && stats.no_cred == 0 {
-                ui.colored_label(C_GREEN, "이상 없음");
+                console_ui::badge(ui, "● 정상 · 이상 없음", color::OK);
             } else {
                 if stats.need_update > 0 {
-                    ui.colored_label(egui::Color32::from_rgb(220, 150, 60), format!("{}  업데이트 필요 {}", ph::WARNING, stats.need_update));
+                    console_ui::badge(ui, &format!("● 주의 · 업데이트 필요 {}", stats.need_update), color::WARN);
                 }
                 if stats.no_cred > 0 {
-                    ui.colored_label(egui::Color32::from_rgb(220, 150, 60), format!("{}  자격증명 미입력 {}", ph::WARNING, stats.no_cred));
+                    console_ui::badge(ui, &format!("● 주의 · 자격증명 미입력 {}", stats.no_cred), color::WARN);
                 }
             }
         }
@@ -288,7 +292,7 @@ fn idle_site_bytes(site: &IdleSite, cache: &[CachedSite]) -> Option<u64> {
 fn idle_sites_tsv(rows: &[IdleSite], cache: &[CachedSite]) -> String {
     let mut out = String::from("계정\t도메인\t사유\t용량\n");
     for site in rows {
-        let size = idle_site_bytes(site, cache).map(human_bytes).unwrap_or_else(|| "-".into());
+        let size = idle_site_bytes(site, cache).map(human_bytes).unwrap_or_else(|| "조회불가".into());
         let fields = [site.account.clone(), site.domain.clone(), idle_reason(site), size];
         out.push_str(&fields.iter().map(|value| tsv_cell(value)).collect::<Vec<_>>().join("\t"));
         out.push('\n');
@@ -309,11 +313,11 @@ impl Grade {
     }
     fn color(self) -> egui::Color32 {
         match self {
-            Grade::A => C_GREEN,
-            Grade::B => egui::Color32::from_rgb(0x6E, 0xA8, 0x4F),
-            Grade::C => egui::Color32::from_rgb(0xDC, 0x96, 0x3C),
-            Grade::D => egui::Color32::from_rgb(0xD1, 0x6B, 0x3E),
-            Grade::E => C_RED,
+            Grade::A => color::OK,
+            Grade::B => color::OK,
+            Grade::C => color::WARN,
+            Grade::D => color::DANGER,
+            Grade::E => color::DANGER,
         }
     }
 }
@@ -569,75 +573,31 @@ enum ScanMsg {
     WpPlugins { domain_id: u64, kind: ops::WpAssetKind, res: Result<Vec<ops::WpPluginRow>, String> },
 }
 
-/// 사이트 표의 컬럼: (텍스트, 색, 폭)
-type SiteCols = Vec<(String, egui::Color32, f32)>;
-const SITE_LEAD: f32 = 30.0; // 체크 글리프 영역 폭
-
-/// 한 행 전체(여백 포함)를 클릭 영역으로 그린다. 체크 글리프 + 고정폭 컬럼. 클릭되면 true.
-fn site_row(ui: &mut egui::Ui, selected: bool, cols: &SiteCols) -> bool {
-    let need: f32 = SITE_LEAD + cols.iter().map(|c| c.2).sum::<f32>();
-    let w = ui.available_width().max(need);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::click());
-    if ui.is_rect_visible(rect) {
-        let vis = ui.visuals();
-        if selected {
-            ui.painter().rect_filled(rect, 3.0, vis.selection.bg_fill);
-        } else if resp.hovered() {
-            ui.painter().rect_filled(rect, 3.0, vis.widgets.hovered.weak_bg_fill);
-        }
-        let cy = rect.center().y;
-        let chk = if selected { ph::CHECK_SQUARE } else { ph::SQUARE };
-        let chk_col = if selected { vis.selection.stroke.color } else { vis.weak_text_color() };
-        ui.painter().text(egui::pos2(rect.left() + 7.0, cy), egui::Align2::LEFT_CENTER, chk, egui::FontId::proportional(15.0), chk_col);
-        let mut x = rect.left() + SITE_LEAD;
-        for (txt, col, wdt) in cols {
-            ui.painter().text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, txt.as_str(), egui::FontId::proportional(13.0), *col);
-            x += *wdt;
-        }
-    }
-    resp.clicked()
-}
-
 /// 설치 버전 vs 최신 버전 비교 → 상태 문자열
 fn compute_status(kind: &str, version: &str, git: bool, rx: &str, wp: &str, gn: &str) -> String {
     if !version.contains('.') {
-        return if git { "확인필요".into() } else { "-".into() };
+        return if git { "확인필요".into() } else { "조회불가".into() };
     }
-    let cmp = |latest: &str| if latest.is_empty() { "-".into() } else if version == latest { "최신버전".into() } else { format!("업데이트필요 ({latest})") };
+    let cmp = |latest: &str| if latest.is_empty() { "조회불가".into() } else if version == latest { "최신버전".into() } else { format!("업데이트필요 ({latest})") };
     match kind {
         "Rhymix" => cmp(rx),
         "WordPress" => cmp(wp),
         "Gnuboard" => cmp(gn),
-        _ => "-".into(),
+        _ => "해당 없음".into(),
     }
 }
 
 fn kind_color(kind: &str, git: bool) -> egui::Color32 {
-    if kind.starts_with('(') || kind == "unknown" { egui::Color32::GRAY }
-    else if git { egui::Color32::from_rgb(80, 170, 110) }
-    else { egui::Color32::from_rgb(150, 150, 200) }
+    if kind.starts_with('(') || kind == "unknown" { color::MUTED }
+    else if git { color::OK }
+    else { color::MUTED }
 }
 
 fn status_color(s: &str) -> egui::Color32 {
-    if s.starts_with("최신") { egui::Color32::from_rgb(80, 180, 110) }
-    else if s.starts_with("업데이트") { egui::Color32::from_rgb(220, 150, 60) }
-    else if s == "확인필요" { egui::Color32::from_rgb(200, 190, 90) }
-    else { egui::Color32::GRAY }
-}
-
-/// 헤더/합계 등 클릭 없는 행 (체크 영역만큼 들여쓰기)
-fn site_info_row(ui: &mut egui::Ui, cols: &SiteCols) {
-    let need: f32 = SITE_LEAD + cols.iter().map(|c| c.2).sum::<f32>();
-    let w = ui.available_width().max(need);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let cy = rect.center().y;
-        let mut x = rect.left() + SITE_LEAD;
-        for (txt, col, wdt) in cols {
-            ui.painter().text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, txt.as_str(), egui::FontId::proportional(13.0), *col);
-            x += *wdt;
-        }
-    }
+    if s.starts_with("최신") { color::OK }
+    else if s.starts_with("업데이트") { color::WARN }
+    else if s == "확인필요" { color::WARN }
+    else { color::MUTED }
 }
 
 /// 경과 시간 한국어 표기
@@ -650,9 +610,18 @@ fn ago_text(at: i64) -> String {
     else { format!("{}일 전", d / 86400) }
 }
 
+/// 조회 기준 시각은 절대시각과 상대시각을 함께 보여준다.
+fn observed_at(at: i64) -> String {
+    if at <= 0 {
+        "조회 시각 미상".into()
+    } else {
+        format!("{} ({})", fmt_kst(at), ago_text(at))
+    }
+}
+
 /// 바이트를 사람이 읽기 쉬운 단위로
 fn human_bytes(n: u64) -> String {
-    if n == 0 { return "-".into(); }
+    if n == 0 { return "0B".into(); }
     let units = ["B", "K", "M", "G", "T"];
     let mut v = n as f64;
     let mut i = 0;
@@ -739,8 +708,8 @@ fn diskmon_last_at(snapshot: &ServerSnapshot) -> Option<i64> {
 
 /// unix초 → "YYYY-MM-DD" (KST). 0 이하면 "-".
 fn short_date(ts: i64) -> String {
-    if ts <= 0 { return "-".into(); }
-    fmt_kst(ts).split(' ').next().unwrap_or("-").to_string()
+    if ts <= 0 { return "조회불가".into(); }
+    fmt_kst(ts).split(' ').next().unwrap_or("조회불가").to_string()
 }
 
 /// days(에포크 기준) → (년,월,일). Howard Hinnant 알고리즘.
@@ -757,29 +726,25 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-// 디자인 토큰 (색)
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x3B, 0x82, 0xF6);
-const C_GREEN: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x9E, 0x5B);
-const C_RED: egui::Color32 = egui::Color32::from_rgb(0xC4, 0x5A, 0x5A);
-
 /// 주(primary) 액션 버튼 — 액센트 채움 + 흰 글씨
 fn btn_primary(label: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong()).fill(ACCENT)
+    egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong()).fill(color::ACCENT)
 }
 /// 긍정(go) 버튼 — 녹색 채움
 fn btn_go(label: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong()).fill(C_GREEN)
+    egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong()).fill(color::OK)
 }
 /// 위험(danger) 버튼 — 빨강 채움
 fn btn_danger(label: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(C_RED)
+    egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(color::DANGER)
 }
 
 /// 채움색 + 테두리를 가진 섹션 카드 (배경과 또렷이 구분)
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::group(ui.style())
         .fill(ui.visuals().faint_bg_color)
-        .inner_margin(egui::Margin::same(10))
+        .stroke(egui::Stroke::new(1.0, color::BORDER))
+        .inner_margin(egui::Margin::same(space::SM as i8))
         .show(ui, add)
         .inner
 }
@@ -869,6 +834,12 @@ pub struct App {
     all_filter_acct: String,
     /// 전체 사이트: 도메인 검색어
     all_search: String,
+    /// 전체 사이트/계정 사이트 표 정렬(원본 순서는 유지한다).
+    sites_sort: SortState,
+    /// 계정 모듈 표 정렬.
+    modules_sort: SortState,
+    /// 대시보드 도메인 헬스 표 정렬.
+    domain_health_sort: SortState,
     /// 계정별 모듈 목록: (모듈명, 사용 도메인들, 선택여부)
     acct_mods: Vec<(String, Vec<String>, bool)>,
     /// acct_mods/acct_sites 가 어느 고객 것인지
@@ -979,6 +950,9 @@ impl App {
             all_sites_status: String::new(),
             all_filter_acct: String::new(),
             all_search: String::new(),
+            sites_sort: SortState::new(1, false),
+            modules_sort: SortState::new(0, false),
+            domain_health_sort: SortState::new(0, false),
             acct_mods: Vec::new(),
             acct_mods_for: None,
             acct_mod_domain: String::new(),
@@ -1272,7 +1246,8 @@ impl App {
         let mut go_settings = false;
         let mut copy_domains: Option<bool> = None;
         let mut copy_idle = false;
-        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
+        let mut domain_sort = self.domain_health_sort;
+        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(space::LG as i8, space::MD as i8));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
           egui::ScrollArea::vertical()
             .id_salt("dashboard_scroll")
@@ -1290,28 +1265,28 @@ impl App {
                     }
                 });
             });
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
             card(ui, |ui| {
                 ui.strong("종합 상태");
-                ui.add_space(5.0);
+                ui.add_space(space::XS);
                 ui.horizontal(|ui| {
                     match total_grade {
                         Some(grade) => {
                             ui.label(egui::RichText::new(grade.letter()).size(32.0).strong().color(grade.color()));
                             ui.vertical(|ui| {
                                 ui.label(egui::RichText::new(format!("{} ({})", grade.letter(), grade.label())).size(18.0).strong().color(grade.color()));
-                                ui.weak(format!("{} · {} 기준", if snapshot.host.is_empty() { "서버" } else { &snapshot.host }, ago_text(snapshot.at.max(domain_health_at))));
+                                ui.weak(format!("{} · {} 기준", if snapshot.host.is_empty() { "서버" } else { &snapshot.host }, observed_at(snapshot.at.max(domain_health_at))));
                                 if domain_health.is_empty() { ui.weak("도메인 미점검"); }
                             });
                         }
                         None => {
-                            ui.label(egui::RichText::new("?").size(32.0).strong().color(egui::Color32::GRAY));
+                            ui.label(egui::RichText::new("?").size(32.0).strong().color(color::MUTED));
                             ui.weak("서버 헬스를 조회하면 등급이 표시됩니다");
                         }
                     }
                 });
                 if !grade_data.is_empty() {
-                    ui.add_space(5.0);
+                    ui.add_space(space::XS);
                     ui.horizontal_wrapped(|ui| {
                         for (name, grade, _, detail) in &grade_data {
                             let color = if *grade >= Grade::C { grade.color() } else { ui.visuals().text_color() };
@@ -1321,43 +1296,43 @@ impl App {
                     });
                 }
             });
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
             card(ui, |ui| {
                 let mut alerts: Vec<(String, egui::Color32, &'static str)> = Vec::new();
                 if !snapshot.svc_fail.trim().is_empty() {
-                    alerts.push((format!("서비스 정지: {}", snapshot.svc_fail), C_RED, "서버 설정"));
+                    alerts.push((format!("서비스 정지: {}", snapshot.svc_fail), color::DANGER, "서버 설정"));
                 }
                 let phpfpm_bad = snapshot.phpfpm_bad.parse::<u32>().unwrap_or(0);
                 if phpfpm_bad > 0 {
-                    alerts.push((format!("PHP-FPM 실패 {phpfpm_bad}개"), C_RED, "PHP-FPM 진단"));
+                    alerts.push((format!("PHP-FPM 실패 {phpfpm_bad}개"), color::DANGER, "PHP-FPM 진단"));
                 }
                 let disk = snapshot.disk_max.parse::<u32>().unwrap_or(0);
                 if disk >= 95 {
-                    alerts.push((format!("디스크 {}% ({})", snapshot.disk_max, snapshot.disk_max_mp), C_RED, "디스크 점검"));
+                    alerts.push((format!("디스크 {}% ({})", snapshot.disk_max, snapshot.disk_max_mp), color::DANGER, "디스크 점검"));
                 } else if disk >= 90 {
-                    alerts.push((format!("디스크 {}%", snapshot.disk_max), egui::Color32::from_rgb(220, 150, 60), "디스크 점검"));
+                    alerts.push((format!("디스크 {}%", snapshot.disk_max), color::WARN, "디스크 점검"));
                 }
                 let cert_exp = domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| d < 0)).count();
                 if cert_exp > 0 {
-                    alerts.push((format!("인증서 만료 {cert_exp}건"), C_RED, "아래 보기"));
+                    alerts.push((format!("인증서 만료 {cert_exp}건"), color::DANGER, "아래 보기"));
                 }
                 let dom_issues = domain_health.iter().filter(|h| domain_issue(h).is_some()).count();
                 if dom_issues > 0 {
-                    alerts.push((format!("도메인 이상 {dom_issues}건"), egui::Color32::from_rgb(220, 150, 60), "아래 보기"));
+                    alerts.push((format!("도메인 이상 {dom_issues}건"), color::WARN, "아래 보기"));
                 }
                 if snapshot.diskmon == "1" {
                     if diskmon_last_at(&snapshot).is_some_and(|at| now_unix() - at > 36 * 3600) {
-                        alerts.push(("디스크 감시가 하루 넘게 안 돌았습니다".into(), egui::Color32::from_rgb(220, 150, 60), "디스크 점검"));
+                        alerts.push(("디스크 감시가 하루 넘게 안 돌았습니다".into(), color::WARN, "디스크 점검"));
                     }
                 } else if snapshot.at > 0 && snapshot.diskmon == "0" {
-                    alerts.push(("디스크 자동 감시 미설치".into(), egui::Color32::GRAY, "디스크 점검"));
+                    alerts.push(("디스크 자동 감시 미설치".into(), color::MUTED, "디스크 점검"));
                 }
                 if alerts.is_empty() {
-                    ui.colored_label(C_GREEN, format!("{}  이상 없음", ph::CHECK_CIRCLE));
+                    console_ui::badge(ui, "● 정상 · 즉시 조치 항목 없음", color::OK);
                 } else {
                     for (message, color, target) in alerts {
                         ui.horizontal(|ui| {
-                            ui.colored_label(color, format!("{}  {message}", ph::WARNING));
+                            console_ui::badge(ui, &format!("● 위험 · {message}"), color);
                             if ui.small_button(target).clicked() {
                                 match target {
                                     "PHP-FPM 진단" | "서버 설정" => go_php = true,
@@ -1369,11 +1344,11 @@ impl App {
                     }
                 }
             });
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
             card(ui, |ui| {
                 ui.strong("권고");
                 if advisory_data.is_empty() {
-                    ui.colored_label(C_GREEN, "조치할 항목이 없습니다");
+                    console_ui::badge(ui, "● 정상 · 조치할 항목 없음", color::OK);
                 } else {
                     for (message, target) in &advisory_data {
                         ui.horizontal_wrapped(|ui| {
@@ -1392,11 +1367,11 @@ impl App {
                     }
                 }
             });
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
             if dashboard_is_narrow(ui.available_width()) {
                 for index in 0..3 {
                     go_all |= dashboard_stat_card(ui, index, &stats, cache_at);
-                    if index < 2 { ui.add_space(8.0); }
+                    if index < 2 { ui.add_space(space::SM); }
                 }
             } else {
                 ui.columns(3, |cols| {
@@ -1405,7 +1380,7 @@ impl App {
                     }
                 });
             }
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("서버 헬스");
@@ -1416,31 +1391,34 @@ impl App {
                     });
                 });
                 if !ssh_ready {
-                    ui.weak("서버 SSH 설정이 필요합니다.");
+                    console_ui::empty_state(ui, ph::PLUG, "서버 상태를 조회할 수 없습니다.", Some("[설정]에서 서버 SSH를 입력하세요."));
                 } else if snapshot.at <= 0 {
-                    ui.weak("아직 조회하지 않았습니다 — 서버 조회는 버튼을 눌렀을 때만 실행됩니다.");
+                    console_ui::empty_state(ui, ph::GAUGE, "아직 서버 헬스를 조회하지 않았습니다.", Some("위의 [새로고침]을 눌러 조회하세요."));
                 } else {
-                    ui.weak(format!("{} · {} 기준", snapshot.host, ago_text(snapshot.at)));
-                    ui.add_space(4.0);
+                    ui.weak(format!("{} · {} 기준", snapshot.host, observed_at(snapshot.at)));
+                    ui.add_space(space::XS);
                     ui.horizontal_wrapped(|ui| {
                         let load = snapshot.load1.parse::<f32>().unwrap_or(0.0);
                         let cores = snapshot.cores.parse::<f32>().unwrap_or(1.0).max(1.0);
                         let ratio = load / cores;
-                        let load_color = if ratio > 2.0 { C_RED } else if ratio > 1.0 { egui::Color32::from_rgb(220, 150, 60) } else { C_GREEN };
-                        ui.colored_label(load_color, format!("부하 {} / {}코어", snapshot.load1, snapshot.cores));
+                        let load_color = if ratio > 2.0 { color::DANGER } else if ratio > 1.0 { color::WARN } else { color::OK };
+                        console_ui::badge(ui, &format!("● 부하 {} / {}코어", snapshot.load1, snapshot.cores), load_color);
                         ui.separator();
                         ui.label(format!("메모리 {}%", snapshot.mem_pct));
                         ui.separator();
                         let disk = snapshot.disk_max.parse::<u32>().unwrap_or(0);
-                        let disk_color = if disk >= 95 { C_RED } else if disk >= 90 { egui::Color32::from_rgb(220, 150, 60) } else { C_GREEN };
-                        ui.colored_label(disk_color, format!("디스크 {}% ({})", snapshot.disk_max, snapshot.disk_max_mp));
+                        let disk_color = if disk >= 95 { color::DANGER } else if disk >= 90 { color::WARN } else { color::OK };
+                        console_ui::badge(ui, &format!("● 디스크 {}% ({})", snapshot.disk_max, snapshot.disk_max_mp), disk_color);
                     });
                     ui.horizontal_wrapped(|ui| {
-                        if snapshot.svc_fail.trim().is_empty() { ui.colored_label(C_GREEN, "서비스 정상"); }
-                        else { ui.colored_label(C_RED, format!("서비스 정지: {}", snapshot.svc_fail)); }
+                        if snapshot.svc_fail.trim().is_empty() {
+                            console_ui::badge(ui, "● 정상 · 서비스", color::OK);
+                        } else {
+                            console_ui::badge(ui, &format!("● 위험 · 서비스 정지: {}", snapshot.svc_fail), color::DANGER);
+                        }
                         let bad = snapshot.phpfpm_bad.parse::<u32>().unwrap_or(0);
                         if bad > 0 {
-                            ui.colored_label(C_RED, format!("PHP-FPM 실패 {bad}개"));
+                            console_ui::badge(ui, &format!("● 실패 · PHP-FPM {bad}개"), color::DANGER);
                             if ui.small_button("PHP-FPM 진단").clicked() { go_php = true; }
                         } else {
                             ui.label(format!("PHP-FPM {}개", snapshot.phpfpm));
@@ -1449,35 +1427,64 @@ impl App {
                         ui.label(format!("HestiaCP 계정 {} · 도메인 {}", snapshot.users, snapshot.domains));
                     });
                     if !disks.is_empty() {
-                        ui.add_space(7.0);
+                        ui.add_space(space::SM);
                         ui.strong("디스크");
-                        for disk in &disks {
-                            let grade = disk_grade(disk);
-                            let value = |v: &str| if v == "-" || v.is_empty() { "조회불가".to_string() } else { v.to_string() };
-                            ui.horizontal_wrapped(|ui| {
-                                ui.colored_label(grade.color(), "●");
-                                ui.label(egui::RichText::new(&disk.mount).monospace().strong());
-                                ui.label(role_label(&disk.role));
-                                ui.label(format!("{}% · {} 남음", disk.use_pct, disk.avail));
-                                ui.label(format!("inode {}%", value(&disk.inode_pct)));
-                                let sectors = match (disk.realloc.parse::<u32>(), disk.pending.parse::<u32>()) {
-                                    (Ok(a), Ok(b)) if a + b > 0 => format!(" · 섹터 {}", a + b),
-                                    _ => String::new(),
-                                };
-                                ui.label(format!("SMART {}{sectors}", value(&disk.smart)));
-                                if disk.rate == "-" || disk.rate.is_empty() {
-                                    ui.weak("추이 데이터 쌓이는 중");
-                                } else {
-                                    let rate = if disk.rate.starts_with('-') { disk.rate.clone() } else { format!("+{}", disk.rate) };
-                                    ui.label(format!("{rate}%p/일"));
-                                    if disk.eta != "-" && !disk.eta.is_empty() { ui.label(format!("· 95%까지 {}일", disk.eta)); }
+                        let value = |value: &str| {
+                            if value == "-" || value.is_empty() { "조회불가".to_string() } else { value.to_string() }
+                        };
+                        let percent = |value: &str| {
+                            if value == "-" || value.is_empty() { "조회불가".to_string() } else { format!("{value}%") }
+                        };
+                        TableBuilder::new(ui)
+                            .id_salt("dash_disks_table")
+                            .striped(true)
+                            .resizable(true)
+                            .max_scroll_height(220.0)
+                            .column(Column::exact(96.0))
+                            .column(Column::initial(120.0).at_least(88.0))
+                            .column(Column::initial(88.0).at_least(72.0))
+                            .column(Column::exact(72.0))
+                            .column(Column::exact(88.0))
+                            .column(Column::exact(88.0))
+                            .column(Column::remainder().at_least(140.0))
+                            .header(console_ui::TABLE_HEADER_HEIGHT, |mut header| {
+                                for title in ["상태", "마운트", "역할", "사용률", "여유", "inode", "SMART·추이"] {
+                                    header.col(|ui| { ui.strong(title); });
                                 }
-                                ui.colored_label(grade.color(), format!("{} ({})", grade.letter(), grade.label()));
-                            }).response.on_hover_text(format!(
-                                "장치 {} · 물리 디스크 {} · 가동 {}시간 · 온도 {}°C · FS 오류 {} · 관측 {}일",
-                                disk.device, disk.disk, value(&disk.power_h), value(&disk.temp_c), value(&disk.fs_err), value(&disk.span)
-                            ));
-                        }
+                            })
+                            .body(|body| {
+                                body.rows(console_ui::TABLE_ROW_HEIGHT, disks.len(), |mut row| {
+                                    let disk = &disks[row.index()];
+                                    let grade = disk_grade(disk);
+                                    row.col(|ui| {
+                                        ui.horizontal(|ui| {
+                                            console_ui::dot(ui, grade.color());
+                                            ui.label(format!("{} {}", grade.letter(), grade.label()));
+                                        });
+                                    });
+                                    row.col(|ui| { ui.label(egui::RichText::new(&disk.mount).monospace()); });
+                                    row.col(|ui| { ui.label(role_label(&disk.role)); });
+                                    row.col(|ui| console_ui::num(ui, &percent(&disk.use_pct)));
+                                    row.col(|ui| console_ui::num(ui, &value(&disk.avail)));
+                                    row.col(|ui| console_ui::num(ui, &percent(&disk.inode_pct)));
+                                    row.col(|ui| {
+                                        let sectors = match (disk.realloc.parse::<u32>(), disk.pending.parse::<u32>()) {
+                                            (Ok(a), Ok(b)) if a + b > 0 => format!(" · 섹터 {}개", a + b),
+                                            _ => String::new(),
+                                        };
+                                        let trend = if disk.rate == "-" || disk.rate.is_empty() {
+                                            "추이 미조회".to_string()
+                                        } else {
+                                            let rate = if disk.rate.starts_with('-') { disk.rate.clone() } else { format!("+{}", disk.rate) };
+                                            format!("{rate}%p/일")
+                                        };
+                                        ui.label(format!("{}{} · {trend}", value(&disk.smart), sectors)).on_hover_text(format!(
+                                            "장치 {} · 물리 디스크 {} · 가동 {}시간 · 온도 {}°C · FS 오류 {} · 관측 {}일",
+                                            disk.device, disk.disk, value(&disk.power_h), value(&disk.temp_c), value(&disk.fs_err), value(&disk.span)
+                                        ));
+                                    });
+                                });
+                            });
                         if disks.iter().all(|d| d.rate == "-" || d.rate.is_empty()) && !snapshot.disk_rate.is_empty() {
                             ui.weak(format!("기존 전체 추이: {}일간 하루 {}%p{}", snapshot.disk_span, snapshot.disk_rate,
                                 if snapshot.disk_eta.is_empty() { String::new() } else { format!(" · 95%까지 약 {}일", snapshot.disk_eta) }));
@@ -1486,7 +1493,7 @@ impl App {
                     ui.weak(format!("디스크 감시 {} · 트래픽 감시 {}", if snapshot.diskmon == "1" { "설치됨" } else { "미설치" }, if snapshot.trafficmon == "1" { "설치됨" } else { "미설치" }));
                 }
             });
-            ui.add_space(8.0);
+            ui.add_space(space::SM);
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("백업 현황");
@@ -1497,32 +1504,32 @@ impl App {
                     });
                 });
                 if !ssh_ready {
-                    ui.weak("서버 SSH 설정이 필요합니다.");
+                    console_ui::empty_state(ui, ph::PLUG, "백업 현황을 조회할 수 없습니다.", Some("[설정]에서 서버 SSH를 입력하세요."));
                 } else if upkeep_at <= 0 {
-                    ui.weak("아직 점검하지 않았습니다 — 버튼을 눌렀을 때만 서버를 조회합니다.");
+                    console_ui::empty_state(ui, ph::DOWNLOAD_SIMPLE, "아직 백업 현황을 점검하지 않았습니다.", Some("위의 [백업·정리 점검]을 눌러 조회하세요."));
                 } else {
                     if backup_status.cron {
                         ui.label(format!("자동 백업 cron 등록됨 · 보관 {}세대 · 파일 {}개 · {}",
                             backup_status.keep, backup_status.total,
-                            if backup_status.size.is_empty() { "-" } else { &backup_status.size }));
+                            if backup_status.size.is_empty() { "조회불가" } else { &backup_status.size }));
                     } else {
-                        ui.colored_label(C_RED, "자동 백업이 등록되어 있지 않습니다");
+                        console_ui::badge(ui, "● 위험 · 자동 백업 미등록", color::DANGER);
                     }
                     let backed_up = backup_status.users.saturating_sub(backup_status.missing.len() as u64);
                     let account_text = format!("계정 {}개 중 백업 있음 {} · 없음 {}",
                         backup_status.users, backed_up, backup_status.missing.len());
                     if backup_status.missing.is_empty() {
-                        ui.colored_label(C_GREEN, account_text);
+                        console_ui::badge(ui, &format!("● 정상 · {account_text}"), color::OK);
                     } else {
-                        ui.colored_label(C_RED, account_text);
-                        ui.colored_label(C_RED, format!("백업 없는 계정: {}", backup_status.missing.join(", ")));
+                        console_ui::badge(ui, &format!("● 위험 · {account_text}"), color::DANGER);
+                        console_ui::badge(ui, &format!("● 위험 · 백업 없는 계정: {}", backup_status.missing.join(", ")), color::DANGER);
                     }
                     let newest_days = (backup_status.newest > 0)
                         .then(|| (now_unix() - backup_status.newest).max(0) / 86400);
                     if let Some(days) = newest_days {
                         let newest_text = format!("가장 최근 백업 {days}일 전");
                         if days >= 3 {
-                            ui.colored_label(egui::Color32::from_rgb(220, 150, 60),
+                            ui.colored_label(color::WARN,
                                 format!("백업이 {days}일째 갱신되지 않았습니다"));
                         }
                         if backup_status.stalest_account.is_empty() {
@@ -1532,24 +1539,39 @@ impl App {
                                 backup_status.stalest_account, backup_status.stalest_days));
                         }
                     }
-                    ui.weak(format!("{} 기준", ago_text(upkeep_at)));
+                    ui.weak(format!("{} 기준", observed_at(upkeep_at)));
                     if !backup_users.is_empty() {
                         egui::CollapsingHeader::new("계정별 백업")
                             .id_salt("dash_backup_users")
                             .show(ui, |ui| {
                                 let mut rows = backup_users.clone();
                                 rows.sort_by(|a, b| b.age_days.cmp(&a.age_days).then_with(|| a.account.cmp(&b.account)));
-                                egui::Grid::new("dash_backup_users_grid").num_columns(3).striped(true).show(ui, |ui| {
-                                    ui.strong("계정"); ui.strong("세대 수"); ui.strong("경과일"); ui.end_row();
-                                    for row in rows {
-                                        ui.label(row.account); ui.label(row.generations.to_string()); ui.label(format!("{}일", row.age_days)); ui.end_row();
-                                    }
-                                });
+                                TableBuilder::new(ui)
+                                    .id_salt("dash_backup_users_table")
+                                    .striped(true)
+                                    .resizable(true)
+                                    .max_scroll_height(240.0)
+                                    .column(Column::remainder().at_least(140.0))
+                                    .column(Column::exact(80.0))
+                                    .column(Column::exact(80.0))
+                                    .header(console_ui::TABLE_HEADER_HEIGHT, |mut header| {
+                                        header.col(|ui| { ui.strong("계정"); });
+                                        header.col(|ui| { ui.strong("세대 수"); });
+                                        header.col(|ui| { ui.strong("경과일"); });
+                                    })
+                                    .body(|body| {
+                                        body.rows(console_ui::TABLE_ROW_HEIGHT, rows.len(), |mut row| {
+                                            let item = &rows[row.index()];
+                                            row.col(|ui| { ui.label(&item.account); });
+                                            row.col(|ui| console_ui::num(ui, &format!("{}세대", item.generations)));
+                                            row.col(|ui| console_ui::num(ui, &format!("{}일", item.age_days)));
+                                        });
+                                    });
                             });
                     }
                 }
             });
-            ui.add_space(8.0);
+            ui.add_space(space::SM);
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("확인 권장 사이트");
@@ -1560,33 +1582,47 @@ impl App {
                 });
                 ui.weak("※ 삭제 대상이 아니라 확인해볼 곳입니다. 계절성·내부용 사이트가 섞일 수 있습니다.");
                 if upkeep_at <= 0 {
-                    ui.weak("백업 현황의 ‘백업·정리 점검’을 누르면 함께 조회합니다.");
+                    console_ui::empty_state(ui, ph::MAGNIFYING_GLASS, "확인 권장 사이트를 아직 조회하지 않았습니다.", Some("[백업 현황]의 [백업·정리 점검]을 누르세요."));
                 } else if idle_sites.is_empty() {
-                    ui.colored_label(C_GREEN, "최근 활동이 확인되지 않는 사이트가 없습니다");
+                    console_ui::badge(ui, "● 정상 · 확인 권장 사이트 없음", color::OK);
                 } else {
-                    ui.add_space(4.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("dash_idle_sites_scroll")
-                        .auto_shrink([false, false])
-                        .max_height(320.0)
-                        .show(ui, |ui| {
-                            egui::Grid::new("dash_idle_sites_grid").num_columns(4).striped(true).show(ui, |ui| {
-                                ui.strong("도메인"); ui.strong("계정"); ui.strong("사유"); ui.strong("용량"); ui.end_row();
-                                for site in &idle_sites {
+                    ui.add_space(space::XS);
+                    let mut rows = idle_sites.clone();
+                    rows.sort_by(|a, b| a.domain.cmp(&b.domain));
+                    TableBuilder::new(ui)
+                        .id_salt("dash_idle_sites_table")
+                        .striped(true)
+                        .resizable(true)
+                        .max_scroll_height(320.0)
+                        .column(Column::initial(180.0).at_least(140.0))
+                        .column(Column::initial(112.0).at_least(88.0))
+                        .column(Column::remainder().at_least(180.0))
+                        .column(Column::exact(80.0))
+                        .header(console_ui::TABLE_HEADER_HEIGHT, |mut header| {
+                            header.col(|ui| { ui.strong("도메인"); });
+                            header.col(|ui| { ui.strong("계정"); });
+                            header.col(|ui| { ui.strong("사유"); });
+                            header.col(|ui| { ui.strong("용량"); });
+                        })
+                        .body(|body| {
+                            body.rows(console_ui::TABLE_ROW_HEIGHT, rows.len(), |mut row| {
+                                let site = &rows[row.index()];
+                                row.col(|ui| {
                                     if ui.link(&site.domain).on_hover_text("계정 관리로 이동").clicked() {
                                         go_account = Some(site.account.clone());
                                     }
-                                    ui.add(egui::Label::new(&site.account).selectable(true));
-                                    ui.add(egui::Label::new(idle_reason(site)).selectable(true));
-                                    let size = idle_site_bytes(site, &scan_cache).map(human_bytes).unwrap_or_else(|| "-".into());
-                                    ui.add(egui::Label::new(size).selectable(true));
-                                    ui.end_row();
-                                }
+                                });
+                                row.col(|ui| { ui.label(&site.account); });
+                                row.col(|ui| { ui.label(idle_reason(site)); });
+                                let size = idle_site_bytes(site, &scan_cache)
+                                    .map(human_bytes)
+                                    .unwrap_or_else(|| "조회불가".into());
+                                row.col(|ui| console_ui::num(ui, &size));
                             });
                         });
                 }
             });
-            ui.add_space(8.0);
+            ui.add_space(space::SM);
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("도메인 헬스");
@@ -1599,43 +1635,77 @@ impl App {
                     });
                 });
                 if !ssh_ready {
-                    ui.weak("서버 SSH 설정이 필요합니다.");
+                    console_ui::empty_state(ui, ph::PLUG, "도메인 헬스를 조회할 수 없습니다.", Some("[설정]에서 서버 SSH를 입력하세요."));
                 } else if domain_health_at <= 0 {
-                    ui.weak("아직 점검하지 않았습니다 — 도메인 점검은 버튼을 눌렀을 때만 실행됩니다.");
+                    console_ui::empty_state(ui, ph::GLOBE, "아직 도메인 헬스를 점검하지 않았습니다.", Some("위의 [점검]을 누르세요. 100개 기준 약 2분 걸립니다."));
                 } else {
-                    let issues: Vec<_> = domain_health.iter().filter_map(|h| domain_issue(h).map(|reason| (h, reason))).collect();
+                    let mut issues: Vec<_> = domain_health.iter()
+                        .filter_map(|health| domain_issue(health).map(|reason| (health.clone(), reason)))
+                        .collect();
+                    issues.sort_by(|(a_health, a_reason), (b_health, b_reason)| {
+                        let order = match domain_sort.col {
+                            1 => a_reason.cmp(b_reason),
+                            2 => a_health.dns.cmp(&b_health.dns),
+                            3 => a_health.cert_days.parse::<i32>().ok().cmp(&b_health.cert_days.parse::<i32>().ok()),
+                            _ => a_health.domain.cmp(&b_health.domain),
+                        };
+                        if domain_sort.desc { order.reverse() } else { order }
+                    });
                     let dns_bad = domain_health.iter().filter(|h| h.dns == "other" || h.dns == "none").count();
                     let http_bad = domain_health.iter().filter(|h| h.dns == "ok" && !(h.public_code.starts_with('2') || h.public_code.starts_with('3'))).count();
                     let no_root = domain_health.iter().filter(|h| h.webroot == "no").count();
                     let cert_exp = domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| d < 0)).count();
                     let cert_soon = domain_health.iter().filter(|h| h.cert_days.parse::<i32>().is_ok_and(|d| (0..=14).contains(&d))).count();
                     ui.horizontal_wrapped(|ui| {
-                        let color = if issues.is_empty() { C_GREEN } else { C_RED };
-                        ui.colored_label(color, format!("이상 {}건 / 전체 {}건", issues.len(), domain_health.len()));
-                        ui.weak(format!("DNS {dns_bad} · HTTP {http_bad} · 웹루트 {no_root} · 인증서 임박 {cert_soon} / 만료 {cert_exp} · {} 기준", ago_text(domain_health_at)));
+                        let color = if issues.is_empty() { color::OK } else { color::DANGER };
+                        let state = if issues.is_empty() { "정상" } else { "위험" };
+                        console_ui::badge(ui, &format!("● {state} · 이상 {}건 / 전체 {}건", issues.len(), domain_health.len()), color);
+                        ui.weak(format!("DNS {dns_bad} · HTTP {http_bad} · 웹루트 {no_root} · 인증서 임박 {cert_soon} / 만료 {cert_exp} · {} 기준", observed_at(domain_health_at)));
                     });
                     if !issues.is_empty() {
-                        ui.add_space(4.0);
-                        egui::ScrollArea::vertical()
-                            .id_salt("dash_domain_health_scroll")
-                            .auto_shrink([false, false])
-                            .max_height(320.0)
-                            .show(ui, |ui| {
-                            egui::Grid::new("dash_domain_health_grid").num_columns(4).striped(true).show(ui, |ui| {
-                                ui.strong("도메인"); ui.strong("사유"); ui.strong("DNS"); ui.strong("인증서"); ui.end_row();
-                                for (health, reason) in issues {
-                                    if ui.link(&health.domain).on_hover_text("계정 관리로 이동").clicked() { go_account = Some(health.account.clone()); }
-                                    ui.add(egui::Label::new(reason).selectable(true));
-                                    ui.add(egui::Label::new(format!("{} ({})", health.dns, health.a_record)).selectable(true));
-                                    ui.add(egui::Label::new(if health.cert_days == "-" { "-".into() } else { format!("D-{}", health.cert_days) }).selectable(true));
-                                    ui.end_row();
-                                }
+                        ui.add_space(space::XS);
+                        TableBuilder::new(ui)
+                            .id_salt("dash_domain_health_table")
+                            .striped(true)
+                            .resizable(true)
+                            .max_scroll_height(320.0)
+                            .column(Column::initial(180.0).at_least(140.0))
+                            .column(Column::remainder().at_least(220.0))
+                            .column(Column::initial(160.0).at_least(120.0))
+                            .column(Column::exact(88.0))
+                            .header(console_ui::TABLE_HEADER_HEIGHT, |mut header| {
+                                header.col(|ui| console_ui::sort_header(ui, "도메인", 0, &mut domain_sort));
+                                header.col(|ui| console_ui::sort_header(ui, "사유", 1, &mut domain_sort));
+                                header.col(|ui| console_ui::sort_header(ui, "DNS", 2, &mut domain_sort));
+                                header.col(|ui| console_ui::sort_header(ui, "인증서", 3, &mut domain_sort));
+                            })
+                            .body(|body| {
+                                body.rows(console_ui::TABLE_ROW_HEIGHT, issues.len(), |mut row| {
+                                    let (health, reason) = &issues[row.index()];
+                                    row.col(|ui| {
+                                        if ui.link(&health.domain).on_hover_text("계정 관리로 이동").clicked() {
+                                            go_account = Some(health.account.clone());
+                                        }
+                                    });
+                                    row.col(|ui| { ui.label(reason); });
+                                    let dns = if health.a_record == "-" || health.a_record.is_empty() {
+                                        format!("{} (조회불가)", health.dns)
+                                    } else {
+                                        format!("{} ({})", health.dns, health.a_record)
+                                    };
+                                    row.col(|ui| { ui.label(dns); });
+                                    let cert = if health.cert_days == "-" || health.cert_days.is_empty() {
+                                        "조회불가".to_string()
+                                    } else {
+                                        format!("D-{}", health.cert_days)
+                                    };
+                                    row.col(|ui| console_ui::num(ui, &cert));
+                                });
                             });
-                        });
                     }
                 }
             });
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
             ui.horizontal_wrapped(|ui| {
                 ui.strong("바로가기:");
                 if ui.button("전체 사이트").clicked() { go_all = true; }
@@ -1645,6 +1715,7 @@ impl App {
             });
           });
         });
+        self.domain_health_sort = domain_sort;
         if go_all { self.view = MainView::AllSites; }
         if go_bulk { self.view = MainView::Settings; self.settings_tab = SettingsTab::BulkUpdate; }
         if go_disk { self.view = MainView::Settings; self.settings_tab = SettingsTab::Disk; }
@@ -1731,7 +1802,7 @@ impl App {
         let mut do_restore: Option<std::path::PathBuf> = None;
         let mut close = false;
         let running = self.running;
-        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
+        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(space::LG as i8, space::MD as i8));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(format!("{}  설정", ph::GEAR));
@@ -1739,7 +1810,7 @@ impl App {
                     if ui.button(format!("{}  도메인으로", ph::X)).clicked() { close = true; }
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
             ui.horizontal(|ui| {
                 for (t, label) in [
                     (SettingsTab::Connect, "  HestiaCP 연동  "),
@@ -1754,16 +1825,16 @@ impl App {
                     }
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
             ui.separator();
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 match self.settings_tab {
                     SettingsTab::Connect => {
                         card(ui, |ui| {
                             ui.strong("HestiaCP API 연동");
-                            ui.add_space(4.0);
-                            egui::Grid::new("settings_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                            ui.add_space(space::XS);
+                            egui::Grid::new("settings_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                                 grid_label(ui, "호스트");
                                 ui.add(egui::TextEdit::singleline(&mut self.store.settings.hestia_host).hint_text("HestiaCP IP/도메인").desired_width(260.0).margin(FIELD_MARGIN));
                                 ui.end_row();
@@ -1781,19 +1852,19 @@ impl App {
                                 ui.checkbox(&mut self.store.settings.ssl_verify, "자체서명 인증서면 끄기");
                                 ui.end_row();
                             });
-                            ui.add_space(8.0);
+                            ui.add_space(space::SM);
                             ui.horizontal(|ui| {
                                 if ui.button(format!("{}  연결 테스트", ph::PLUGS_CONNECTED)).clicked() { do_test = true; }
                                 if ui.add(btn_primary(format!("{}  고객 불러오기", ph::USERS))).clicked() { do_import_users = true; }
                             });
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             ui.label(egui::RichText::new("사이트 불러오기는 좌측 고객 옆 📥 버튼으로 (고객별).").weak());
                             ui.label(egui::RichText::new("불러온 도메인은 신규(TOBE) IP + HestiaCP 유저가 자동 입력됩니다.").weak());
                         });
                         card(ui, |ui| {
                             ui.strong(format!("{}  웹패널 접속 진단", ph::STETHOSCOPE));
                             ui.label(egui::RichText::new("관리자 웹패널(:8083)이 안 열릴 때 원인을 찾습니다. 서브도메인 alias 추가 등으로 nginx 설정이 깨지면 hestia 서비스가 못 떠 포트가 닫힙니다.").weak());
-                            ui.add_space(6.0);
+                            ui.add_space(space::SM);
                             ui.horizontal(|ui| {
                                 if ui.button(format!("{}  네트워크 진단", ph::WIFI_HIGH))
                                     .on_hover_text("내 PC에서 패널 포트 도달성·HTTP·TLS·인증서 확인 (SSH 불필요)")
@@ -1802,23 +1873,23 @@ impl App {
                                     .on_hover_text("서버에 SSH로 들어가 hestia 서비스/포트/nginx 설정/에러로그/디스크 수집 — '서버 SSH' 설정 필요")
                                     .clicked() { do_panel_diag = true; }
                                 if ui.add_enabled(!running, egui::Button::new(format!("{}  패널 복구", ph::WRENCH))
-                                    .fill(egui::Color32::from_rgb(150, 80, 40)))
+                                    .fill(color::DANGER))
                                     .on_hover_text("포트는 열렸는데 페이지가 타임아웃될 때: 멈춘 통계 프로세스 정리 + hestia 재시작 (확인 후 실행)")
                                     .clicked() { do_panel_recover = true; }
                             });
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             ui.label(egui::RichText::new("서버 진단 결과는 아래 로그창에 표시됩니다. 진단은 읽기 전용이며, '패널 복구'는 확인 후 서버를 재시작합니다.").weak());
                         });
                         card(ui, |ui| {
                             ui.strong(format!("{}  PHP-FPM / 에러로그 진단", ph::FILE_TEXT));
                             ui.label(egui::RichText::new("PHP 백엔드(php8.4-fpm 등)가 안 뜰 때 원인을 찾습니다. 패널 로그에 v-restart-service 'php8.4-fpm' [Error 20] 이 반복되면 이 진단으로 실패 사유를 확인하세요.").weak());
-                            ui.add_space(6.0);
+                            ui.add_space(space::SM);
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!running, btn_primary(format!("{}  PHP 진단 (SSH)", ph::FILE_TEXT)))
                                     .on_hover_text("php*-fpm 서비스 상태·설정 문법검사·journalctl·FPM 로그·중복 listen·도메인 에러로그 수집 — '서버 SSH' 설정 필요")
                                     .clicked() { do_php_diag = true; }
                             });
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             ui.label(egui::RichText::new("읽기 전용입니다. 비정상 버전이 있으면 그 버전을, 모두 정상이면 최신 버전을 상세 출력합니다.").weak());
                         });
                         card(ui, |ui| {
@@ -1834,8 +1905,8 @@ impl App {
                         card(ui, |ui| {
                             ui.strong("서버 SSH (일괄 작업용 · sudo 경유)");
                             ui.label(egui::RichText::new("root 직접 로그인 대신 sudo 권한 계정(예: tong)으로 접속해 sudo로 root 권한 사용. 일괄 업데이트·모듈 삭제에 사용됩니다.").weak());
-                            ui.add_space(6.0);
-                            egui::Grid::new("settings_ssh_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                            ui.add_space(space::SM);
+                            egui::Grid::new("settings_ssh_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                                 grid_label(ui, "SSH 호스트");
                                 ui.add(egui::TextEdit::singleline(&mut self.store.settings.ssh_host).hint_text("비우면 HestiaCP 호스트 사용").desired_width(260.0).margin(FIELD_MARGIN));
                                 ui.end_row();
@@ -1868,7 +1939,7 @@ impl App {
                             ui.strong(format!("{}  Rhymix/그누보드 일괄 업데이트", ph::ARROWS_CLOCKWISE));
                             ui.label(egui::RichText::new("서버의 모든 vhost 웹루트(/home/*/web/*/public_html)를 순회합니다. .git 있으면 얕은 업데이트(depth=1), 없으면 '수동/선택 필요'로 보고만 합니다.").weak());
                             ui.label(egui::RichText::new("※ 서버 SSH(sudo 유저) 설정이 필요합니다.").weak());
-                            ui.add_space(6.0);
+                            ui.add_space(space::SM);
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!running, btn_primary(format!("{}  일괄 업데이트 실행", ph::ARROWS_CLOCKWISE))).clicked() {
                                     do_bulk_update = Some(true);
@@ -1883,11 +1954,11 @@ impl App {
                         card(ui, |ui| {
                             ui.strong(format!("{}  Rhymix 모듈 일괄 삭제 (이름 지정)", ph::TRASH));
                             ui.label(egui::RichText::new("특정 모듈을 서버 전체 또는 한 계정의 모든 사이트에서 제거 (modules/<이름>/ + 캐시 정리). 계정을 비우면 서버 전체입니다.").weak());
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             // 지원종료 모듈 안내
                             ui.group(|ui| {
                                 ui.label(egui::RichText::new(format!("{}  지원종료(삭제 권장) 모듈", ph::WARNING))
-                                    .strong().color(egui::Color32::from_rgb(200, 140, 50)));
+                                    .strong().color(color::WARN));
                                 ui.label(egui::RichText::new("아래 모듈은 최신 Rhymix에서 지원이 종료되어 오류를 유발할 수 있습니다. 클릭하면 이름이 채워집니다.").weak());
                                 ui.horizontal_wrapped(|ui| {
                                     for m in DEPRECATED_MODULES {
@@ -1897,8 +1968,8 @@ impl App {
                                     }
                                 });
                             });
-                            ui.add_space(6.0);
-                            egui::Grid::new("settings_moddel_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                            ui.add_space(space::SM);
+                            egui::Grid::new("settings_moddel_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                                 grid_label(ui, "모듈 이름");
                                 ui.add(egui::TextEdit::singleline(&mut self.mod_del_name).hint_text("예: trackback (영숫자/._- 만)").desired_width(260.0).margin(FIELD_MARGIN));
                                 ui.end_row();
@@ -1908,9 +1979,9 @@ impl App {
                             });
                             if is_deprecated_module(&self.mod_del_name) {
                                 ui.label(egui::RichText::new(format!("⚠ '{}' 은(는) 지원종료 모듈입니다 — 삭제 권장.", self.mod_del_name.trim()))
-                                    .color(egui::Color32::from_rgb(200, 140, 50)));
+                                    .color(color::WARN));
                             }
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             ui.horizontal(|ui| {
                                 let enabled = !running && !self.mod_del_name.trim().is_empty();
                                 if ui.add_enabled(enabled, egui::Button::new(format!("{}  모듈 삭제", ph::TRASH)))
@@ -1921,7 +1992,7 @@ impl App {
                                     do_module_delete = Some(false);
                                 }
                             });
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             ui.label(egui::RichText::new("계정별로 설치된 모듈을 보고 선택 삭제하려면: 좌측 고객 옆 🧩 버튼(계정 모듈).").weak());
                         });
                     }
@@ -1930,22 +2001,22 @@ impl App {
                             ui.strong(format!("{}  디스크 건강 진단", ph::HARD_DRIVES));
                             ui.label(egui::RichText::new("백업/데이터 디스크의 손상 신호를 사전에 감지합니다. dmesg I/O 에러·ext4 누적 에러카운트·SMART·RO 재마운트·용량을 한 번에 수집(읽기 전용).").weak());
                             ui.label(egui::RichText::new("※ '서버 SSH' 설정 필요. 결과는 아래 로그창에 표시됩니다.").weak());
-                            ui.add_space(6.0);
+                            ui.add_space(space::SM);
                             if ui.add_enabled(!running, btn_primary(format!("{}  디스크 건강 진단", ph::STETHOSCOPE)))
                                 .clicked() { do_disk_health = true; }
                         });
-                        ui.add_space(8.0);
+                        ui.add_space(space::SM);
                         card(ui, |ui| {
                             ui.strong(format!("{}  무결성 검사 (write → read-back)", ph::SEAL_CHECK));
                             ui.label(egui::RichText::new("SMART가 PASSED여도 못 잡는 silent corruption 확정용. 지정 경로에 임시파일을 쓰고 캐시를 비운 뒤 다시 읽어 해시를 비교합니다. 갓 쓴 데이터가 바뀌면 디스크 교체 신호.").weak());
-                            ui.label(egui::RichText::new("⚠ 임시파일 쓰기가 발생합니다(검사 후 자동 삭제). 부하 시 장치가 탈락하면 타임아웃으로 잡힙니다.").weak().color(egui::Color32::from_rgb(200, 140, 50)));
-                            ui.add_space(6.0);
-                            egui::Grid::new("disk_scrub_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                            ui.label(egui::RichText::new("⚠ 임시파일 쓰기가 발생합니다(검사 후 자동 삭제). 부하 시 장치가 탈락하면 타임아웃으로 잡힙니다.").weak().color(color::WARN));
+                            ui.add_space(space::SM);
+                            egui::Grid::new("disk_scrub_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                                 grid_label(ui, "검사 경로");
                                 ui.add(egui::TextEdit::singleline(&mut self.disk_path).hint_text("예: /backup").desired_width(260.0).margin(FIELD_MARGIN));
                                 ui.end_row();
                             });
-                            ui.add_space(6.0);
+                            ui.add_space(space::SM);
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!running, egui::Button::new(format!("{}  무결성 검사 (512MB)", ph::SEAL_CHECK)))
                                     .on_hover_text("빠른 확인용 512MB")
@@ -1955,17 +2026,17 @@ impl App {
                                     .clicked() { do_disk_scrub = Some(4096); }
                             });
                         });
-                        ui.add_space(8.0);
+                        ui.add_space(space::SM);
                         card(ui, |ui| {
                             ui.strong(format!("{}  자동 감시 (사전 경보)", ph::BELL_RINGING));
                             ui.label(egui::RichText::new("서버에 cron 감시를 설치합니다: smartd + 매일 FS에러카운트/dmesg/SMART/용량 점검 + 매주 무결성 스크럽(위 경로). 이상 시 이메일 경보.").weak());
-                            ui.add_space(6.0);
-                            egui::Grid::new("disk_monitor_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                            ui.add_space(space::SM);
+                            egui::Grid::new("disk_monitor_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                                 grid_label(ui, "알림 이메일");
                                 ui.add(egui::TextEdit::singleline(&mut self.disk_alert_email).hint_text("eond@eond.com").desired_width(260.0).margin(FIELD_MARGIN));
                                 ui.end_row();
                             });
-                            ui.add_space(6.0);
+                            ui.add_space(space::SM);
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!running, btn_primary(format!("{}  자동 감시 설치", ph::BELL_RINGING)))
                                     .on_hover_text("확인 후 서버에 cron/smartd 설치")
@@ -1980,16 +2051,16 @@ impl App {
                         card(ui, |ui| {
                             ui.strong(format!("{}  백업 (암호화)", ph::FLOPPY_DISK));
                             ui.label(egui::RichText::new("모든 데이터(고객·도메인·설정·스캔 캐시)를 마스터 비밀번호로 암호화한 .hmbak 파일로 저장합니다.").weak());
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             if ui.add(btn_primary(format!("{}  백업 파일 생성", ph::DOWNLOAD_SIMPLE))).clicked() { do_backup = true; }
                             ui.label(egui::RichText::new(format!("저장 폴더: {}", store::backups_root().display())).weak());
                         });
-                        ui.add_space(8.0);
+                        ui.add_space(space::SM);
                         card(ui, |ui| {
                             ui.strong(format!("{}  복원", ph::ARROW_SQUARE_OUT));
-                            ui.colored_label(egui::Color32::from_rgb(220, 120, 120), "주의: 복원하면 현재 모든 데이터가 선택한 백업으로 교체됩니다.");
+                            ui.colored_label(color::DANGER, "주의: 복원하면 현재 모든 데이터가 선택한 백업으로 교체됩니다.");
                             ui.checkbox(&mut self.restore_armed, "현재 데이터를 덮어쓰는 것에 동의");
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             ui.label(egui::RichText::new("백업 목록 (최신순):").weak());
                             let backups = store::list_backups();
                             if backups.is_empty() {
@@ -2006,7 +2077,7 @@ impl App {
                                     }
                                 });
                             }
-                            ui.add_space(6.0);
+                            ui.add_space(space::SM);
                             ui.label(egui::RichText::new("다른 경로의 백업 파일 직접 지정:").weak());
                             ui.horizontal(|ui| {
                                 ui.add(egui::TextEdit::singleline(&mut self.restore_path).hint_text("/경로/hostmover-backup-….hmbak").desired_width(360.0).margin(FIELD_MARGIN));
@@ -2267,8 +2338,6 @@ impl App {
             .unwrap_or_default();
         let running = self.running;
         let scanning = self.scanning;
-        let orange = egui::Color32::from_rgb(200, 140, 50);
-        let hcol = egui::Color32::from_gray(210);
         let mut close = false;
         let mut do_scan = false;
         let mut do_load_mods = false;
@@ -2285,7 +2354,7 @@ impl App {
         let mut select_all = None;
         let mut select_deprecated = false;
         let has_rows = self.all_sites.iter().any(|r| r.account == acct);
-        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
+        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(space::LG as i8, space::MD as i8));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(format!("{}  계정 관리 — {acct}", ph::PUZZLE_PIECE));
@@ -2294,7 +2363,7 @@ impl App {
                 });
             });
             ui.label(egui::RichText::new("사이트 데이터는 전체 사이트 스캔 캐시를 공유합니다. (설정 > 서버 SSH 필요)").weak());
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
             ui.horizontal(|ui| {
                 let note_cnt = self.store.customers.get(ci).map(|c| c.notes.len()).unwrap_or(0);
                 let notes_label = if note_cnt > 0 { format!("  📝 메모 ({note_cnt})  ") } else { "  📝 메모  ".to_string() };
@@ -2306,9 +2375,9 @@ impl App {
                     if ui.selectable_label(self.acct_tab == t, label).clicked() { self.acct_tab = t; }
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
             ui.separator();
-            ui.add_space(8.0);
+            ui.add_space(space::SM);
             match self.acct_tab {
                 AcctTab::Sites => {
                     ui.horizontal(|ui| {
@@ -2322,17 +2391,17 @@ impl App {
                         }
                     });
                     if !self.all_sites_status.is_empty() { ui.label(egui::RichText::new(&self.all_sites_status).weak()); }
-                    ui.add_space(6.0);
+                    ui.add_space(space::SM);
                     if !has_rows {
-                        ui.label(egui::RichText::new("이 계정의 스캔 데이터가 없습니다. ‘이 계정 스캔’ 또는 전체 사이트에서 전체 스캔하세요.").weak());
+                        console_ui::empty_state(ui, ph::MAGNIFYING_GLASS, "이 계정의 스캔 데이터가 없습니다.", Some("[이 계정 스캔] 또는 [전체 사이트]의 [전체 스캔]을 누르세요."));
                     } else {
                         let avail = ui.available_height();
                         let (sa, tl) = self.render_sites_table(ui, false, &acct, "", (avail - 96.0).max(140.0));
                         if let Some(v) = sa { sel_all_sites = Some(v); }
                         alias_loads = tl;
-                        ui.add_space(6.0);
+                        ui.add_space(space::SM);
                         ui.separator();
-                        ui.add_space(4.0);
+                        ui.add_space(space::XS);
                         let seln = self.all_sites.iter().filter(|r| r.account == acct && r.sel).count();
                         ui.horizontal_wrapped(|ui| {
                             if ui.add_enabled(!running && seln > 0, btn_primary(format!("{}  선택 {seln}개 업데이트", ph::ARROWS_CLOCKWISE))).clicked() { do_update = Some(true); }
@@ -2365,26 +2434,87 @@ impl App {
                         }
                     });
                     if !self.acct_mods_status.is_empty() { ui.label(egui::RichText::new(&self.acct_mods_status).weak()); }
-                    ui.add_space(6.0);
+                    ui.add_space(space::SM);
                     if self.acct_mods.is_empty() {
-                        ui.label(egui::RichText::new("‘모듈 불러오기’를 눌러 설치 모듈을 조회하세요. (행 클릭으로 선택)").weak());
+                        console_ui::empty_state(
+                            ui,
+                            ph::PUZZLE_PIECE,
+                            "아직 설치 모듈을 조회하지 않았습니다.",
+                            Some("위의 [모듈 불러오기]를 눌러 조회하세요."),
+                        );
                     } else {
                         let avail = ui.available_height();
-                        egui::ScrollArea::vertical().auto_shrink([false, false]).max_height((avail - 70.0).max(140.0)).show(ui, |ui| {
-                            for (name, doms, sel) in &mut self.acct_mods {
-                                let dep = is_deprecated_module(name);
-                                let namecol = if dep { orange } else { hcol };
-                                let cols: SiteCols = vec![
-                                    (name.clone(), namecol, 200.0),
-                                    (if dep { "지원종료".to_string() } else { String::new() }, orange, 80.0),
-                                    (format!("{}개 사이트: {}", doms.len(), doms.join(", ")), egui::Color32::from_gray(150), 480.0),
-                                ];
-                                if site_row(ui, *sel, &cols) { *sel = !*sel; }
-                            }
+                        let max_height = (avail - 72.0).max(144.0);
+                        let mut indices: Vec<usize> = (0..self.acct_mods.len()).collect();
+                        let sort = self.modules_sort;
+                        indices.sort_by(|&left, &right| {
+                            let a = &self.acct_mods[left];
+                            let b = &self.acct_mods[right];
+                            let order = match sort.col {
+                                1 => is_deprecated_module(&a.0).cmp(&is_deprecated_module(&b.0)),
+                                2 => a.1.len().cmp(&b.1.len()),
+                                _ => a.0.cmp(&b.0),
+                            };
+                            if sort.desc { order.reverse() } else { order }
                         });
-                        ui.add_space(6.0);
+                        let mut sort_state = self.modules_sort;
+                        let mut all_selected = self.acct_mods.iter().all(|row| row.2);
+                        let modules = &mut self.acct_mods;
+                        TableBuilder::new(ui)
+                            .id_salt("account_modules_table")
+                            .striped(true)
+                            .resizable(true)
+                            .sense(egui::Sense::click())
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .max_scroll_height(max_height)
+                            .column(Column::exact(28.0))
+                            .column(Column::initial(200.0).at_least(140.0))
+                            .column(Column::exact(88.0))
+                            .column(Column::remainder().at_least(240.0))
+                            .header(console_ui::TABLE_HEADER_HEIGHT, |mut header| {
+                                header.col(|ui| {
+                                    if ui.checkbox(&mut all_selected, "").on_hover_text("전체 선택").changed() {
+                                        select_all = Some(all_selected);
+                                    }
+                                });
+                                header.col(|ui| console_ui::sort_header(ui, "모듈", 0, &mut sort_state));
+                                header.col(|ui| console_ui::sort_header(ui, "지원", 1, &mut sort_state));
+                                header.col(|ui| console_ui::sort_header(ui, "사용 사이트", 2, &mut sort_state));
+                            })
+                            .body(|body| {
+                                body.rows(console_ui::TABLE_ROW_HEIGHT, indices.len(), |mut row| {
+                                    let index = indices[row.index()];
+                                    let (name, domains, selected) = &mut modules[index];
+                                    let deprecated = is_deprecated_module(name);
+                                    row.set_selected(*selected);
+                                    let mut checkbox_clicked = false;
+                                    row.col(|ui| {
+                                        checkbox_clicked = ui.checkbox(selected, "").clicked();
+                                    });
+                                    row.col(|ui| {
+                                        let text = egui::RichText::new(name.as_str())
+                                            .color(if deprecated { color::WARN } else { ui.visuals().text_color() });
+                                        ui.label(text);
+                                    });
+                                    row.col(|ui| {
+                                        if deprecated {
+                                            console_ui::badge(ui, "주의", color::WARN);
+                                        } else {
+                                            console_ui::badge(ui, "지원", color::OK);
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(format!("{}개 · {}", domains.len(), domains.join(", ")));
+                                    });
+                                    if row.response().clicked() && !checkbox_clicked {
+                                        *selected = !*selected;
+                                    }
+                                });
+                            });
+                        self.modules_sort = sort_state;
+                        ui.add_space(space::SM);
                         ui.separator();
-                        ui.add_space(4.0);
+                        ui.add_space(space::XS);
                         let seln = self.acct_mods.iter().filter(|(_, _, s)| *s).count();
                         ui.horizontal(|ui| {
                             if ui.add_enabled(!running && seln > 0, egui::Button::new(format!("{}  선택 {seln}개 삭제", ph::TRASH)))
@@ -2397,7 +2527,7 @@ impl App {
                 }
                 AcctTab::Notes => {
                     ui.label(egui::RichText::new("이 고객의 추가요청·작업사항을 그때그때 기록합니다. (작성 시각 자동 저장, 최신이 위)").weak());
-                    ui.add_space(6.0);
+                    ui.add_space(space::SM);
                     // ── 새 메모 입력 ──
                     let mut add_note = false;
                     let resp = ui.add(egui::TextEdit::multiline(&mut self.acct_note_input)
@@ -2419,9 +2549,9 @@ impl App {
                             self.save();
                         }
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(space::SM);
                     ui.separator();
-                    ui.add_space(6.0);
+                    ui.add_space(space::SM);
                     // ── 메모 목록 (최신 먼저) ──
                     let notes = self.store.customers.get(ci).map(|c| c.notes.clone()).unwrap_or_default();
                     if notes.is_empty() {
@@ -2435,14 +2565,14 @@ impl App {
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new(fmt_kst(n.at)).weak().monospace());
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            if ui.add(egui::Button::new(egui::RichText::new(ph::TRASH).color(egui::Color32::from_rgb(206, 112, 112))).frame(false)).on_hover_text("이 메모 삭제").clicked() {
+                                            if ui.add(egui::Button::new(egui::RichText::new(ph::TRASH).color(color::DANGER)).frame(false)).on_hover_text("이 메모 삭제").clicked() {
                                                 del_note = Some(i);
                                             }
                                         });
                                     });
                                     ui.add(egui::Label::new(&n.text).wrap());
                                 });
-                                ui.add_space(4.0);
+                                ui.add_space(space::XS);
                             }
                         });
                         if let Some(i) = del_note {
@@ -2540,7 +2670,7 @@ impl App {
         self.all_sites = self.store.scan_cache.iter()
             .map(|c| { let mut r = AcctSiteRow::new(c.account.clone(), c.domain.clone(), c.kind.clone(), c.version.clone(), c.status.clone(), c.git, c.file_bytes, c.db_bytes); r.created = c.created.clone(); r.perm = c.perm.clone(); r })
             .collect();
-        self.all_sites_status = format!("캐시 {}개 ({}) — 최신화하려면 전체 스캔", self.all_sites.len(), ago_text(self.store.scan_cache_at));
+        self.all_sites_status = format!("캐시 {}개 · {} 기준 — 최신화하려면 전체 스캔", self.all_sites.len(), observed_at(self.store.scan_cache_at));
     }
 
     /// all_sites → 캐시 저장
@@ -2835,68 +2965,162 @@ impl App {
     /// 사이트 표(공용) — all_sites 를 필터(fa=계정, fs=검색)해서 렌더. 행 클릭 선택, 화살표로 alias 펼침.
     /// 반환: (헤더 전체선택 변경, alias 조회 필요한 (계정,도메인) 목록)
     fn render_sites_table(&mut self, ui: &mut egui::Ui, show_account: bool, fa: &str, fs: &str, max_h: f32) -> (Option<bool>, Vec<(String, String)>) {
-        let hc = ui.visuals().strong_text_color();
-        let tc = ui.visuals().text_color();
-        let weak = ui.visuals().weak_text_color();
         let fsl = fs.to_lowercase();
         let vis = |r: &AcctSiteRow| (fa.is_empty() || r.account == fa) && (fsl.is_empty() || r.domain.to_lowercase().contains(&fsl));
         let mut sel_all = None;
         let mut to_load: Vec<(String, String)> = Vec::new();
-        let any = self.all_sites.iter().any(|r| vis(r));
-        let mut allsel = any && self.all_sites.iter().filter(|r| vis(r)).all(|r| r.sel);
-        if ui.checkbox(&mut allsel, "보이는 항목 전체 선택").changed() { sel_all = Some(allsel); }
-        ui.add_space(2.0);
-        let lead = (if show_account { 110.0 } else { 0.0 }) + 175.0 + 92.0 + 100.0 + 76.0 + 150.0;
-        egui::ScrollArea::both().auto_shrink([false, false]).max_height(max_h).show(ui, |ui| {
-            let mut header: SiteCols = Vec::new();
-            if show_account { header.push(("계정".to_string(), hc, 110.0)); }
-            for (h, w) in [("도메인", 175.0), ("생성일", 92.0), ("CMS", 100.0), ("버전", 76.0), ("상태", 150.0), ("ALIAS", 200.0), ("A레코드", 120.0), ("파일", 60.0), ("DB", 60.0), ("퍼미션", 130.0)] {
-                header.push((h.to_string(), hc, w));
-            }
-            site_info_row(ui, &header);
-            let (mut tf, mut tdb) = (0u64, 0u64);
-            for i in 0..self.all_sites.len() {
-                if !vis(&self.all_sites[i]) { continue; }
-                let r = &mut self.all_sites[i];
-                // 보이는 행은 alias 자동 조회 (한 번만)
-                if r.aliases.is_none() && !r.alias_req {
-                    r.alias_req = true;
-                    to_load.push((r.account.clone(), r.domain.clone()));
+        let narrow = dashboard_is_narrow(ui.available_width());
+        let mut visible: Vec<usize> = self.all_sites.iter().enumerate()
+            .filter_map(|(index, row)| vis(row).then_some(index))
+            .collect();
+        let sort = self.sites_sort;
+        visible.sort_by(|&left, &right| {
+            let a = &self.all_sites[left];
+            let b = &self.all_sites[right];
+            let order = match sort.col {
+                0 => a.account.cmp(&b.account),
+                1 => a.domain.cmp(&b.domain),
+                2 => a.created.cmp(&b.created),
+                3 => a.kind.cmp(&b.kind),
+                4 => a.version.cmp(&b.version),
+                5 => a.status.cmp(&b.status),
+                8 => a.file_bytes.cmp(&b.file_bytes),
+                9 => a.db_bytes.cmp(&b.db_bytes),
+                _ => a.domain.cmp(&b.domain),
+            };
+            if sort.desc { order.reverse() } else { order }
+        });
+        let any = !visible.is_empty();
+        let mut all_selected = any && visible.iter().all(|&index| self.all_sites[index].sel);
+        let total_file_bytes: u64 = visible.iter().map(|&index| self.all_sites[index].file_bytes).sum();
+        let total_db_bytes: u64 = visible.iter().map(|&index| self.all_sites[index].db_bytes).sum();
+        let mut sort_state = self.sites_sort;
+
+        let mut table = TableBuilder::new(ui)
+            .id_salt(if show_account { "all_sites_table" } else { "account_sites_table" })
+            .striped(true)
+            .resizable(true)
+            .sense(egui::Sense::click())
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .min_scrolled_height(max_h.min(200.0))
+            .max_scroll_height(max_h)
+            .column(Column::exact(28.0));
+        if show_account {
+            table = table.column(Column::initial(104.0).at_least(80.0));
+        }
+        table = table.column(Column::initial(180.0).at_least(140.0));
+        if !narrow {
+            table = table.column(Column::exact(92.0));
+        }
+        table = table
+            .column(Column::initial(104.0).at_least(80.0))
+            .column(Column::exact(80.0))
+            .column(Column::remainder().at_least(120.0));
+        if !narrow {
+            table = table
+                .column(Column::initial(180.0).at_least(100.0))
+                .column(Column::exact(120.0))
+                .column(Column::exact(72.0))
+                .column(Column::exact(72.0))
+                .column(Column::initial(128.0).at_least(96.0));
+        }
+
+        let all_sites = &mut self.all_sites;
+        table
+            .header(console_ui::TABLE_HEADER_HEIGHT, |mut header| {
+                header.col(|ui| {
+                    if ui.checkbox(&mut all_selected, "").on_hover_text("보이는 항목 전체 선택").changed() {
+                        sel_all = Some(all_selected);
+                    }
+                });
+                if show_account {
+                    header.col(|ui| console_ui::sort_header(ui, "계정", 0, &mut sort_state));
                 }
-                let alias_txt = match &r.aliases {
-                    None => "…".to_string(),
-                    Some(a) if a.is_empty() => "-".to_string(),
-                    Some(a) => a.join(", "),
-                };
-                let kc = kind_color(&r.kind, r.git);
-                let sc = status_color(&r.status);
-                let mut cols: SiteCols = Vec::new();
-                if show_account { cols.push((r.account.clone(), egui::Color32::GRAY, 110.0)); }
-                cols.push((r.domain.clone(), tc, 175.0));
-                cols.push((if r.created.is_empty() { "…".to_string() } else { r.created.clone() }, weak, 92.0));
-                cols.push((format!("{}{}", r.kind, if r.git { " (git)" } else { "" }), kc, 100.0));
-                cols.push((r.version.clone(), tc, 76.0));
-                cols.push((if r.status.is_empty() { "-".to_string() } else { r.status.clone() }, sc, 150.0));
-                cols.push((alias_txt, weak, 200.0));
-                cols.push((if r.a_record.is_empty() { "-".to_string() } else { r.a_record.clone() }, tc, 120.0));
-                cols.push((human_bytes(r.file_bytes), tc, 60.0));
-                cols.push((human_bytes(r.db_bytes), tc, 60.0));
-                // 퍼미션 "소유자:chmod" → "chmod 소유자", 소유자가 계정과 다르면 빨강(access denied 위험)
-                let (perm_txt, perm_col) = if r.perm.is_empty() {
-                    ("…".to_string(), weak)
-                } else {
-                    let owner = r.perm.split(':').next().unwrap_or("");
-                    let txt = match r.perm.split_once(':') { Some((o, p)) => format!("{p}  {o}"), None => r.perm.clone() };
-                    let col = if owner == r.account { tc } else { egui::Color32::from_rgb(220, 120, 120) };
-                    (txt, col)
-                };
-                cols.push((perm_txt, perm_col, 130.0));
-                if site_row(ui, r.sel, &cols) { r.sel = !r.sel; }
-                tf += r.file_bytes;
-                tdb += r.db_bytes;
-            }
-            let tot: SiteCols = vec![("합계".to_string(), hc, lead + 200.0 + 120.0), (human_bytes(tf), hc, 60.0), (human_bytes(tdb), hc, 60.0), (String::new(), hc, 130.0)];
-            site_info_row(ui, &tot);
+                header.col(|ui| console_ui::sort_header(ui, "도메인", 1, &mut sort_state));
+                if !narrow {
+                    header.col(|ui| console_ui::sort_header(ui, "생성일", 2, &mut sort_state));
+                }
+                header.col(|ui| console_ui::sort_header(ui, "CMS", 3, &mut sort_state));
+                header.col(|ui| console_ui::sort_header(ui, "버전", 4, &mut sort_state));
+                header.col(|ui| console_ui::sort_header(ui, "상태", 5, &mut sort_state));
+                if !narrow {
+                    header.col(|ui| { ui.strong("ALIAS"); });
+                    header.col(|ui| { ui.strong("A레코드"); });
+                    header.col(|ui| console_ui::sort_header(ui, "파일", 8, &mut sort_state));
+                    header.col(|ui| console_ui::sort_header(ui, "DB", 9, &mut sort_state));
+                    header.col(|ui| { ui.strong("퍼미션"); });
+                }
+            })
+            .body(|body| {
+                body.rows(console_ui::TABLE_ROW_HEIGHT, visible.len(), |mut row| {
+                    let index = visible[row.index()];
+                    let item = &mut all_sites[index];
+                    row.set_selected(item.sel);
+                    let mut checkbox_clicked = false;
+                    row.col(|ui| {
+                        let response = ui.checkbox(&mut item.sel, "");
+                        checkbox_clicked = response.clicked();
+                    });
+                    if show_account {
+                        row.col(|ui| { ui.label(egui::RichText::new(&item.account).color(color::MUTED)); });
+                    }
+                    row.col(|ui| { ui.label(&item.domain); });
+                    if !narrow {
+                        row.col(|ui| { ui.label(if item.created.is_empty() || item.created == "-" { "미조회" } else { &item.created }); });
+                    }
+                    row.col(|ui| {
+                        let label = format!("{}{}", item.kind, if item.git { " (git)" } else { "" });
+                        ui.label(egui::RichText::new(label).color(kind_color(&item.kind, item.git)));
+                    });
+                    row.col(|ui| {
+                        ui.label(if item.version.is_empty() || item.version == "-" { "조회불가" } else { &item.version });
+                    });
+                    row.col(|ui| {
+                        let text = if item.status.is_empty() || item.status == "-" { "조회불가" } else { &item.status };
+                        ui.label(egui::RichText::new(text).color(status_color(&item.status)));
+                    });
+                    if !narrow {
+                        row.col(|ui| {
+                            if item.aliases.is_none() && !item.alias_req {
+                                item.alias_req = true;
+                                to_load.push((item.account.clone(), item.domain.clone()));
+                            }
+                            let text = match &item.aliases {
+                                None => "미조회".to_string(),
+                                Some(values) if values.is_empty() => "해당 없음".to_string(),
+                                Some(values) => values.join(", "),
+                            };
+                            ui.label(egui::RichText::new(text).color(color::MUTED));
+                        });
+                        row.col(|ui| { ui.label(if item.a_record.is_empty() || item.a_record == "-" { "미조회" } else { &item.a_record }); });
+                        row.col(|ui| console_ui::num(ui, &human_bytes(item.file_bytes)));
+                        row.col(|ui| console_ui::num(ui, &human_bytes(item.db_bytes)));
+                        row.col(|ui| {
+                            if item.perm.is_empty() {
+                                ui.label(egui::RichText::new("미조회").color(color::MUTED));
+                            } else {
+                                let owner = item.perm.split(':').next().unwrap_or("");
+                                let text = item.perm.split_once(':')
+                                    .map_or_else(|| item.perm.clone(), |(owner, perm)| format!("{perm}  {owner}"));
+                                let text_color = if owner == item.account { ui.visuals().text_color() } else { color::DANGER };
+                                ui.label(egui::RichText::new(text).color(text_color));
+                            }
+                        });
+                    }
+                    if row.response().clicked() && !checkbox_clicked {
+                        item.sel = !item.sel;
+                    }
+                });
+            });
+        self.sites_sort = sort_state;
+        ui.horizontal(|ui| {
+            ui.strong(format!("합계 {}개", visible.len()));
+            ui.separator();
+            ui.label("파일");
+            console_ui::num(ui, &human_bytes(total_file_bytes));
+            ui.separator();
+            ui.label("DB");
+            console_ui::num(ui, &human_bytes(total_db_bytes));
         });
         (sel_all, to_load)
     }
@@ -2917,7 +3141,7 @@ impl App {
         let mut do_permfix = false;
         let mut do_wp_pw = false;
         let mut alias_loads: Vec<(String, String)> = Vec::new();
-        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
+        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(space::LG as i8, space::MD as i8));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(format!("{}  전체 사이트", ph::LIST_BULLETS));
@@ -2926,7 +3150,7 @@ impl App {
                 });
             });
             ui.label(egui::RichText::new("모든 계정(/home/*/web/*)의 사이트를 스캔합니다. (설정 > 서버 SSH 필요)").weak());
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
             ui.horizontal(|ui| {
                 if ui.add_enabled(!running && !scanning, btn_primary(format!("{}  전체 스캔", ph::ARROWS_CLOCKWISE))).clicked() { do_load = true; }
                 if ui.add_enabled(!running && !scanning && !self.all_filter_acct.is_empty(), egui::Button::new(format!("{}  이 계정만 재스캔", ph::ARROWS_CLOCKWISE)))
@@ -2950,16 +3174,16 @@ impl App {
                             ui.selectable_value(&mut self.all_filter_acct, a.clone(), a.as_str());
                         }
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(space::SM);
                     ui.label("검색:");
                     ui.add(egui::TextEdit::singleline(&mut self.all_search).hint_text("도메인 일부").desired_width(180.0).margin(FIELD_MARGIN));
                     if !self.all_search.is_empty() && ui.button(ph::X).clicked() { self.all_search.clear(); }
                 });
             }
             if !self.all_sites_status.is_empty() { ui.label(egui::RichText::new(&self.all_sites_status).weak()); }
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
             if self.all_sites.is_empty() {
-                ui.label(egui::RichText::new("‘전체 스캔’으로 모든 계정의 사이트를 조회하세요. (사이트가 많으면 다소 시간이 걸립니다)").weak());
+                console_ui::empty_state(ui, ph::MAGNIFYING_GLASS, "아직 사이트를 스캔하지 않았습니다.", Some("[전체 스캔]을 누르세요. 사이트가 많으면 약 2분 걸립니다."));
             } else {
                 let fa = self.all_filter_acct.clone();
                 let fs = self.all_search.trim().to_string();
@@ -2969,9 +3193,9 @@ impl App {
                 let (sa, tl) = self.render_sites_table(ui, true, &fa, &fs, (avail - 96.0).max(140.0));
                 if let Some(v) = sa { sel_all = Some(v); }
                 alias_loads = tl;
-                ui.add_space(6.0);
+                ui.add_space(space::SM);
                 ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(space::XS);
                 let seln = self.all_sites.iter().filter(|r| r.sel).count();
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_enabled(!running && seln > 0, btn_primary(format!("{}  선택 {seln}개 업데이트", ph::ARROWS_CLOCKWISE))).clicked() { do_update = Some((true, false)); }
@@ -3354,31 +3578,31 @@ impl App {
         let total_w = LOCK_W + 2.0 * LOCK_PAD.x; // 인풋 전체 너비(버튼과 정렬)
         let btn = |label: &str| egui::Button::new(label).min_size(egui::vec2(total_w, LOCK_H));
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(70.0);
+            ui.add_space(72.0);
             ui.vertical_centered(|ui| {
                 ui.heading("Hostmover");
-                ui.add_space(4.0);
+                ui.add_space(space::XS);
                 ui.label(egui::RichText::new("호스팅 이전 백업/복원 관리").weak());
-                ui.add_space(2.0);
+                ui.add_space(space::XS);
                 ui.label(egui::RichText::new(version_line()).weak().small().monospace())
                     .on_hover_text("실행 중인 바이너리의 버전 · git 커밋 · 커밋일");
-                ui.add_space(18.0);
+                ui.add_space(space::LG);
                 // 화면 진입 시 포커스가 없으면 입력칸에 커서를 둔다
                 let nothing_focused = ui.memory(|m| m.focused().is_none());
                 let vis = self.show_lock_pw;
 
                 if self.creating {
                     ui.label("새 마스터 패스워드를 설정하세요");
-                    ui.add_space(10.0);
+                    ui.add_space(space::MD);
                     let r1 = ui.add(pw_field(&mut self.password, "마스터 패스워드", vis));
-                    ui.add_space(10.0);
+                    ui.add_space(space::MD);
                     ui.add(pw_field(&mut self.password_confirm, "패스워드 확인", vis));
                     if nothing_focused {
                         r1.request_focus();
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(space::SM);
                     ui.checkbox(&mut self.show_lock_pw, "비밀번호 표시");
-                    ui.add_space(10.0);
+                    ui.add_space(space::MD);
                     if ui.add(btn("생성")).clicked() {
                         if self.password.is_empty() {
                             self.auth_error = "패스워드를 입력하세요".into();
@@ -3398,15 +3622,15 @@ impl App {
                     }
                 } else {
                     ui.label("마스터 패스워드를 입력하세요");
-                    ui.add_space(10.0);
+                    ui.add_space(space::MD);
                     let resp = ui.add(pw_field(&mut self.password, "마스터 패스워드", vis));
                     if nothing_focused {
                         resp.request_focus();
                     }
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.add_space(8.0);
+                    ui.add_space(space::SM);
                     ui.checkbox(&mut self.show_lock_pw, "비밀번호 표시");
-                    ui.add_space(10.0);
+                    ui.add_space(space::MD);
                     if ui.add(btn("잠금 해제")).clicked() || enter {
                         match store::load(&self.password) {
                             Ok(s) => {
@@ -3423,8 +3647,8 @@ impl App {
                 }
 
                 if !self.auth_error.is_empty() {
-                    ui.add_space(8.0);
-                    ui.colored_label(egui::Color32::from_rgb(242, 109, 109), &self.auth_error);
+                    ui.add_space(space::SM);
+                    ui.colored_label(color::DANGER, &self.auth_error);
                 }
             });
         });
@@ -3472,7 +3696,7 @@ impl App {
                                     .size(16.0)
                                     .strong()
                                     .color(egui::Color32::WHITE)
-                                    .background_color(egui::Color32::from_rgb(34, 150, 74)),
+                                    .background_color(color::OK),
                             );
                         }
                         Some(false) => {
@@ -3481,7 +3705,7 @@ impl App {
                                     .size(16.0)
                                     .strong()
                                     .color(egui::Color32::WHITE)
-                                    .background_color(egui::Color32::from_rgb(190, 60, 60)),
+                                    .background_color(color::DANGER),
                             );
                         }
                         None => {
@@ -3495,7 +3719,7 @@ impl App {
 
     fn left_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("tree").resizable(true).default_width(252.0).show(ctx, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(space::XS);
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.new_customer).hint_text("새 고객명").desired_width(140.0).margin(FIELD_MARGIN));
                 if ui.button("+ 고객").clicked() && !self.new_customer.trim().is_empty() {
@@ -3556,7 +3780,7 @@ impl App {
                         if let Some(c) = col { rt = rt.color(c); }
                         ui.add(egui::Button::new(rt).frame(false)).on_hover_text(hint).clicked()
                     };
-                    if icon(ui, ph::TRASH, Some(egui::Color32::from_rgb(206, 112, 112)), "이 고객 삭제(휴지통)") {
+                    if icon(ui, ph::TRASH, Some(color::DANGER), "이 고객 삭제(휴지통)") {
                         self.pending_delete = Some(DelTarget::Customer(ci));
                     }
                     if icon(ui, ph::DOWNLOAD_SIMPLE, None, "HestiaCP 사이트 불러오기") {
@@ -3620,7 +3844,7 @@ impl App {
                     let working = self.store.customers[ci].domains[di].working;
                     let selected = self.sel_customer == Some(ci) && self.sel_domain == Some(di);
                     // 작업중이면 렌치 아이콘 + 앰버색 강조
-                    let amber = egui::Color32::from_rgb(224, 168, 74);
+                    let amber = color::WARN;
                     let label = if working {
                         egui::RichText::new(format!("{}  {dname}  {}", ph::GLOBE, ph::WRENCH)).color(amber).strong()
                     } else {
@@ -3667,7 +3891,7 @@ impl App {
     /// 휴지통: 삭제된 고객/도메인 + 복원/완전삭제 + 남은 일수
     fn trash_view(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("삭제 항목 — 30일 후 자동 완전삭제").weak());
-        ui.add_space(4.0);
+        ui.add_space(space::XS);
         let mut restore: Option<DelTarget> = None;
         let mut purge: Option<DelTarget> = None;
         let mut any = false;
@@ -3779,8 +4003,8 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.label(msg);
-                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), "30일 후 완전삭제됩니다. 그 전엔 휴지통에서 복원 가능.");
-                ui.add_space(8.0);
+                ui.colored_label(color::WARN, "30일 후 완전삭제됩니다. 그 전엔 휴지통에서 복원 가능.");
+                ui.add_space(space::SM);
                 ui.horizontal(|ui| {
                     if ui.add(btn_danger(format!("{}  휴지통으로 이동", ph::TRASH))).clicked() {
                         let now = now_unix();
@@ -3821,16 +4045,16 @@ impl App {
                     }
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(space::SM);
             ui.separator();
-            ui.add_space(4.0);
+            ui.add_space(space::XS);
             egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
                 for line in &self.log {
                     let txt = egui::RichText::new(line).monospace();
                     if is_success_line(line) {
-                        ui.label(txt.color(egui::Color32::from_rgb(74, 200, 120)).strong());
+                        ui.label(txt.color(color::OK).strong());
                     } else if is_error_line(line) {
-                        ui.label(txt.color(egui::Color32::from_rgb(236, 110, 110)));
+                        ui.label(txt.color(color::DANGER));
                     } else {
                         ui.label(txt);
                     }
@@ -3840,7 +4064,7 @@ impl App {
     }
 
     fn central(&mut self, ctx: &egui::Context) {
-        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
+        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(space::LG as i8, space::MD as i8));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let (ci, di) = match (self.sel_customer, self.sel_domain) {
                 (Some(c), Some(d))
@@ -3931,7 +4155,7 @@ impl App {
                 });
             });
             // ── 탭 바 ──
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
             ui.horizontal(|ui| {
                 for (t, label) in [
                     (Tab::Info, "  정보  "),
@@ -3945,9 +4169,9 @@ impl App {
                     }
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
             ui.separator();
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
 
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
               ui.push_id(("domain", did), |ui| {
@@ -3958,7 +4182,7 @@ impl App {
                             ui.label("메모");
                             changed |= ui.add(egui::TextEdit::singleline(&mut domain.memo).desired_width(440.0).margin(FIELD_MARGIN)).changed();
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(space::SM);
                         // ① 도메인 접속 / ④ CMS 좌우
                         ui.columns(2, |cols| {
                             card(&mut cols[0], |ui| {
@@ -3970,13 +4194,13 @@ impl App {
                                 changed |= cms_editor(ui, &mut domain.cms, show_pw);
                             });
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(space::SM);
                         // ② 현재 / ③ 신규 좌우
                         ui.columns(2, |cols| {
                             card(&mut cols[0], |ui| {
                                 ui.strong("② 현재 사이트 (ASIS)");
                                 changed |= site_fields(ui, &mut domain.asis, show_pw);
-                                ui.add_space(4.0);
+                                ui.add_space(space::XS);
                                 if ui.add_enabled(!running, egui::Button::new(format!("{}  접속 테스트", ph::PLUGS_CONNECTED)))
                                     .on_hover_text("SSH 로그인 + 원격 도구(mysqldump/rsync/tar)·DB소켓·CMS설정 탐지 → DB정보 자동입력").clicked() {
                                     request = Some((Req::Op(OpKind::TestAsis), customer_name.clone(), domain_name.clone(), domain.asis.clone(), domain.tobe.clone()));
@@ -3985,7 +4209,7 @@ impl App {
                             card(&mut cols[1], |ui| {
                                 ui.strong("③ 신규 사이트 (TOBE)");
                                 changed |= site_fields(ui, &mut domain.tobe, show_pw);
-                                ui.add_space(4.0);
+                                ui.add_space(space::XS);
                                 if ui.add_enabled(!running, egui::Button::new(format!("{}  접속 테스트", ph::PLUGS_CONNECTED)))
                                     .on_hover_text("SSH 로그인 + 원격 도구(mysqldump/rsync/tar)·DB소켓·CMS설정 탐지 → DB정보 자동입력").clicked() {
                                     request = Some((Req::Op(OpKind::TestTobe), customer_name.clone(), domain_name.clone(), domain.asis.clone(), domain.tobe.clone()));
@@ -4019,7 +4243,7 @@ impl App {
                                 });
                             });
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(space::SM);
                         let asis = domain.asis.clone();
                         let tobe = domain.tobe.clone();
                         // 마이그레이션 — 좌(개별) / 우(묶음 + 직접)
@@ -4038,7 +4262,7 @@ impl App {
                                     )
                                     .wrap(),
                                 );
-                                ui.add_space(4.0);
+                                ui.add_space(space::XS);
                                 for (label, kind) in [
                                     (format!("{}  DB 백업", ph::ARROW_LINE_DOWN), OpKind::DbBackup),
                                     (format!("{}  파일 백업", ph::ARROW_LINE_DOWN), OpKind::FileBackup),
@@ -4070,7 +4294,7 @@ impl App {
                                     });
                                     ui.label(egui::RichText::new("현재→로컬 디스크에 백업본 저장 후→신규로 복원. 백업본이 남아 재시도·롤백이 안전하나, 로컬 디스크 공간이 필요하고 전송이 2회라 느립니다.").weak());
                                     ui.label(egui::RichText::new("※ 공간 부족 시 '파일만' → 확보 후 '디비만'").weak());
-                                    ui.add_space(4.0);
+                                    ui.add_space(space::XS);
                                     ui.horizontal_wrapped(|ui| {
                                         if ui.add_enabled(!running, btn_go(format!("{}  전체 이전", ph::ROCKET_LAUNCH))).clicked() {
                                             request = Some((Req::Migrate(MigrateKind::Full), customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
@@ -4083,7 +4307,7 @@ impl App {
                                         }
                                     });
                                 });
-                                ui.add_space(6.0);
+                                ui.add_space(space::SM);
                                 card(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.strong(format!("{}  직접 이전 (디스크 미사용)", ph::LIGHTNING));
@@ -4091,7 +4315,7 @@ impl App {
                                             .on_hover_text("파일: tar -czf - . | ssh | tar -xzf - (무저장 스트리밍) · DB: mysqldump 파이프");
                                     });
                                     ui.label(egui::RichText::new("로컬 디스크를 안 거치고 현재→신규로 바로 스트리밍. 전송 1회라 빠르고 디스크가 필요 없으나, 백업본이 남지 않아 중간 실패 시 처음부터 다시 합니다.").weak());
-                                    ui.add_space(4.0);
+                                    ui.add_space(space::XS);
                                     ui.horizontal_wrapped(|ui| {
                                         if ui.add_enabled(!running, egui::Button::new(format!("{}  DB 직접", ph::LIGHTNING))).clicked() {
                                             request = Some((Req::Op(OpKind::DbDirect), customer_name.clone(), domain_name.clone(), asis.clone(), tobe.clone()));
@@ -4140,7 +4364,7 @@ impl App {
                                 changed |= row_text_hint(ui, "언어", &mut c.locale, "기본 ko_KR");
                                 changed |= row_text_hint(ui, "버전", &mut c.version, "기본 latest (예: 6.5)");
                             });
-                            ui.add_space(6.0);
+                            ui.add_space(space::SM);
                             // DB·관리자 정보는 정보 탭을 단일 출처로 사용 (여기선 읽기 전용 표시)
                             egui::Grid::new(("cmsinstall_ro", ui.next_auto_id())).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                                 grid_label(ui, "HestiaCP 유저 (=FTP)");
@@ -4158,7 +4382,7 @@ impl App {
                             });
                             ui.label(egui::RichText::new("※ HestiaCP 유저·DB·관리자 정보는 정보 탭에서 수정합니다. (대상 서버 = 선택된 현재/신규 서버)").weak());
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(space::SM);
                         card(ui, |ui| {
                             ui.strong(format!("{}  ('루트로 실행' 필수)", c.kind.label()));
                             let hint = match c.kind {
@@ -4167,7 +4391,7 @@ impl App {
                                 CmsKind::Gnuboard => "설치: git clone+DB+data권한+SSL → /install/ 마법사  /  업데이트: git pull",
                             };
                             ui.label(egui::RichText::new(hint).weak());
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!running, btn_primary(format!("{}  설치", ph::DOWNLOAD)).min_size(egui::vec2(132.0, 0.0))).clicked() {
                                     cms_step = Some((1, true));
@@ -4184,22 +4408,22 @@ impl App {
                             });
                         });
                         if c.kind == CmsKind::Rhymix {
-                            ui.add_space(6.0);
+                            ui.add_space(space::SM);
                             let rx_src = rx_source.trim().to_string();
                             card(ui, |ui| {
                                 ui.strong(format!("{}  Rhymix 모듈/레이아웃 업로드", ph::UPLOAD));
                                 if rx_src.is_empty() {
-                                    ui.label(egui::RichText::new("⚠ 설정 > 서버 SSH > 'Rhymix 소스'에 로컬 dev/rx 경로를 먼저 지정하세요.").weak().color(egui::Color32::from_rgb(200, 140, 50)));
+                                    ui.label(egui::RichText::new("⚠ 설정 > 서버 SSH > 'Rhymix 소스'에 로컬 dev/rx 경로를 먼저 지정하세요.").weak().color(color::WARN));
                                 } else {
                                     ui.label(egui::RichText::new(format!("소스: {rx_src}/modules · {rx_src}/layouts → 위에서 선택한 대상 서버의 사이트로 업로드(전체 교체).")).weak());
                                 }
-                                ui.add_space(4.0);
+                                ui.add_space(space::XS);
                                 egui::Grid::new(("rxup", ui.next_auto_id())).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                                     changed |= row_text_hint(ui, "모듈(쉼표)", &mut c.rx_modules, "예: mymod, point  (dev/rx/modules 하위 폴더명)");
                                     changed |= row_text_hint(ui, "레이아웃(쉼표)", &mut c.rx_layouts, "예: mylayout  (dev/rx/layouts 하위 폴더명)");
                                     ui.end_row();
                                 });
-                                ui.add_space(4.0);
+                                ui.add_space(space::XS);
                                 ui.horizontal(|ui| {
                                     if ui.add_enabled(!running, btn_primary(format!("{}  업로드", ph::UPLOAD)).min_size(egui::vec2(132.0, 0.0))).clicked() {
                                         rx_upload = Some(true);
@@ -4211,7 +4435,7 @@ impl App {
                             });
                         }
                         if c.kind == CmsKind::WordPress {
-                            ui.add_space(6.0);
+                            ui.add_space(space::SM);
                             let wp_src = wp_source.trim().to_string();
                             card(ui, |ui| {
                                 ui.strong(format!("{}  WordPress 플러그인 · 테마 (버전 비교 · 동기화)", ph::PUZZLE_PIECE));
@@ -4230,11 +4454,11 @@ impl App {
                                 };
                                 let cached = !wp_rows.is_empty();
                                 if wp_src.is_empty() {
-                                    ui.label(egui::RichText::new("⚠ 설정 > 서버 SSH > 'WordPress 소스'에 로컬 dev/wp 경로를 먼저 지정하세요.").weak().color(egui::Color32::from_rgb(200, 140, 50)));
+                                    ui.label(egui::RichText::new("⚠ 설정 > 서버 SSH > 'WordPress 소스'에 로컬 dev/wp 경로를 먼저 지정하세요.").weak().color(color::WARN));
                                 } else {
                                     ui.label(egui::RichText::new(format!("소스: {wp_src}/wp-content/{ksub} → 위 대상 서버 사이트의 설치 버전과 비교(같은 서버, 경로만 있으면 자동 조회).")).weak());
                                 }
-                                ui.add_space(4.0);
+                                ui.add_space(space::XS);
                                 ui.horizontal(|ui| {
                                     // 캐시가 있으면 '새로고침', 없으면 '스캔'. 캐시는 즉시 표시되고 이 버튼으로만 재조회.
                                     let btn_label = if cached { format!("{}  {klbl} 새로고침", ph::ARROWS_CLOCKWISE) } else { format!("{}  {klbl} 스캔(버전 비교)", ph::MAGNIFYING_GLASS) };
@@ -4256,7 +4480,7 @@ impl App {
                                     if cached && !wp_scanning { ui.label(egui::RichText::new("· 캐시 표시중").weak()); }
                                 });
                                 if cached {
-                                    ui.add_space(4.0);
+                                    ui.add_space(space::XS);
                                     // 검색: 이름/slug 부분일치(대소문자 무시). 빈칸이면 전체.
                                     ui.horizontal(|ui| {
                                         ui.label(format!("{} 검색", ph::MAGNIFYING_GLASS));
@@ -4287,51 +4511,69 @@ impl App {
                                         if ui.small_button("선택 해제").clicked() { wp_sel_local.clear(); }
                                         if !fq.is_empty() { ui.label(egui::RichText::new(format!("· {shown}/{}개 표시", wp_rows.len())).weak()); }
                                     });
-                                    ui.add_space(2.0);
-                                    egui::ScrollArea::horizontal().id_salt(("wpsc", ui.next_auto_id())).show(ui, |ui| {
-                                    egui::Grid::new(("wpplugins", ui.next_auto_id())).striped(true).num_columns(9).spacing([12.0, 4.0]).show(ui, |ui| {
-                                        for h in ["", klbl, "로컬ver", "원격ver", "상태", "로컬크기", "원격크기", "로컬수정", "원격수정"] {
-                                            ui.label(egui::RichText::new(h).strong());
-                                        }
-                                        ui.end_row();
-                                        let newer = egui::Color32::from_rgb(80, 190, 110);
-                                        let older = egui::Color32::from_rgb(220, 160, 60);
-                                        for r in wp_rows.iter().filter(|r| matches(r)) {
-                                            // 로컬·원격 어느 쪽이든 존재하면 선택 가능(로컬만=업로드, 원격만=내려받기 대상).
-                                            {
+                                    ui.add_space(space::XS);
+                                    let visible_rows: Vec<_> = wp_rows.iter().filter(|row| matches(row)).collect();
+                                    TableBuilder::new(ui)
+                                        .id_salt(("wp_assets_table", domain.id, wp_kind))
+                                        .striped(true)
+                                        .resizable(true)
+                                        .max_scroll_height(320.0)
+                                        .column(Column::exact(28.0))
+                                        .column(Column::remainder().at_least(160.0))
+                                        .column(Column::exact(88.0))
+                                        .column(Column::exact(88.0))
+                                        .column(Column::initial(132.0).at_least(104.0))
+                                        .column(Column::exact(80.0))
+                                        .column(Column::exact(80.0))
+                                        .column(Column::exact(96.0))
+                                        .column(Column::exact(96.0))
+                                        .header(console_ui::TABLE_HEADER_HEIGHT, |mut header| {
+                                            for title in ["", klbl, "로컬 ver", "원격 ver", "상태", "로컬 크기", "원격 크기", "로컬 수정", "원격 수정"] {
+                                                header.col(|ui| { ui.strong(title); });
+                                            }
+                                        })
+                                        .body(|body| {
+                                            body.rows(console_ui::TABLE_ROW_HEIGHT, visible_rows.len(), |mut row| {
+                                                let r = visible_rows[row.index()];
                                                 let mut checked = wp_sel_local.contains(&r.slug);
                                                 let tip = if r.local_size == 0 && r.local_ver.is_empty() { "원격에만 있음 → 내려받기 가능" }
                                                     else if r.remote_size == 0 && r.remote_ver.is_empty() { "로컬에만 있음 → 업로드 가능" }
                                                     else { "양쪽 존재 → 업로드/내려받기 가능" };
-                                                if ui.checkbox(&mut checked, "").on_hover_text(tip).changed() {
-                                                    if checked { wp_sel_local.insert(r.slug.clone()); } else { wp_sel_local.remove(&r.slug); }
-                                                }
-                                            }
-                                            let nm = if r.active { format!("● {}", r.name) } else { r.name.clone() };
-                                            ui.label(nm).on_hover_text(format!("{} (active={})", r.slug, r.active));
-                                            ui.label(if r.local_ver.is_empty() { "-".to_string() } else { r.local_ver.clone() });
-                                            ui.label(if r.remote_ver.is_empty() { "-".to_string() } else { r.remote_ver.clone() });
-                                            let (txt, col) = wp_diff_label(r.diff);
-                                            ui.label(egui::RichText::new(txt).color(col));
-                                            ui.label(human_bytes(r.local_size));
-                                            ui.label(human_bytes(r.remote_size));
-                                            // 수정일: 더 최신 쪽을 색으로 강조 (로컬이 최신=초록, 원격이 최신=주황)
-                                            let (lc, rc) = if r.local_mtime > 0 && r.remote_mtime > 0 {
-                                                if r.local_mtime > r.remote_mtime { (Some(newer), None) }
-                                                else if r.remote_mtime > r.local_mtime { (None, Some(older)) }
-                                                else { (None, None) }
-                                            } else { (None, None) };
-                                            let mut lt = egui::RichText::new(short_date(r.local_mtime));
-                                            if let Some(c) = lc { lt = lt.color(c); }
-                                            ui.label(lt);
-                                            let mut rt = egui::RichText::new(short_date(r.remote_mtime));
-                                            if let Some(c) = rc { rt = rt.color(c); }
-                                            ui.label(rt);
-                                            ui.end_row();
-                                        }
-                                    });
-                                    });
-                                    ui.add_space(4.0);
+                                                row.col(|ui| {
+                                                    if ui.checkbox(&mut checked, "").on_hover_text(tip).changed() {
+                                                        if checked { wp_sel_local.insert(r.slug.clone()); } else { wp_sel_local.remove(&r.slug); }
+                                                    }
+                                                });
+                                                row.col(|ui| {
+                                                    let name = if r.active { format!("● 활성 · {}", r.name) } else { r.name.clone() };
+                                                    ui.label(name).on_hover_text(&r.slug);
+                                                });
+                                                row.col(|ui| { ui.label(if r.local_ver.is_empty() { "해당 없음" } else { &r.local_ver }); });
+                                                row.col(|ui| { ui.label(if r.remote_ver.is_empty() { "해당 없음" } else { &r.remote_ver }); });
+                                                let (text, state_color) = wp_diff_label(r.diff);
+                                                row.col(|ui| { ui.label(egui::RichText::new(text).color(state_color)); });
+                                                row.col(|ui| console_ui::num(ui, &human_bytes(r.local_size)));
+                                                row.col(|ui| console_ui::num(ui, &human_bytes(r.remote_size)));
+                                                let (local_color, remote_color) = if r.local_mtime > 0 && r.remote_mtime > 0 {
+                                                    if r.local_mtime > r.remote_mtime { (Some(color::OK), None) }
+                                                    else if r.remote_mtime > r.local_mtime { (None, Some(color::WARN)) }
+                                                    else { (None, None) }
+                                                } else { (None, None) };
+                                                row.col(|ui| {
+                                                    let text = if r.local_mtime <= 0 { "해당 없음".to_string() } else { short_date(r.local_mtime) };
+                                                    let mut rich = egui::RichText::new(text);
+                                                    if let Some(value) = local_color { rich = rich.color(value); }
+                                                    ui.label(rich);
+                                                });
+                                                row.col(|ui| {
+                                                    let text = if r.remote_mtime <= 0 { "해당 없음".to_string() } else { short_date(r.remote_mtime) };
+                                                    let mut rich = egui::RichText::new(text);
+                                                    if let Some(value) = remote_color { rich = rich.color(value); }
+                                                    ui.label(rich);
+                                                });
+                                            });
+                                        });
+                                    ui.add_space(space::XS);
                                     ui.horizontal(|ui| {
                                         let n = wp_sel_local.len();
                                         if ui.add_enabled(!running && n > 0, btn_primary(format!("{}  선택 {n}개 업로드(로컬→원격)", ph::UPLOAD)).min_size(egui::vec2(180.0, 0.0))).clicked() {
@@ -4383,10 +4625,10 @@ impl App {
                                 changed |= row_text_hint(ui, "코드 경로(dev)", &mut e.code_local, "이 PC의 eondcms pythonapp 경로(rsync 소스). web/build 빌드 필요");
                             });
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(space::SM);
                         card(ui, |ui| {
                             ui.strong("신규 설치  ·  순서: ① → ② → ③  ('루트로 실행' 필수)");
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             for (n, label) in [(1u8, "① 리소스 생성"), (2, "② 코드 업로드"), (3, "③ 설치 마무리")] {
                                 ui.horizontal(|ui| {
                                     let b = egui::Button::new(label).min_size(egui::vec2(150.0, 0.0));
@@ -4404,11 +4646,11 @@ impl App {
                                 });
                             }
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(space::SM);
                         card(ui, |ui| {
                             ui.strong("코드 업데이트 (이미 설치된 인스턴스)");
                             ui.label(egui::RichText::new(format!("② 코드 업로드 → {} 업데이트 (v-*/SSL/nginx 생략, 재시작 포함)", ph::ARROWS_CLOCKWISE)).weak());
-                            ui.add_space(4.0);
+                            ui.add_space(space::XS);
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!running, egui::Button::new(format!("{}  업데이트", ph::ARROWS_CLOCKWISE)).min_size(egui::vec2(150.0, 0.0))).clicked() {
                                     eond_step = Some((4, true));
@@ -4424,7 +4666,7 @@ impl App {
                         let h = &domain.history;
                         card(ui, |ui| {
                             ui.strong("작업 요약");
-                            ui.add_space(2.0);
+                            ui.add_space(space::XS);
                             let last_ok = |needles: &[&str]| -> Option<String> {
                                 h.iter().rev().find(|e| e.ok && needles.iter().all(|n| e.title.contains(n))).map(|e| fmt_kst(e.at))
                             };
@@ -4436,7 +4678,7 @@ impl App {
                                     });
                                     match when {
                                         Some(d) => {
-                                            ui.colored_label(egui::Color32::from_rgb(60, 190, 100), format!("✓ {d}"));
+                                            ui.colored_label(color::OK, format!("✓ {d}"));
                                             if !extra.is_empty() { ui.weak(extra); }
                                         }
                                         None => { ui.weak("— 안 함"); }
@@ -4451,10 +4693,10 @@ impl App {
                             row(ui, "Rhymix", last_ok(&["Rhymix 설치"]), upd(upd_cnt("Rhymix")));
                             row(ui, "그누보드", last_ok(&["그누보드 설치"]), upd(upd_cnt("그누보드")));
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(space::SM);
                         card(ui, |ui| {
                             ui.strong(format!("전체 기록 ({}건)", h.len()));
-                            ui.add_space(2.0);
+                            ui.add_space(space::XS);
                             if h.is_empty() {
                                 ui.weak("아직 작업 기록이 없습니다. (백업·이전·설치·업데이트 완료 시 기록됨)");
                             } else {
@@ -4462,9 +4704,9 @@ impl App {
                                     ui.horizontal(|ui| {
                                         ui.add(egui::Label::new(egui::RichText::new(fmt_kst(e.at)).monospace().weak()));
                                         if e.ok {
-                                            ui.colored_label(egui::Color32::from_rgb(60, 190, 100), "✓");
+                                            ui.colored_label(color::OK, "✓");
                                         } else {
-                                            ui.colored_label(egui::Color32::from_rgb(230, 95, 95), "✗");
+                                            ui.colored_label(color::DANGER, "✗");
                                         }
                                         ui.label(&e.title);
                                     });
@@ -4773,8 +5015,8 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.label(format!("도메인: {dn}"));
-                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), format!("대상을 덮어씁니다: {target}"));
-                ui.add_space(8.0);
+                ui.colored_label(color::WARN, format!("대상을 덮어씁니다: {target}"));
+                ui.add_space(space::SM);
                 ui.horizontal(|ui| {
                     if ui.add(btn_primary(format!("{}  실행", ph::PLAY))).clicked() {
                         if let Some(a) = self.confirm.take() {
@@ -4806,7 +5048,7 @@ impl App {
                         open = false;
                     }
                 });
-                ui.add_space(4.0);
+                ui.add_space(space::XS);
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                     // 읽기용 코드 표시(선택/복사 가능). 편집 내용은 사용하지 않는다.
                     let mut text = cv.command.clone();
@@ -4860,16 +5102,16 @@ impl App {
                         ui.label(egui::RichText::new("정보 탭에서 고른 서버(현재/신규)로 접속해 웹루트를 자동탐지합니다. '루트로 실행'이 켜져 있어야 합니다.").weak());
                     }
                 }
-                ui.add_space(4.0);
+                ui.add_space(space::XS);
                 egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
                     for (a, dom, kind) in &d.targets {
                         let wp = kind == "WordPress";
-                        let col = if wp { egui::Color32::from_gray(200) } else { egui::Color32::from_gray(120) };
+                        let col = color::MUTED;
                         let mark = if wp { "•" } else { "·" };
                         ui.label(egui::RichText::new(format!("{mark} {a} / {dom}  ({kind})")).color(col).small());
                     }
                 });
-                ui.add_space(6.0);
+                ui.add_space(space::SM);
                 ui.horizontal(|ui| {
                     grid_label(ui, "관리자 ID");
                     ui.add(egui::TextEdit::singleline(&mut d.user).hint_text("admin").desired_width(220.0).margin(FIELD_MARGIN));
@@ -4887,9 +5129,9 @@ impl App {
                     ui.checkbox(&mut d.show, "비밀번호 표시");
                 });
                 if !d.error.is_empty() {
-                    ui.colored_label(C_RED, &d.error);
+                    ui.colored_label(color::DANGER, &d.error);
                 }
-                ui.add_space(6.0);
+                ui.add_space(space::SM);
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!running, btn_primary(format!("{}  비밀번호 변경", ph::KEY))).clicked() { submit = true; }
                     if ui.button("취소").clicked() { close = true; }
@@ -4938,9 +5180,9 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.strong(title);
-                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), &note);
-                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), "대상 서버 상태를 변경합니다.");
-                ui.add_space(8.0);
+                ui.colored_label(color::WARN, &note);
+                ui.colored_label(color::WARN, "대상 서버 상태를 변경합니다.");
+                ui.add_space(space::SM);
                 ui.horizontal(|ui| {
                     if ui.add(btn_primary(format!("{}  실행", ph::PLAY))).clicked() {
                         if let Some(job) = self.eond_confirm.take() {
@@ -4964,11 +5206,11 @@ impl App {
 /// WordPress 플러그인 버전차이 → (라벨, 색)
 fn wp_diff_label(d: ops::WpDiff) -> (&'static str, egui::Color32) {
     match d {
-        ops::WpDiff::Update => ("↑ 업데이트 가능", egui::Color32::from_rgb(80, 190, 110)),
-        ops::WpDiff::LocalOnly => ("+ 신규(원격 없음)", egui::Color32::from_rgb(90, 160, 230)),
-        ops::WpDiff::Newer => ("↓ 원격이 최신", egui::Color32::from_rgb(220, 160, 60)),
-        ops::WpDiff::Same => ("= 동일", egui::Color32::from_gray(140)),
-        ops::WpDiff::RemoteOnly => ("원격 전용(로컬 없음)", egui::Color32::from_gray(120)),
+        ops::WpDiff::Update => ("↑ 업데이트 가능", color::OK),
+        ops::WpDiff::LocalOnly => ("+ 신규(원격 없음)", color::ACCENT),
+        ops::WpDiff::Newer => ("↓ 원격이 최신", color::WARN),
+        ops::WpDiff::Same => ("= 동일", color::MUTED),
+        ops::WpDiff::RemoteOnly => ("원격 전용(로컬 없음)", color::MUTED),
     }
 }
 
