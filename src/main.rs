@@ -3,6 +3,7 @@ mod crypto;
 mod model;
 mod ops;
 mod store;
+mod ui;
 
 // 한글 폰트 후보 경로. Linux 경로를 먼저, macOS 경로를 뒤에 둔다.
 // first_readable 가 존재하는 첫 파일만 고르므로 두 OS 모두에서 안전하다.
