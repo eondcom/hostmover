@@ -71,13 +71,13 @@ fn setup_theme(ctx: &egui::Context) {
         (TextStyle::Small, FontId::new(11.5, FontFamily::Proportional)),
     ]
     .into();
-    // 컨트롤 높이 통일(34) + 적당한 여백
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(12.0, 8.0);
-    style.spacing.interact_size = egui::vec2(44.0, 34.0);
-    style.spacing.window_margin = Margin::same(10);
-    style.spacing.menu_margin = Margin::same(6);
-    style.spacing.indent = 18.0;
+    // 운영 콘솔 밀도: 이 세 값만 원복하면 기존 밀도로 되돌릴 수 있다.
+    style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.interact_size = egui::vec2(40.0, 28.0);
+    style.spacing.window_margin = Margin::same(12);
+    style.spacing.menu_margin = Margin::same(8);
+    style.spacing.indent = 16.0;
 
     let radius = CornerRadius::same(6);
     let mut v = egui::Visuals::dark();
