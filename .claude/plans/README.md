@@ -15,20 +15,15 @@ Codex 에 넘기는 작업 지시서를 모아둔 곳. **각 문서는 자기완
 | 2 | [dashboard-SPEC.md](2026-07-30-dashboard-SPEC.md) | 시작 대시보드 Phase 1~4 | ✅ **구현됨** (PR #11) |
 | 3 | [dashboard-PHASE5.md](2026-07-30-dashboard-PHASE5.md) | 디스크 감시 시각 타임존 수정 | ✅ **구현됨** (PR #11) |
 | 4 | [dashboard-PHASE6.md](2026-07-30-dashboard-PHASE6.md) | 상태 등급(A~E) · 디스크별 헬스 · 반응형/목록 UI | ✅ **구현됨** (PR #11 후속) |
-| 5 | [upkeep-SPEC.md](2026-07-31-upkeep-SPEC.md) | 백업 현황 · 휴면 사이트 점검 | ⬜ **미구현** |
+| 5 | [upkeep-SPEC.md](2026-07-31-upkeep-SPEC.md) | 백업 현황 · 휴면 사이트 점검 | ✅ **구현됨** |
 
 참고 문서(구현 지시서 아님): [account-domain-delete.md](2026-07-30-account-domain-delete.md) — 삭제 기능의 배경·판단 근거
 
 ---
 
-## 남은 작업 (Codex 에 넘길 순서)
+## 남은 작업
 
-### 1순위 — [upkeep-SPEC.md](2026-07-31-upkeep-SPEC.md)
-
-- 7-A: 백업 현황 (백업 없는 계정 감지가 핵심)
-- 7-B: 휴면 사이트 점검 (오판 방향을 "살아있음" 으로 고정)
-
-둘 다 `dashboard-impl` 브랜치 위에서 이어서 작업한다.
+현재 지시서 기준 미구현 항목 없음.
 
 ---
 
