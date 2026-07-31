@@ -1,4 +1,4 @@
-use crate::model::{ActivityLog, CachedSite, CmsAccess, CmsKind, Customer, CustomerNote, DiskHealth, Domain, DomainAccess, DomainHealth, ServerSnapshot, Site, Store};
+use crate::model::{ActivityLog, BackupStatus, BackupUser, CachedSite, CmsAccess, CmsKind, Customer, CustomerNote, DiskHealth, Domain, DomainAccess, DomainHealth, IdleSite, ServerSnapshot, Site, Store};
 use crate::ops::{self, LogMsg, OpKind};
 use crate::store;
 use egui_phosphor::regular as ph;
@@ -30,6 +30,7 @@ enum Req {
 enum DashRun {
     Snapshot,
     DomainHealth,
+    Upkeep,
 }
 
 /// 실행할 작업 묶음 (요청, 고객명, 도메인명, 현재사이트, 신규사이트)
@@ -235,6 +236,60 @@ fn domain_health_tsv(rows: &[DomainHealth], issues_only: bool) -> String {
             health.dns.as_str(), health.a_record.as_str(), health.public_code.as_str(),
             health.cert_days.as_str(), health.webroot.as_str(),
         ];
+        out.push_str(&fields.iter().map(|value| tsv_cell(value)).collect::<Vec<_>>().join("\t"));
+        out.push('\n');
+    }
+    out
+}
+
+fn backup_status_from_markers(values: &HashMap<String, String>) -> BackupStatus {
+    let value = |key: &str| values.get(key).map(String::as_str).unwrap_or("");
+    let (stalest_account, stalest_days) = value("STALEST").split_once(' ')
+        .map(|(account, days)| (account.to_string(), days.parse().unwrap_or(0)))
+        .unwrap_or_default();
+    BackupStatus {
+        cron: value("CRON") == "1",
+        keep: value("KEEP").to_string(),
+        total: value("TOTAL").parse().unwrap_or(0),
+        size: value("SIZE").to_string(),
+        users: value("USERS").parse().unwrap_or(0),
+        missing: value("MISSING").split_whitespace().map(str::to_string).collect(),
+        newest: value("NEWEST").parse().unwrap_or(0),
+        stalest_account,
+        stalest_days,
+    }
+}
+
+fn parse_idle_marker(marker: &str) -> Option<IdleSite> {
+    let fields: Vec<_> = marker.split_whitespace().collect();
+    if fields.len() != 5 { return None; }
+    let access_days = fields[2].parse().ok()?;
+    let files_old = match fields[3] { "0" => false, "1" => true, _ => return None };
+    let signals = fields[4].parse().ok()?;
+    if signals < 2 { return None; }
+    Some(IdleSite {
+        account: fields[0].into(), domain: fields[1].into(), access_days, files_old, signals,
+    })
+}
+
+fn idle_reason(site: &IdleSite) -> String {
+    let mut reasons = Vec::new();
+    if site.access_days < 0 { reasons.push("접근로그 없음".to_string()); }
+    else if site.access_days >= 90 { reasons.push(format!("{}일간 접근 없음", site.access_days)); }
+    if site.files_old { reasons.push("180일+ 파일 변경 없음".to_string()); }
+    reasons.join(" · ")
+}
+
+fn idle_site_bytes(site: &IdleSite, cache: &[CachedSite]) -> Option<u64> {
+    let matches: Vec<_> = cache.iter().filter(|row| row.domain == site.domain).collect();
+    (!matches.is_empty()).then(|| matches.iter().map(|row| row.file_bytes + row.db_bytes).sum())
+}
+
+fn idle_sites_tsv(rows: &[IdleSite], cache: &[CachedSite]) -> String {
+    let mut out = String::from("계정\t도메인\t사유\t용량\n");
+    for site in rows {
+        let size = idle_site_bytes(site, cache).map(human_bytes).unwrap_or_else(|| "-".into());
+        let fields = [site.account.clone(), site.domain.clone(), idle_reason(site), size];
         out.push_str(&fields.iter().map(|value| tsv_cell(value)).collect::<Vec<_>>().join("\t"));
         out.push('\n');
     }
@@ -803,6 +858,12 @@ pub struct App {
     dash_domain_buf: Vec<DomainHealth>,
     /// 성공 완료 전까지 마커를 모으는 디스크별 헬스 임시 버퍼.
     dash_disk_buf: Vec<DiskHealth>,
+    /// 성공 완료 전까지 모으는 백업 요약 마커.
+    dash_upkeep_buf: HashMap<String, String>,
+    /// 성공 완료 전까지 모으는 계정별 백업 현황.
+    dash_backup_users_buf: Vec<BackupUser>,
+    /// 성공 완료 전까지 모으는 확인 권장 사이트.
+    dash_idle_sites_buf: Vec<IdleSite>,
     /// 중앙 영역 화면 전환
     view: MainView,
     /// 설정 페이지 내부 탭
@@ -942,6 +1003,9 @@ impl App {
             dash_snapshot_buf: HashMap::new(),
             dash_domain_buf: Vec::new(),
             dash_disk_buf: Vec::new(),
+            dash_upkeep_buf: HashMap::new(),
+            dash_backup_users_buf: Vec::new(),
+            dash_idle_sites_buf: Vec::new(),
             view: MainView::Dashboard,
             settings_tab: SettingsTab::Connect,
             acct_tab: AcctTab::Sites,
@@ -1226,6 +1290,11 @@ impl App {
         let snapshot = self.store.server_snapshot.clone();
         let domain_health = self.store.domain_health.clone();
         let domain_health_at = self.store.domain_health_at;
+        let backup_status = self.store.backup_status.clone();
+        let backup_users = self.store.backup_users.clone();
+        let idle_sites = self.store.idle_sites.clone();
+        let scan_cache = self.store.scan_cache.clone();
+        let upkeep_at = self.store.upkeep_at;
         let grade_data = grade_items(&self.store);
         let grade_keys: Vec<_> = grade_data.iter().map(|(name, grade, monitor, _)| (name.clone(), *grade, *monitor)).collect();
         let mut total_grade = overall_grade(&grade_keys);
@@ -1235,11 +1304,13 @@ impl App {
         let disks = self.store.disk_health.clone();
         let snapshot_running = self.dash_running == Some(DashRun::Snapshot);
         let domain_running = self.dash_running == Some(DashRun::DomainHealth);
+        let upkeep_running = self.dash_running == Some(DashRun::Upkeep);
         let ssh_ready = !settings.ssh_user.trim().is_empty()
             && !settings.ssh_pass.is_empty()
             && (!settings.ssh_host.trim().is_empty() || !settings.hestia_host.trim().is_empty());
         let mut do_snapshot = false;
         let mut do_domain_health = false;
+        let mut do_upkeep = false;
         let mut go_php = false;
         let mut go_account: Option<String> = None;
         let mut go_all = false;
@@ -1247,6 +1318,7 @@ impl App {
         let mut go_disk = false;
         let mut go_settings = false;
         let mut copy_domains: Option<bool> = None;
+        let mut copy_idle = false;
         let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 12));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
           egui::ScrollArea::vertical()
@@ -1464,6 +1536,106 @@ impl App {
             ui.add_space(8.0);
             card(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.strong("백업 현황");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(ssh_ready && !self.running, egui::Button::new("백업·정리 점검"))
+                            .on_hover_text("SSH 1회로 백업 현황과 확인 권장 사이트를 함께 읽습니다").clicked() { do_upkeep = true; }
+                        if upkeep_running { ui.spinner(); }
+                    });
+                });
+                if !ssh_ready {
+                    ui.weak("서버 SSH 설정이 필요합니다.");
+                } else if upkeep_at <= 0 {
+                    ui.weak("아직 점검하지 않았습니다 — 버튼을 눌렀을 때만 서버를 조회합니다.");
+                } else {
+                    if backup_status.cron {
+                        ui.label(format!("자동 백업 cron 등록됨 · 보관 {}세대 · 파일 {}개 · {}",
+                            backup_status.keep, backup_status.total,
+                            if backup_status.size.is_empty() { "-" } else { &backup_status.size }));
+                    } else {
+                        ui.colored_label(C_RED, "자동 백업이 등록되어 있지 않습니다");
+                    }
+                    let backed_up = backup_status.users.saturating_sub(backup_status.missing.len() as u64);
+                    let account_text = format!("계정 {}개 중 백업 있음 {} · 없음 {}",
+                        backup_status.users, backed_up, backup_status.missing.len());
+                    if backup_status.missing.is_empty() {
+                        ui.colored_label(C_GREEN, account_text);
+                    } else {
+                        ui.colored_label(C_RED, account_text);
+                        ui.colored_label(C_RED, format!("백업 없는 계정: {}", backup_status.missing.join(", ")));
+                    }
+                    let newest_days = (backup_status.newest > 0)
+                        .then(|| (now_unix() - backup_status.newest).max(0) / 86400);
+                    if let Some(days) = newest_days {
+                        let newest_text = format!("가장 최근 백업 {days}일 전");
+                        if days >= 3 {
+                            ui.colored_label(egui::Color32::from_rgb(220, 150, 60),
+                                format!("백업이 {days}일째 갱신되지 않았습니다"));
+                        }
+                        if backup_status.stalest_account.is_empty() {
+                            ui.weak(newest_text);
+                        } else {
+                            ui.weak(format!("{newest_text} · 가장 밀린 계정 {} ({}일)",
+                                backup_status.stalest_account, backup_status.stalest_days));
+                        }
+                    }
+                    ui.weak(format!("{} 기준", ago_text(upkeep_at)));
+                    if !backup_users.is_empty() {
+                        egui::CollapsingHeader::new("계정별 백업")
+                            .id_salt("dash_backup_users")
+                            .show(ui, |ui| {
+                                let mut rows = backup_users.clone();
+                                rows.sort_by(|a, b| b.age_days.cmp(&a.age_days).then_with(|| a.account.cmp(&b.account)));
+                                egui::Grid::new("dash_backup_users_grid").num_columns(3).striped(true).show(ui, |ui| {
+                                    ui.strong("계정"); ui.strong("세대 수"); ui.strong("경과일"); ui.end_row();
+                                    for row in rows {
+                                        ui.label(row.account); ui.label(row.generations.to_string()); ui.label(format!("{}일", row.age_days)); ui.end_row();
+                                    }
+                                });
+                            });
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("확인 권장 사이트");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(upkeep_at > 0, egui::Button::new("TSV 복사")).clicked() { copy_idle = true; }
+                        if upkeep_at > 0 { ui.label(format!("{}건", idle_sites.len())); }
+                    });
+                });
+                ui.weak("※ 삭제 대상이 아니라 확인해볼 곳입니다. 계절성·내부용 사이트가 섞일 수 있습니다.");
+                if upkeep_at <= 0 {
+                    ui.weak("백업 현황의 ‘백업·정리 점검’을 누르면 함께 조회합니다.");
+                } else if idle_sites.is_empty() {
+                    ui.colored_label(C_GREEN, "최근 활동이 확인되지 않는 사이트가 없습니다");
+                } else {
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("dash_idle_sites_scroll")
+                        .auto_shrink([false, false])
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("dash_idle_sites_grid").num_columns(4).striped(true).show(ui, |ui| {
+                                ui.strong("도메인"); ui.strong("계정"); ui.strong("사유"); ui.strong("용량"); ui.end_row();
+                                for site in &idle_sites {
+                                    if ui.link(&site.domain).on_hover_text("계정 관리로 이동").clicked() {
+                                        go_account = Some(site.account.clone());
+                                    }
+                                    ui.add(egui::Label::new(&site.account).selectable(true));
+                                    ui.add(egui::Label::new(idle_reason(site)).selectable(true));
+                                    let size = idle_site_bytes(site, &scan_cache).map(human_bytes).unwrap_or_else(|| "-".into());
+                                    ui.add(egui::Label::new(size).selectable(true));
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                }
+            });
+            ui.add_space(8.0);
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
                     ui.strong("도메인 헬스");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add_enabled(ssh_ready && !self.running, egui::Button::new("점검"))
@@ -1531,10 +1703,14 @@ impl App {
             self.status = if issues_only { format!("이상 {count}건을 클립보드에 복사했습니다") } else { format!("전체 {count}건을 클립보드에 복사했습니다") };
             self.last_ok = Some(true);
         }
+        if copy_idle {
+            ctx.copy_text(idle_sites_tsv(&idle_sites, &scan_cache));
+            self.status = format!("확인 권장 사이트 {}건을 클립보드에 복사했습니다", idle_sites.len());
+            self.last_ok = Some(true);
+        }
         if let Some(account) = go_account {
             if let Some(ci) = self.store.customers.iter().position(|c| c.deleted_at.is_none() && c.name == account) {
-                self.sel_customer = Some(ci);
-                self.view = MainView::AccountModules(ci);
+                self.open_account_page(ci);
             }
         }
         if do_snapshot {
@@ -1563,6 +1739,22 @@ impl App {
                     self.last_ok = Some(false);
                     self.status = e.clone();
                     self.log.push(format!("도메인 헬스: {e}"));
+                }
+            }
+        }
+        if do_upkeep {
+            match ops::build_upkeep_check(&self.store.settings) {
+                Ok(job) => {
+                    self.dash_upkeep_buf.clear();
+                    self.dash_backup_users_buf.clear();
+                    self.dash_idle_sites_buf.clear();
+                    self.dash_running = Some(DashRun::Upkeep);
+                    self.run_diagnostic(job, ctx);
+                }
+                Err(e) => {
+                    self.last_ok = Some(false);
+                    self.status = e.clone();
+                    self.log.push(format!("백업·정리 점검: {e}"));
                 }
             }
         }
@@ -3329,6 +3521,28 @@ impl App {
                             }
                         }
                     }
+                    if self.dash_running == Some(DashRun::Upkeep) {
+                        if let Some(marker) = l.strip_prefix("HM_BK_") {
+                            if let Some((key, value)) = marker.split_once('=') {
+                                self.dash_upkeep_buf.insert(key.to_string(), value.to_string());
+                            }
+                        }
+                        if let Some(marker) = l.strip_prefix("HM_BKU ") {
+                            let fields: Vec<_> = marker.split_whitespace().collect();
+                            if fields.len() == 3 {
+                                if let (Ok(generations), Ok(age_days)) = (fields[1].parse(), fields[2].parse()) {
+                                    self.dash_backup_users_buf.push(BackupUser {
+                                        account: fields[0].into(), generations, age_days,
+                                    });
+                                }
+                            }
+                        }
+                        if let Some(marker) = l.strip_prefix("HM_IDLE ") {
+                            if let Some(site) = parse_idle_marker(marker) {
+                                self.dash_idle_sites_buf.push(site);
+                            }
+                        }
+                    }
                     self.log.push(l);
                     if self.log.len() > 1000 {
                         let cut = self.log.len() - 1000;
@@ -3393,6 +3607,20 @@ impl App {
                         } else {
                             self.dash_domain_buf.clear();
                         }
+                    }
+                    if dash_run == Some(DashRun::Upkeep) {
+                        if ok {
+                            self.store.backup_status = backup_status_from_markers(&self.dash_upkeep_buf);
+                            self.store.backup_users = std::mem::take(&mut self.dash_backup_users_buf);
+                            self.store.idle_sites = std::mem::take(&mut self.dash_idle_sites_buf);
+                            self.store.upkeep_at = now_unix();
+                            self.dirty = true;
+                            self.save();
+                        } else {
+                            self.dash_backup_users_buf.clear();
+                            self.dash_idle_sites_buf.clear();
+                        }
+                        self.dash_upkeep_buf.clear();
                     }
                 }
                 LogMsg::Detected { is_tobe, db } => {
@@ -5757,5 +5985,52 @@ mod tests {
         let issues = domain_health_tsv(&rows, true);
         assert_eq!(issues.lines().count(), 2, "헤더와 이상 도메인만 포함");
         assert!(!issues.contains("example.com\t\tok"), "정상 도메인은 제외");
+    }
+
+    #[test]
+    fn backup_markers_detect_missing_and_stale_accounts() {
+        let values = HashMap::from([
+            ("CRON".into(), "0".into()),
+            ("KEEP".into(), "3".into()),
+            ("TOTAL".into(), "4".into()),
+            ("SIZE".into(), "215G".into()),
+            ("USERS".into(), "3".into()),
+            ("MISSING".into(), "ghost testuser".into()),
+            ("NEWEST".into(), "1785364201".into()),
+            ("STALEST".into(), "rokmc 40".into()),
+        ]);
+        let status = backup_status_from_markers(&values);
+        assert!(!status.cron, "cron 미등록 상태를 경고할 수 있어야 함");
+        assert_eq!(status.missing, ["ghost", "testuser"]);
+        assert_eq!(status.stalest_account, "rokmc");
+        assert_eq!(status.stalest_days, 40);
+        assert_eq!(status.total, 4);
+    }
+
+    #[test]
+    fn idle_candidate_requires_both_signals() {
+        let idle = parse_idle_marker("rokmc old.example.com 200 1 2").unwrap();
+        assert_eq!(idle_reason(&idle), "200일간 접근 없음 · 180일+ 파일 변경 없음");
+
+        let no_log = parse_idle_marker("eond nolog.example.com -1 1 2").unwrap();
+        assert_eq!(idle_reason(&no_log), "접근로그 없음 · 180일+ 파일 변경 없음");
+
+        assert!(parse_idle_marker("active managed.example.com -1 0 1").is_none(),
+            "로그가 없어도 파일이 최신이면 후보에 올리지 않음");
+        assert!(parse_idle_marker("broken marker").is_none());
+    }
+
+    #[test]
+    fn idle_tsv_joins_scan_cache_size_by_domain() {
+        let rows = vec![parse_idle_marker("rokmc old.example.com 200 1 2").unwrap()];
+        let cache = vec![CachedSite {
+            account: "rokmc".into(), domain: "old.example.com".into(),
+            file_bytes: 1_000, db_bytes: 24, ..Default::default()
+        }];
+        assert_eq!(idle_site_bytes(&rows[0], &cache), Some(1_024));
+        let tsv = idle_sites_tsv(&rows, &cache);
+        assert_eq!(tsv.lines().next(), Some("계정\t도메인\t사유\t용량"));
+        assert!(tsv.contains("rokmc\told.example.com\t200일간 접근 없음 · 180일+ 파일 변경 없음\t1.0K"));
+        assert!(!tsv.contains("삭제"));
     }
 }

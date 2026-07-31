@@ -2924,6 +2924,113 @@ pub fn build_domain_health(s: &Settings) -> Result<Job, String> {
     })
 }
 
+const UPKEEP_CHECK_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+BDIR=/backup
+NOW=$(date +%s)
+
+echo "[백업 현황]"
+BCRON=0
+grep -rqi 'backup' /etc/cron.d/hestia 2>/dev/null && BCRON=1
+BKEEP=$(grep -E "^BACKUPS=" /usr/local/hestia/conf/hestia.conf 2>/dev/null | cut -d"'" -f2)
+[ -z "$BKEEP" ] && BKEEP="-"
+echo "  자동 백업 cron: $([ "$BCRON" = 1 ] && echo 등록됨 || echo '없음(수동 백업만)')   보관 세대: $BKEEP"
+echo "HM_BK_CRON=$BCRON"
+echo "HM_BK_KEEP=$BKEEP"
+
+if [ ! -d "$BDIR" ]; then
+  echo "  ✗ $BDIR 없음"
+  echo "HM_BK_TOTAL=0"; echo "HM_BK_USERS=0"; echo "HM_BK_MISSING="
+else
+  NTAR=$(ls -1 "$BDIR"/*.tar 2>/dev/null | grep -c .)
+  SIZE=$(du -sh "$BDIR" 2>/dev/null | cut -f1)
+  echo "  파일 ${NTAR}개 · ${SIZE:-?}"
+  echo "HM_BK_TOTAL=$NTAR"
+  echo "HM_BK_SIZE=${SIZE:-}"
+
+  USERS=$("$VBIN/v-list-users" plain 2>/dev/null | awk '{print $1}')
+  NU=$(printf '%s\n' "$USERS" | grep -c .)
+  MISSING=""; NEWEST=0; OLDESTU=""; OLDESTT=0
+  for U in $USERS; do
+    LAST=$(ls -1t "$BDIR/$U".*.tar 2>/dev/null | head -1)
+    if [ -z "$LAST" ]; then MISSING="$MISSING $U"; continue; fi
+    N=$(ls -1 "$BDIR/$U".*.tar 2>/dev/null | grep -c .)
+    T=$(stat -c %Y "$LAST" 2>/dev/null); [ -z "$T" ] && T=0
+    [ "$T" -gt "$NEWEST" ] 2>/dev/null && NEWEST=$T
+    # 가장 오래된 '최신 백업' = 제일 방치된 계정
+    if [ "$OLDESTT" = 0 ] || { [ "$T" -lt "$OLDESTT" ] 2>/dev/null; }; then OLDESTT=$T; OLDESTU="$U"; fi
+    AGE=$(( (NOW - T) / 86400 ))
+    printf 'HM_BKU %s %s %s\n' "$U" "$N" "$AGE"
+  done
+  NMISS=$(printf '%s' "$MISSING" | wc -w)
+  echo "  계정 ${NU}개 중 백업 있음 $((NU - NMISS))개 · 없음 ${NMISS}개"
+  [ -n "$MISSING" ] && echo "    백업 없는 계정:$MISSING"
+  if [ "$NEWEST" -gt 0 ] 2>/dev/null; then
+    echo "  가장 최근 백업: $(date -d "@$NEWEST" '+%F %T') ($(( (NOW - NEWEST) / 86400 ))일 전)"
+  else
+    echo "  ✗ 백업 파일이 하나도 없습니다"
+  fi
+  echo "HM_BK_USERS=$NU"
+  echo "HM_BK_MISSING=$(printf '%s' "$MISSING" | sed 's/^ *//')"
+  echo "HM_BK_NEWEST=$NEWEST"
+  [ -n "$OLDESTU" ] && echo "HM_BK_STALEST=$OLDESTU $(( (NOW - OLDESTT) / 86400 ))"
+fi
+echo
+
+echo "[휴면 후보 — 오래 방치된 사이트]"
+echo "  ※ 삭제 대상이 아니라 '확인해볼 곳' 이다. 계절성·내부용 사이트가 섞일 수 있다."
+HITDAYS=90
+MODDAYS=180
+NCAND=0
+shopt -s nullglob
+for WR in /home/*/web/*/public_html; do
+  [ -d "$WR" ] || continue
+  DOM="$(basename "$(dirname "$WR")")"
+  OWN="$(stat -c %U "$WR" 2>/dev/null)"; [ -z "$OWN" ] && continue
+
+  HITT=0
+  for L in /var/log/apache2/domains/"$DOM".log /var/log/nginx/domains/"$DOM".log \
+           /home/"$OWN"/web/"$DOM"/logs/"$DOM".log; do
+    [ -s "$L" ] || continue
+    T=$(stat -c %Y "$L" 2>/dev/null); [ -z "$T" ] && continue
+    [ "$T" -gt "$HITT" ] 2>/dev/null && HITT=$T
+  done
+  if [ "$HITT" = 0 ]; then HITD=-1; else HITD=$(( (NOW - HITT) / 86400 )); fi
+
+  FRESH=$(find "$WR" -type f -mtime -"$MODDAYS" \
+            -not -path "$WR/*cache/*" -not -path "$WR/logs/*" -not -path "$WR/tmp/*" \
+            -not -path "$WR/wp-content/uploads/*" -print -quit 2>/dev/null)
+  [ -n "$FRESH" ] && MODOLD=0 || MODOLD=1
+
+  SIG=0; WHY=""
+  if [ "$HITD" = -1 ]; then SIG=$((SIG+1)); WHY="접근로그 없음"
+  elif [ "$HITD" -ge "$HITDAYS" ] 2>/dev/null; then SIG=$((SIG+1)); WHY="${HITD}일간 접근 없음"; fi
+  if [ "$MODOLD" = 1 ]; then SIG=$((SIG+1)); WHY="$WHY${WHY:+ · }${MODDAYS}일+ 파일 변경 없음"; fi
+
+  if [ "$SIG" -ge 2 ] 2>/dev/null; then
+    NCAND=$((NCAND+1))
+    printf '  %-34s %-10s %s\n' "$DOM" "$OWN" "$WHY"
+    printf 'HM_IDLE %s %s %s %s %s\n' "$OWN" "$DOM" "$HITD" "$MODOLD" "$SIG"
+  fi
+done
+[ "$NCAND" = 0 ] && echo "  없음 — 최근 활동이 확인되지 않는 사이트가 없습니다"
+echo "HM_IDLE_COUNT=$NCAND""#;
+
+/// 백업 현황 + 휴면 사이트 점검 (SSH, sudo, 읽기 전용).
+/// 백업 누락 계정·마지막 백업 시각과, 오래 방치된 사이트 후보를 한 번에 조사한다.
+pub fn build_upkeep_check(s: &Settings) -> Result<Job, String> {
+    let srv = ssh_admin_site(s)?;
+    let (script, sshpass, env) = eondcms_exec(&srv, UPKEEP_CHECK_BODY, false, true);
+    Ok(Job {
+        title: "백업·정리 점검".into(),
+        script,
+        sshpass,
+        env,
+        note: "SSH 1회 · 읽기 전용 백업·휴면 현황 조회".into(),
+    })
+}
+
 /// 모듈 목록 조회 → (모듈명, 사용 도메인들) 정렬. domain=Some 이면 그 도메인만, None 이면 계정 전체.
 pub fn list_account_modules(s: &Settings, account: &str, domain: Option<&str>) -> Result<Vec<(String, Vec<String>)>, String> {
     let acct = account.trim();
@@ -5896,6 +6003,31 @@ mod tests {
         assert!(DOMAIN_HEALTH_BODY.contains("자동 갱신이 실패하고 있을 수 있습니다"));
     }
 
+
+    #[test]
+    fn upkeep_check_is_read_only_valid_bash() {
+        let st = Settings {
+            ssh_host: "10.0.0.1".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "tongpw".into(),
+            ..Default::default()
+        };
+        let job = build_upkeep_check(&st).unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        assert_bash_syntax(UPKEEP_CHECK_BODY, "백업·휴면 점검 원문");
+        assert!(!UPKEEP_CHECK_BODY.split_whitespace().any(|word| word == "rm"), "rm 명령 포함");
+        for destructive in ["v-delete-", "DROP"] {
+            assert!(!UPKEEP_CHECK_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
+        }
+        assert!(UPKEEP_CHECK_BODY.contains("\"$BDIR/$U\".*.tar"), "계정 접두어가 겹치지 않는 glob 필요");
+        assert!(UPKEEP_CHECK_BODY.contains("-mtime -\"$MODDAYS\""));
+        assert!(!UPKEEP_CHECK_BODY.contains("-newermt"));
+        assert!(UPKEEP_CHECK_BODY.contains("-print -quit"));
+    }
 
     #[test]
     fn punycode_korean_domain() {
