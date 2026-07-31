@@ -1691,6 +1691,22 @@ while read -r FS IN IU IFR PCT MP; do
   P=${PCT%\%}; [ "$P" -ge 90 ] 2>/dev/null && add "[$MP] inode 사용량 $PCT (파일 개수 한계 임박)"
 done < <(df -Pi -x tmpfs -x devtmpfs 2>/dev/null | awk 'NR>1')
 
+# 디스크별 일일 사용량 — 하루 디스크당 1행, 같은 날 재실행은 교체한다.
+DUSAGE="$STATE/disk-usage.tsv"
+[ -s "$DUSAGE" ] || printf 'date\tmount\tdevice\tuse\tavail\n' > "$DUSAGE"
+if grep -q "^$DAY"$'\t' "$DUSAGE" 2>/dev/null; then
+  grep -v "^$DAY"$'\t' "$DUSAGE" > "$DUSAGE.tmp" && mv "$DUSAGE.tmp" "$DUSAGE"
+fi
+while read -r FS SZ USED AVAIL PCT MP; do
+  case "$FS" in /dev/*) ;; *) continue ;; esac
+  case "$MP" in /boot*|/efi*) continue ;; esac
+  printf '%s\t%s\t%s\t%s\t%s\n' "$DAY" "$MP" "$FS" "${PCT%\%}" "$AVAIL" >> "$DUSAGE"
+done < <(df -hP 2>/dev/null | awk 'NR>1')
+LINES=$(grep -c . "$DUSAGE" 2>/dev/null)
+if [ "${LINES:-0}" -gt 5000 ] 2>/dev/null; then
+  { head -n 1 "$DUSAGE"; tail -n 4000 "$DUSAGE" | grep -v '^date'; } > "$DUSAGE.tmp" && mv "$DUSAGE.tmp" "$DUSAGE"
+fi
+
 # --- 판정 + 기록 보존 ---
 NALERT=$(printf '%s' "$ALERT" | grep -c .)
 if [ -n "$ALERT" ]; then RESULT=WARN; else RESULT=OK; fi
@@ -2505,6 +2521,7 @@ fn ssh_admin_site(s: &Settings) -> Result<Site, String> {
 const SERVER_SNAPSHOT_BODY: &str = r#"set +e
 export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 VBIN=/usr/local/hestia/bin
+HIST=/var/lib/hm-disk-monitor/history.tsv
 echo "===== 서버 상태 스냅샷 ====="
 
 echo "[호스트]"
@@ -2607,6 +2624,149 @@ else
   echo "HM_DASH_TRAFFICMON=0"
 fi
 
+echo "[추이·구성 점검]"
+
+# 1) 디스크 사용률 전체 추이 — 디스크별 기록이 아직 없는 전환기 폴백
+RATE=""; ETA=""; SPAN=""
+if [ -s "$HIST" ]; then
+  ROWS=$(grep -v '^date' "$HIST" 2>/dev/null | awk -F'\t' 'NF>=6' | tail -30)
+  N=$(printf '%s\n' "$ROWS" | grep -c .)
+  if [ "${N:-0}" -ge 2 ] 2>/dev/null; then
+    F=$(printf '%s\n' "$ROWS" | head -1); L=$(printf '%s\n' "$ROWS" | tail -1)
+    D1=$(printf '%s' "$F" | cut -f1); U1=$(printf '%s' "$F" | cut -f6 | tr -d '%')
+    D2=$(printf '%s' "$L" | cut -f1); U2=$(printf '%s' "$L" | cut -f6 | tr -d '%')
+    S1=$(date -d "$D1" +%s 2>/dev/null); S2=$(date -d "$D2" +%s 2>/dev/null)
+    if [ -n "$S1" ] && [ -n "$S2" ]; then
+      DAYS=$(( (S2 - S1) / 86400 ))
+      if [ "$DAYS" -gt 0 ] 2>/dev/null; then
+        SPAN=$DAYS
+        RATE=$(awk -v a="$U1" -v b="$U2" -v d="$DAYS" 'BEGIN{printf "%.2f", (b-a)/d}')
+        ETA=$(awk -v u="$U2" -v r="$RATE" 'BEGIN{ if (r > 0.02 && u < 95) printf "%d", (95-u)/r }')
+      fi
+    fi
+  fi
+fi
+if [ -n "$RATE" ]; then
+  echo "  디스크 추이: ${SPAN}일간 하루 ${RATE}%p"
+  [ -n "$ETA" ] && echo "  95% 도달 예상: 약 ${ETA}일 후"
+else
+  echo "  디스크 추이: 데이터 부족 (감시 기록 2일 이상 필요)"
+fi
+echo "HM_DASH_DISKRATE=${RATE}"
+echo "HM_DASH_DISKETA=${ETA}"
+echo "HM_DASH_DISKSPAN=${SPAN}"
+
+# 2) 백업 위치가 데이터 파티션과 같은지
+BSRC=$(df -P /backup 2>/dev/null | awk 'NR==2{print $1}')
+HSRC=$(df -P /home 2>/dev/null | awk 'NR==2{print $1}')
+BSAME=0
+if [ -n "$BSRC" ] && [ "$BSRC" = "$HSRC" ]; then BSAME=1; fi
+if [ -z "$BSRC" ]; then
+  echo "  백업 경로: /backup 없음 (v-backup-user 가 실패할 수 있음)"
+else
+  echo "  백업 경로: $BSRC $([ "$BSAME" = 1 ] && echo '← /home 과 같은 파티션' || echo '(별도 파티션)')"
+fi
+echo "HM_DASH_BACKUPSAME=$BSAME"
+echo "HM_DASH_BACKUPSRC=${BSRC:-}"
+
+# 3) PHP-FPM 버전 공존
+PHPV=$(systemctl list-units --type=service 'php*-fpm.service' --no-legend 2>/dev/null \
+  | awk '{print $1}' | grep -oE '[0-9]+\.[0-9]+' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+NPV=$(printf '%s' "$PHPV" | wc -w)
+echo "  PHP-FPM 버전: ${PHPV:-없음} (${NPV}개)"
+echo "HM_DASH_PHPVERS=${PHPV}"
+echo "HM_DASH_PHPVERN=${NPV}"
+
+# 4) 버전을 넘나드는 소켓 중복
+DUP=$(grep -rhE '^[[:space:]]*listen[[:space:]]*=' /etc/php/*/fpm/pool.d/*.conf 2>/dev/null \
+  | sed 's/.*=[[:space:]]*//' | sort | uniq -d | grep -c .)
+[ -z "$DUP" ] && DUP=0
+echo "  소켓 중복 정의: ${DUP}건"
+echo "HM_DASH_SOCKDUP=$DUP"
+
+echo "[디스크별 헬스]"
+
+# 물리 디스크 SMART는 파티션마다 다시 묻지 않고 캐시한다.
+SMCACHE=$(mktemp)
+smart_of() {
+  local D="$1" line
+  line=$(grep -m1 "^$D " "$SMCACHE" 2>/dev/null)
+  if [ -n "$line" ]; then printf '%s' "${line#* }"; return; fi
+  local H="-" RS="-" PS="-" POH="-" TMP="-"
+  if command -v smartctl >/dev/null 2>&1 && [ -b "/dev/$D" ]; then
+    H=$(smartctl -H "/dev/$D" 2>/dev/null | grep -iE 'overall-health|SMART Health Status' | sed 's/.*: *//' | tr -d ' ')
+    [ -z "$H" ] && H="-"
+    local A
+    A=$(smartctl -A "/dev/$D" 2>/dev/null)
+    RS=$(printf '%s' "$A" | awk '/Reallocated_Sector_Ct/{print $10; exit}')
+    PS=$(printf '%s' "$A" | awk '/Current_Pending_Sector/{print $10; exit}')
+    POH=$(printf '%s' "$A" | awk '/Power_On_Hours/{print $10; exit}')
+    TMP=$(printf '%s' "$A" | awk '/Temperature_Celsius|Airflow_Temperature/{print $10; exit}')
+    if [ "$RS" = "" ] || [ "$POH" = "" ]; then
+      local N
+      N=$(smartctl -A "/dev/$D" 2>/dev/null)
+      [ -z "$POH" ] && POH=$(printf '%s' "$N" | awk -F: '/Power On Hours/{gsub(/[ ,]/,"",$2); print $2; exit}')
+      [ -z "$TMP" ] && TMP=$(printf '%s' "$N" | awk -F: '/Temperature:/{gsub(/[^0-9]/,"",$2); print $2; exit}')
+      [ -z "$RS" ] && RS=$(printf '%s' "$N" | awk -F: '/Available Spare:/{gsub(/[^0-9]/,"",$2); print "spare"$2; exit}')
+    fi
+  fi
+  [ -z "$RS" ] && RS="-"; [ -z "$PS" ] && PS="-"; [ -z "$POH" ] && POH="-"; [ -z "$TMP" ] && TMP="-"
+  echo "$D $H $RS $PS $POH $TMP" >> "$SMCACHE"
+  printf '%s' "$H $RS $PS $POH $TMP"
+}
+
+DUSAGE=/var/lib/hm-disk-monitor/disk-usage.tsv
+trend_of() {
+  local MP="$1" ROWS N F L D1 U1 D2 U2 S1 S2 DAYS RATE ETA
+  [ -s "$DUSAGE" ] || { printf -- '- - -'; return; }
+  ROWS=$(awk -F'\t' -v m="$MP" '$1!="date" && $2==m' "$DUSAGE" 2>/dev/null | tail -60)
+  N=$(printf '%s\n' "$ROWS" | grep -c .)
+  if [ "${N:-0}" -lt 2 ] 2>/dev/null; then printf -- '- - -'; return; fi
+  F=$(printf '%s\n' "$ROWS" | head -1); L=$(printf '%s\n' "$ROWS" | tail -1)
+  D1=$(printf '%s' "$F" | cut -f1); U1=$(printf '%s' "$F" | cut -f4)
+  D2=$(printf '%s' "$L" | cut -f1); U2=$(printf '%s' "$L" | cut -f4)
+  S1=$(date -d "$D1" +%s 2>/dev/null); S2=$(date -d "$D2" +%s 2>/dev/null)
+  if [ -z "$S1" ] || [ -z "$S2" ]; then printf -- '- - -'; return; fi
+  DAYS=$(( (S2 - S1) / 86400 ))
+  if [ "$DAYS" -le 0 ] 2>/dev/null; then printf -- '- - -'; return; fi
+  RATE=$(awk -v a="$U1" -v b="$U2" -v d="$DAYS" 'BEGIN{printf "%.2f", (b-a)/d}')
+  ETA=$(awk -v u="$U2" -v r="$RATE" 'BEGIN{ if (r > 0.02 && u < 95) printf "%d", (95-u)/r }')
+  printf -- '%s %s %s' "$RATE" "${ETA:--}" "$DAYS"
+}
+
+NDISK=0
+while read -r FS SZ USED AVAIL PCT MP; do
+  case "$FS" in /dev/*) ;; *) continue ;; esac
+  case "$MP" in /boot*|/efi*) continue ;; esac
+  P=${PCT%\%}
+  IP=$(df -iP "$MP" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}'); [ -z "$IP" ] && IP="-"
+  PK=$(lsblk -no PKNAME "$FS" 2>/dev/null | head -1 | tr -d ' ')
+  [ -z "$PK" ] && PK=$(basename "$FS")
+  FE="-"
+  if [ -b "$FS" ]; then
+    FE=$(tune2fs -l "$FS" 2>/dev/null | awk -F: '/FS Error count/{gsub(/ /,"",$2); print $2; exit}')
+    [ -z "$FE" ] && FE="-"
+  fi
+  ROLE=other
+  case "$MP" in
+    /backup*|*backup*|*Backup*) ROLE=backup ;;
+    /|/home|/home/*|/var|/var/*) ROLE=main ;;
+  esac
+  SM=$(smart_of "$PK")
+  TR=$(trend_of "$MP")
+  NDISK=$((NDISK + 1))
+  RATE=$(printf '%s' "$TR" | awk '{print $1}'); ETA=$(printf '%s' "$TR" | awk '{print $2}')
+  TRTXT=""
+  [ "$RATE" != "-" ] && TRTXT="  추이 ${RATE}%p/일"
+  [ "$ETA" != "-" ] && [ -n "$ETA" ] && TRTXT="$TRTXT (95% 약 ${ETA}일 후)"
+  printf '  %-14s %-16s %-7s %4s%%  %6s 남음  inode %3s%%  %s%s\n' "$MP" "$FS" "$ROLE" "$P" "$AVAIL" "$IP" "$SM" "$TRTXT"
+  printf 'HM_DISK %s %s %s %s %s %s %s %s %s %s\n' "$MP" "$FS" "$PK" "$ROLE" "$P" "$AVAIL" "$IP" "$FE" "$SM" "$TR"
+done < <(df -hP 2>/dev/null | awk 'NR>1')
+
+[ "$NDISK" = 0 ] && echo "  (검사 가능한 디스크를 찾지 못했습니다)"
+echo "HM_DASH_DISKN=$NDISK"
+rm -f "$SMCACHE"
+
 echo "===== 스냅샷 끝 =====""#;
 
 /// 서버 상태 스냅샷 (SSH, sudo, 읽기 전용).
@@ -2708,8 +2868,8 @@ issue_of() {
     case "$PH" in 2*|3*) ;; 000) M="$M${M:+ · }응답 없음(타임아웃/거부)" ;; *) M="$M${M:+ · }HTTP $PH" ;; esac
   fi
   if [ "$CD" != "-" ]; then
-    if [ "$CD" -lt 0 ] 2>/dev/null; then M="$M${M:+ · }인증서 만료됨"
-    elif [ "$CD" -le 14 ] 2>/dev/null; then M="$M${M:+ · }인증서 D-$CD"; fi
+    if [ "$CD" -lt 0 ] 2>/dev/null; then M="$M${M:+ · }인증서 만료 — 접속이 차단됩니다"
+    elif [ "$CD" -le 14 ] 2>/dev/null; then M="$M${M:+ · }인증서 D-$CD — 자동 갱신이 실패하고 있을 수 있습니다"; fi
   fi
   printf '%s' "$M"
 }
@@ -5004,6 +5164,11 @@ mod tests {
         }
     }
 
+    fn assert_bash_syntax(script: &str, label: &str) {
+        let out = std::process::Command::new("bash").args(["-n", "-c", script]).output().expect("bash");
+        assert!(out.status.success(), "{label} bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
     #[test]
     fn db_backup_script_shape() {
         std::env::set_var("HOME", std::env::temp_dir());
@@ -5679,12 +5844,33 @@ mod tests {
             .output()
             .expect("bash");
         assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        assert_bash_syntax(SERVER_SNAPSHOT_BODY, "서버 스냅샷 원문");
         for destructive in ["rm -rf", "v-delete-", "DROP"] {
             assert!(!SERVER_SNAPSHOT_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
         }
         assert_eq!(SERVER_SNAPSHOT_BODY.matches("HM_DASH_DISKMON_LAST_TS=").count(), 2,
             "설치·미설치 양쪽 분기에서 epoch 마커를 출력해야 함");
         assert!(SERVER_SNAPSHOT_BODY.contains("date -d \"$DL\" +%s"));
+        for marker in ["DISKRATE", "DISKETA", "DISKSPAN", "BACKUPSAME", "BACKUPSRC", "PHPVERS", "PHPVERN", "SOCKDUP"] {
+            assert!(SERVER_SNAPSHOT_BODY.contains(&format!("HM_DASH_{marker}=")), "추이 마커 누락: {marker}");
+        }
+        assert!(SERVER_SNAPSHOT_BODY.contains("HM_DISK %s %s %s %s %s %s %s %s %s %s"));
+        assert!(SERVER_SNAPSHOT_BODY.contains("/boot*|/efi*"));
+    }
+
+    #[test]
+    fn disk_monitor_usage_history_is_valid_bash() {
+        let st = Settings { ssh_host: "10.0.0.1".into(), ssh_user: "tong".into(), ssh_pass: "tongpw".into(), ..Default::default() };
+        let job = build_disk_monitor_install(&st, "admin@example.com", "/backup", 90, false).unwrap();
+        let out = std::process::Command::new("bash").args(["-n", "-c", &job.script]).output().expect("bash");
+        assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        let daily = DISK_MONITOR_INSTALL_BODY
+            .split_once("cat > /usr/local/sbin/hm-disk-monitor.sh <<'EOS'\n").expect("일일 감시 시작").1
+            .split_once("\nEOS\n").expect("일일 감시 끝").0;
+        assert_bash_syntax(daily, "일일 디스크 감시 원문");
+        assert!(DISK_MONITOR_INSTALL_BODY.contains("disk-usage.tsv"));
+        assert!(DISK_MONITOR_INSTALL_BODY.contains("grep -v \"^$DAY\"$'\\t'"), "같은 날 기록 교체 필요");
+        assert!(DISK_MONITOR_INSTALL_BODY.contains("tail -n 4000"), "기록 무한 증가 방지 필요");
     }
 
     #[test]
@@ -5701,11 +5887,13 @@ mod tests {
             .output()
             .expect("bash");
         assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        assert_bash_syntax(DOMAIN_HEALTH_BODY, "도메인 헬스 원문");
         for destructive in ["rm -rf", "v-delete-", "DROP"] {
             assert!(!DOMAIN_HEALTH_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
         }
         assert!(DOMAIN_HEALTH_BODY.contains("getent ahostsv4"));
         assert!(DOMAIN_HEALTH_BODY.contains("case \"$PH\" in 2*|3*)"));
+        assert!(DOMAIN_HEALTH_BODY.contains("자동 갱신이 실패하고 있을 수 있습니다"));
     }
 
 
