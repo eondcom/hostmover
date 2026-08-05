@@ -1,4 +1,4 @@
-use crate::model::{ActivityLog, BackupStatus, BackupUser, CachedSite, CmsAccess, CmsKind, Customer, CustomerNote, DiskHealth, Domain, DomainAccess, DomainHealth, IdleSite, ServerSnapshot, Site, Store};
+use crate::model::{ActivityLog, BackupStatus, BackupUser, CachedSite, CmsAccess, CmsKind, Customer, CustomerNote, DiskHealth, Domain, DomainAccess, DomainHealth, IdleSite, ServerSnapshot, Settings, Site, Store};
 use crate::ops::{self, LogMsg, OpKind};
 use crate::store;
 use crate::ui::{self as console_ui, color, space, SortState};
@@ -2298,7 +2298,7 @@ impl App {
         let (server, mut c, domain_id, dn) = {
             let dom = &self.store.customers[ci].domains[di];
             let c = dom.cms_install.clone();
-            let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+            let server = ops::with_admin_login(if c.use_asis { &dom.asis } else { &dom.tobe }, &self.store.settings);
             (server, c, dom.id, dom.name.clone())
         };
         c.hestia_user = server.ftp_id.clone();
@@ -4764,7 +4764,7 @@ impl App {
             if dryrun {
                 let dom = &self.store.customers[ci].domains[di];
                 let cn = customer_name.clone();
-                let report = build_dryrun(dom, &cn, self.use_root);
+                let report = build_dryrun(dom, &cn, self.use_root, &self.store.settings);
                 self.cmd_view = Some(CmdView { title: format!("드라이런 검토: {}", dom.name), command: report });
             }
 
@@ -4772,7 +4772,7 @@ impl App {
             if let Some((step, run)) = eond_step {
                 let dom = &self.store.customers[ci].domains[di];
                 let eond = dom.eond.clone();
-                let server = if eond.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                let server = ops::with_admin_login(if eond.use_asis { &dom.asis } else { &dom.tobe }, &self.store.settings);
                 let dn = dom.name.clone();
                 let built = match step {
                     1 => ops::build_eondcms_resources(&server, &eond, &dn, self.use_root),
@@ -4803,7 +4803,7 @@ impl App {
             if let Some((step, run)) = cms_step {
                 let dom = &self.store.customers[ci].domains[di];
                 let mut c = dom.cms_install.clone();
-                let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                let server = ops::with_admin_login(if c.use_asis { &dom.asis } else { &dom.tobe }, &self.store.settings);
                 // 정보 탭을 단일 출처로 사용: HestiaCP 유저 = FTP 계정, DB = 선택 서버, 관리자 = ④ CMS 접속정보
                 c.hestia_user = server.ftp_id.clone();
                 c.hestia_pass = server.ftp_pw.clone();
@@ -4842,7 +4842,7 @@ impl App {
             if let Some(run) = rx_upload {
                 let dom = &self.store.customers[ci].domains[di];
                 let mut c = dom.cms_install.clone();
-                let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                let server = ops::with_admin_login(if c.use_asis { &dom.asis } else { &dom.tobe }, &self.store.settings);
                 c.hestia_user = server.ftp_id.clone();
                 c.hestia_pass = server.ftp_pw.clone();
                 if c.hestia_user.trim().is_empty() { c.hestia_user = customer_name.clone(); }
@@ -4875,7 +4875,7 @@ impl App {
             if let Some(run) = wp_upload_req {
                 let dom = &self.store.customers[ci].domains[di];
                 let mut c = dom.cms_install.clone();
-                let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                let server = ops::with_admin_login(if c.use_asis { &dom.asis } else { &dom.tobe }, &self.store.settings);
                 c.hestia_user = server.ftp_id.clone();
                 c.hestia_pass = server.ftp_pw.clone();
                 if c.hestia_user.trim().is_empty() { c.hestia_user = customer_name.clone(); }
@@ -4899,7 +4899,7 @@ impl App {
             if let Some(run) = wp_download_req {
                 let dom = &self.store.customers[ci].domains[di];
                 let mut c = dom.cms_install.clone();
-                let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                let server = ops::with_admin_login(if c.use_asis { &dom.asis } else { &dom.tobe }, &self.store.settings);
                 c.hestia_user = server.ftp_id.clone();
                 c.hestia_pass = server.ftp_pw.clone();
                 if c.hestia_user.trim().is_empty() { c.hestia_user = customer_name.clone(); }
@@ -4923,7 +4923,7 @@ impl App {
             if wp_perm_req {
                 let dom = &self.store.customers[ci].domains[di];
                 let mut c = dom.cms_install.clone();
-                let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                let server = ops::with_admin_login(if c.use_asis { &dom.asis } else { &dom.tobe }, &self.store.settings);
                 c.hestia_user = server.ftp_id.clone();
                 c.hestia_pass = server.ftp_pw.clone();
                 if c.hestia_user.trim().is_empty() { c.hestia_user = customer_name.clone(); }
@@ -4952,7 +4952,7 @@ impl App {
             if wp_permfix_req {
                 let dom = &self.store.customers[ci].domains[di];
                 let mut c = dom.cms_install.clone();
-                let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                let server = ops::with_admin_login(if c.use_asis { &dom.asis } else { &dom.tobe }, &self.store.settings);
                 c.hestia_user = server.ftp_id.clone();
                 c.hestia_pass = server.ftp_pw.clone();
                 if c.hestia_user.trim().is_empty() { c.hestia_user = customer_name.clone(); }
@@ -5152,7 +5152,7 @@ impl App {
                         let cust = self.store.customers[ci].name.clone();
                         let dom = &self.store.customers[ci].domains[di];
                         let mut c = dom.cms_install.clone();
-                        let server = if c.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                        let server = ops::with_admin_login(if c.use_asis { &dom.asis } else { &dom.tobe }, &self.store.settings);
                         c.hestia_user = server.ftp_id.clone();
                         c.hestia_pass = server.ftp_pw.clone();
                         if c.hestia_user.trim().is_empty() { c.hestia_user = cust; }
@@ -5224,7 +5224,7 @@ fn render_command(job: &ops::Job, show_pw: bool) -> String {
 }
 
 /// 드라이런 검토 리포트 (실행 없음): 사이트 입력 요약 + 작업별 준비 상태 + 형식 점검.
-fn build_dryrun(d: &Domain, customer: &str, use_root: bool) -> String {
+fn build_dryrun(d: &Domain, customer: &str, use_root: bool, s: &Settings) -> String {
     let mut r = String::new();
     r.push_str(&format!("도메인: {}", d.name));
     if let Some(p) = puny_if_different(&d.name) {
@@ -5253,10 +5253,10 @@ fn build_dryrun(d: &Domain, customer: &str, use_root: bool) -> String {
     }
 
     r.push_str("\n[eondcms 설치 준비]\n");
-    let server = if d.eond.use_asis { &d.asis } else { &d.tobe };
-    let er = ops::build_eondcms_resources(server, &d.eond, &d.name, use_root);
-    let eu = ops::build_eondcms_upload(server, &d.eond, &d.name, use_root);
-    let ef = ops::build_eondcms_finalize(server, &d.eond, &d.name, use_root);
+    let server = ops::with_admin_login(if d.eond.use_asis { &d.asis } else { &d.tobe }, s);
+    let er = ops::build_eondcms_resources(&server, &d.eond, &d.name, use_root);
+    let eu = ops::build_eondcms_upload(&server, &d.eond, &d.name, use_root);
+    let ef = ops::build_eondcms_finalize(&server, &d.eond, &d.name, use_root);
     for (name, res) in [("① 리소스", er), ("② 코드 업로드", eu), ("③ 설치 마무리", ef)] {
         match res {
             Ok(_) => r.push_str(&format!("  OK  {name}: 준비됨\n")),
@@ -5362,7 +5362,7 @@ fn site_fields(ui: &mut egui::Ui, s: &mut Site, show_pw: bool) -> bool {
         changed |= row_text(ui, "DNS A 호스트값", &mut s.dns_a);
         changed |= row_text(ui, "FTP 아이디", &mut s.ftp_id);
         changed |= row_secret(ui, "FTP 비번", &mut s.ftp_pw, show_pw);
-        changed |= row_text(ui, "서버루트 ID", &mut s.root_id);
+        changed |= row_text_hint(ui, "서버루트 ID", &mut s.root_id, "sudo 가능한 계정 (비우면 설정 > 서버 SSH 계정 사용). 호스팅 계정 아님");
         changed |= row_secret(ui, "서버루트 PW", &mut s.root_pw, show_pw);
         changed |= row_text(ui, "DB 아이디", &mut s.db_id);
         changed |= row_secret(ui, "DB 비번", &mut s.db_pw, show_pw);

@@ -508,10 +508,34 @@ const EONDCMS_STPL: &str = r#"server {
     include %home%/%user%/conf/web/%domain%/nginx.ssl.conf_*;
 }"#;
 
+/// sudo 경유 잡을 위한 대상 서버 사본 — '서버루트' 계정이 비면 설정의 서버 SSH sudo 계정으로 채운다.
+///
+/// 이 보강이 없으면 `Site::login_id(true)` 가 FTP(호스팅) 계정으로 조용히 폴백하고,
+/// 그 계정으로 `sudo -S` 를 시도하다 `"<user> is not in the sudoers file"` 로 실패한다.
+/// (bybiz.kr Rhymix 설치가 이 경로로 전량 실패했다 — 호스팅 계정은 sudoers 에 없다.)
+/// 둘 다 비어 있으면 채우지 않는다. 그 경우는 `cms_validate`/`eondcms_validate` 가 막는다.
+///
+/// 설치 대상 HestiaCP 유저와는 별개다 — 그쪽은 계속 사이트의 FTP 계정을 쓴다.
+pub fn with_admin_login(server: &Site, s: &Settings) -> Site {
+    let mut srv = server.clone();
+    if srv.root_id.trim().is_empty() && !s.ssh_user.trim().is_empty() {
+        srv.root_id = s.ssh_user.trim().to_string();
+        srv.root_pw = s.ssh_pass.clone();
+    }
+    srv
+}
+
 /// eondcms 원격 실행 래퍼.
 /// sudo=true: `ssh user@host "sudo -S -p '' bash -s"` 에 (비번\n + 스크립트)를 stdin 파이프 → 전체 root 실행.
 /// sudo=false: 직접 root 로그인 가정, remote_cmd 로 실행.
 /// 반환: (로컬 실행 스크립트, SSHPASS, 추가 env)
+///
+/// 접속 계정은 `use_root` 로 갈린다:
+/// - use_root=true  → 사이트의 서버루트 ID. **sudo 가능한 계정이어야 한다.**
+///   호출 전에 app.rs 의 `job_server` 가 비어 있으면 설정의 서버 SSH sudo 계정으로 채우고,
+///   그래도 비면 `cms_validate`/`eondcms_validate` 가 막는다.
+/// - use_root=false → FTP(호스팅) 계정. 사이트 소유자 권한으로 도는 잡(git pull 등)과,
+///   설정값으로 만든 합성 Site(ftp 칸 = sudo 유저)를 쓰는 서버 단위 잡이 여기 해당한다.
 fn eondcms_exec(server: &Site, raw: &str, use_root: bool, sudo: bool) -> (String, String, Vec<(String, String)>) {
     let pw = server.login_pw(use_root).to_string();
     let u = sq(server.login_id(use_root));
@@ -534,7 +558,11 @@ fn eondcms_exec(server: &Site, raw: &str, use_root: bool, sudo: bool) -> (String
 fn eondcms_validate(server: &Site, eond: &EondInstall, use_root: bool) -> Result<(), String> {
     if server.ip.trim().is_empty() { return Err("설치 대상 서버 IP가 비어 있습니다".into()); }
     if !use_root { return Err("eondcms 설치는 root 권한 필요 — '루트로 실행'을 켜고 서버루트 계정을 입력하세요".into()); }
-    if server.login_id(use_root).is_empty() { return Err("서버 루트 로그인 아이디가 비어 있습니다".into()); }
+    // login_id 는 서버루트 ID가 비면 FTP(호스팅) 계정으로 조용히 폴백하므로 여기서는 폴백 전 값을 본다.
+    // 호스팅 계정으로 sudo 하면 "<user> is not in the sudoers file" 로 스크립트 첫 줄도 못 돌고 전량 실패한다.
+    if server.root_id.trim().is_empty() {
+        return Err("서버루트 ID가 비어 있습니다 — 사이트의 '서버루트 ID/비번' 또는 설정 > 서버 SSH 의 sudo 계정(예: tong)을 입력하세요".into());
+    }
     if eond.hestia_user.trim().is_empty() { return Err("HestiaCP 유저가 비어 있습니다".into()); }
     Ok(())
 }
@@ -1622,7 +1650,11 @@ echo "===== 설치 끝 ====="
 fn cms_validate(server: &Site, c: &CmsInstall, use_root: bool, need_db: bool, need_admin: bool) -> Result<(), String> {
     if server.ip.trim().is_empty() { return Err("설치 대상 서버 IP가 비어 있습니다".into()); }
     if !use_root { return Err("CMS 설치는 root 권한 필요 — '루트로 실행'을 켜고 서버루트 계정을 입력하세요".into()); }
-    if server.login_id(use_root).is_empty() { return Err("서버 루트 로그인 아이디가 비어 있습니다".into()); }
+    // login_id 는 서버루트 ID가 비면 FTP(호스팅) 계정으로 조용히 폴백하므로 여기서는 폴백 전 값을 본다.
+    // 호스팅 계정으로 sudo 하면 "<user> is not in the sudoers file" 로 스크립트 첫 줄도 못 돌고 전량 실패한다.
+    if server.root_id.trim().is_empty() {
+        return Err("서버루트 ID가 비어 있습니다 — 사이트의 '서버루트 ID/비번' 또는 설정 > 서버 SSH 의 sudo 계정(예: tong)을 입력하세요".into());
+    }
     if c.hestia_user.trim().is_empty() { return Err("HestiaCP 유저가 비어 있습니다".into()); }
     // 업데이트(git pull/wp-cli)는 DB 자격증명이 필요 없으므로 설치 시에만 검증
     if need_db && (c.db_name.trim().is_empty() || c.db_user.trim().is_empty() || c.db_pass.is_empty()) {
@@ -4384,6 +4416,82 @@ mod tests {
     fn assert_bash_syntax(script: &str, label: &str) {
         let out = std::process::Command::new("bash").args(["-n", "-c", script]).output().expect("bash");
         assert!(out.status.success(), "{label} bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn rhymix_install_cfg() -> CmsInstall {
+        CmsInstall {
+            kind: CmsKind::Rhymix,
+            hestia_user: "bybiz".into(),
+            db_name: "bybiz_rx".into(),
+            db_user: "bybiz_rx".into(),
+            db_pass: "dbpw".into(),
+            admin_pass: "adminpw".into(),
+            admin_email: "a@b.c".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 서버루트 ID가 비면 예전에는 FTP(호스팅) 계정으로 조용히 폴백해 그 계정으로 sudo 를 시도했고,
+    /// `"bybiz is not in the sudoers file"` 로 스크립트 첫 줄도 못 돌고 전량 실패했다.
+    /// 이제는 잡을 만들기 전에 막는다.
+    #[test]
+    fn sudo_jobs_reject_hosting_account_fallback() {
+        let server = sample_site(); // root_id 비어 있음, ftp_id = "ftpuser"
+        // Job 은 비밀번호를 담고 있어 Debug 를 안 붙였다 → unwrap_err() 대신 err()
+        let err = build_cms_install(&server, &rhymix_install_cfg(), "bybiz.kr", true)
+            .err()
+            .expect("FTP 계정 폴백은 막혀야 한다");
+        assert!(err.contains("서버루트 ID"), "CMS 설치 안내 문구가 다름: {err}");
+
+        let eond = EondInstall {
+            hestia_user: "bybiz".into(),
+            db_name: "bybiz_e".into(),
+            db_user: "bybiz_e".into(),
+            db_pass: "dbpw".into(),
+            ..Default::default()
+        };
+        let err = build_eondcms_resources(&server, &eond, "bybiz.kr", true)
+            .err()
+            .expect("FTP 계정 폴백은 막혀야 한다");
+        assert!(err.contains("서버루트 ID"), "eondcms 안내 문구가 다름: {err}");
+    }
+
+    /// 사이트에 서버루트 ID가 없으면 설정 > 서버 SSH 의 sudo 계정(tong)이 그 자리를 채우고,
+    /// 실제 ssh 로그인도 그 계정으로 나간다.
+    #[test]
+    fn admin_login_uses_settings_sudo_account() {
+        let st = Settings { ssh_user: "tong".into(), ssh_pass: "tongpw".into(), ..Default::default() };
+        let srv = with_admin_login(&sample_site(), &st);
+        assert_eq!(srv.root_id, "tong");
+        assert_eq!(srv.root_pw, "tongpw");
+        // FTP 계정은 건드리지 않는다 — 설치 대상 HestiaCP 유저 산출에 계속 쓰인다
+        assert_eq!(srv.ftp_id, "ftpuser");
+
+        let job = build_cms_install(&srv, &rhymix_install_cfg(), "bybiz.kr", true).unwrap();
+        assert!(job.script.contains("'tong'@"), "sudo 계정으로 로그인하지 않음: {}", job.script);
+        assert!(!job.script.contains("'ftpuser'@"), "FTP 계정으로 폴백함: {}", job.script);
+        assert!(job.script.contains("sudo -S"), "sudo 경유가 아님: {}", job.script);
+        assert_bash_syntax(&job.script, "rhymix install (설정 sudo 계정)");
+    }
+
+    /// 사이트에 서버루트 ID가 이미 있으면 설정값이 덮어쓰지 않는다.
+    #[test]
+    fn admin_login_keeps_site_root_id() {
+        let mut server = sample_site();
+        server.root_id = "root".into();
+        server.root_pw = "rootpw".into();
+        let st = Settings { ssh_user: "tong".into(), ssh_pass: "tongpw".into(), ..Default::default() };
+        let srv = with_admin_login(&server, &st);
+        assert_eq!(srv.root_id, "root");
+        assert_eq!(srv.root_pw, "rootpw");
+    }
+
+    /// 설정에도 sudo 계정이 없으면 채우지 않고, 검증에서 막힌다 (FTP 폴백 금지).
+    #[test]
+    fn admin_login_without_settings_stays_empty() {
+        let srv = with_admin_login(&sample_site(), &Settings::default());
+        assert!(srv.root_id.is_empty(), "빈 설정인데 계정이 채워짐: {}", srv.root_id);
+        assert!(build_cms_install(&srv, &rhymix_install_cfg(), "bybiz.kr", true).is_err());
     }
 
     #[test]
