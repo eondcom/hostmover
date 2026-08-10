@@ -508,10 +508,34 @@ const EONDCMS_STPL: &str = r#"server {
     include %home%/%user%/conf/web/%domain%/nginx.ssl.conf_*;
 }"#;
 
+/// sudo 경유 잡을 위한 대상 서버 사본 — '서버루트' 계정이 비면 설정의 서버 SSH sudo 계정으로 채운다.
+///
+/// 이 보강이 없으면 `Site::login_id(true)` 가 FTP(호스팅) 계정으로 조용히 폴백하고,
+/// 그 계정으로 `sudo -S` 를 시도하다 `"<user> is not in the sudoers file"` 로 실패한다.
+/// (bybiz.kr Rhymix 설치가 이 경로로 전량 실패했다 — 호스팅 계정은 sudoers 에 없다.)
+/// 둘 다 비어 있으면 채우지 않는다. 그 경우는 `cms_validate`/`eondcms_validate` 가 막는다.
+///
+/// 설치 대상 HestiaCP 유저와는 별개다 — 그쪽은 계속 사이트의 FTP 계정을 쓴다.
+pub fn with_admin_login(server: &Site, s: &Settings) -> Site {
+    let mut srv = server.clone();
+    if srv.root_id.trim().is_empty() && !s.ssh_user.trim().is_empty() {
+        srv.root_id = s.ssh_user.trim().to_string();
+        srv.root_pw = s.ssh_pass.clone();
+    }
+    srv
+}
+
 /// eondcms 원격 실행 래퍼.
 /// sudo=true: `ssh user@host "sudo -S -p '' bash -s"` 에 (비번\n + 스크립트)를 stdin 파이프 → 전체 root 실행.
 /// sudo=false: 직접 root 로그인 가정, remote_cmd 로 실행.
 /// 반환: (로컬 실행 스크립트, SSHPASS, 추가 env)
+///
+/// 접속 계정은 `use_root` 로 갈린다:
+/// - use_root=true  → 사이트의 서버루트 ID. **sudo 가능한 계정이어야 한다.**
+///   호출 전에 app.rs 의 `job_server` 가 비어 있으면 설정의 서버 SSH sudo 계정으로 채우고,
+///   그래도 비면 `cms_validate`/`eondcms_validate` 가 막는다.
+/// - use_root=false → FTP(호스팅) 계정. 사이트 소유자 권한으로 도는 잡(git pull 등)과,
+///   설정값으로 만든 합성 Site(ftp 칸 = sudo 유저)를 쓰는 서버 단위 잡이 여기 해당한다.
 fn eondcms_exec(server: &Site, raw: &str, use_root: bool, sudo: bool) -> (String, String, Vec<(String, String)>) {
     let pw = server.login_pw(use_root).to_string();
     let u = sq(server.login_id(use_root));
@@ -534,7 +558,11 @@ fn eondcms_exec(server: &Site, raw: &str, use_root: bool, sudo: bool) -> (String
 fn eondcms_validate(server: &Site, eond: &EondInstall, use_root: bool) -> Result<(), String> {
     if server.ip.trim().is_empty() { return Err("설치 대상 서버 IP가 비어 있습니다".into()); }
     if !use_root { return Err("eondcms 설치는 root 권한 필요 — '루트로 실행'을 켜고 서버루트 계정을 입력하세요".into()); }
-    if server.login_id(use_root).is_empty() { return Err("서버 루트 로그인 아이디가 비어 있습니다".into()); }
+    // login_id 는 서버루트 ID가 비면 FTP(호스팅) 계정으로 조용히 폴백하므로 여기서는 폴백 전 값을 본다.
+    // 호스팅 계정으로 sudo 하면 "<user> is not in the sudoers file" 로 스크립트 첫 줄도 못 돌고 전량 실패한다.
+    if server.root_id.trim().is_empty() {
+        return Err("서버루트 ID가 비어 있습니다 — 사이트의 '서버루트 ID/비번' 또는 설정 > 서버 SSH 의 sudo 계정(예: tong)을 입력하세요".into());
+    }
     if eond.hestia_user.trim().is_empty() { return Err("HestiaCP 유저가 비어 있습니다".into()); }
     Ok(())
 }
@@ -1514,6 +1542,24 @@ fi
 while read -r FS SZ USED AVAIL PCT MP; do
   P=${PCT%\%}; [ "$P" -ge 95 ] 2>/dev/null && add "[$MP] 사용량 $PCT (디스크 거의 참)"
 done < <(df -P -x tmpfs -x devtmpfs 2>/dev/null | awk 'NR>1')
+
+# 디스크별 일일 사용량 — 하루 디스크당 1행, 같은 날 재실행은 교체한다.
+DAY=$(date +%F)
+DUSAGE="$STATE/disk-usage.tsv"
+mkdir -p "$STATE"
+[ -s "$DUSAGE" ] || printf 'date\tmount\tdevice\tuse\tavail\n' > "$DUSAGE"
+if grep -q "^$DAY"$'\t' "$DUSAGE" 2>/dev/null; then
+  grep -v "^$DAY"$'\t' "$DUSAGE" > "$DUSAGE.tmp" && mv "$DUSAGE.tmp" "$DUSAGE"
+fi
+while read -r FS SZ USED AVAIL PCT MP; do
+  case "$FS" in /dev/*) ;; *) continue ;; esac
+  case "$MP" in /boot*|/efi*) continue ;; esac
+  printf '%s\t%s\t%s\t%s\t%s\n' "$DAY" "$MP" "$FS" "${PCT%\%}" "$AVAIL" >> "$DUSAGE"
+done < <(df -hP 2>/dev/null | awk 'NR>1')
+LINES=$(grep -c . "$DUSAGE" 2>/dev/null)
+if [ "${LINES:-0}" -gt 5000 ] 2>/dev/null; then
+  { head -n 1 "$DUSAGE"; tail -n 4000 "$DUSAGE" | grep -v '^date'; } > "$DUSAGE.tmp" && mv "$DUSAGE.tmp" "$DUSAGE"
+fi
 if [ -n "$ALERT" ]; then
   SUBJ="[hostmover] 디스크 경보: $(hostname)"
   BODY="디스크 감시에서 이상이 감지되었습니다:"$'\n\n'"$ALERT"$'\n'"로그: $LOG"
@@ -1604,7 +1650,11 @@ echo "===== 설치 끝 ====="
 fn cms_validate(server: &Site, c: &CmsInstall, use_root: bool, need_db: bool, need_admin: bool) -> Result<(), String> {
     if server.ip.trim().is_empty() { return Err("설치 대상 서버 IP가 비어 있습니다".into()); }
     if !use_root { return Err("CMS 설치는 root 권한 필요 — '루트로 실행'을 켜고 서버루트 계정을 입력하세요".into()); }
-    if server.login_id(use_root).is_empty() { return Err("서버 루트 로그인 아이디가 비어 있습니다".into()); }
+    // login_id 는 서버루트 ID가 비면 FTP(호스팅) 계정으로 조용히 폴백하므로 여기서는 폴백 전 값을 본다.
+    // 호스팅 계정으로 sudo 하면 "<user> is not in the sudoers file" 로 스크립트 첫 줄도 못 돌고 전량 실패한다.
+    if server.root_id.trim().is_empty() {
+        return Err("서버루트 ID가 비어 있습니다 — 사이트의 '서버루트 ID/비번' 또는 설정 > 서버 SSH 의 sudo 계정(예: tong)을 입력하세요".into());
+    }
     if c.hestia_user.trim().is_empty() { return Err("HestiaCP 유저가 비어 있습니다".into()); }
     // 업데이트(git pull/wp-cli)는 DB 자격증명이 필요 없으므로 설치 시에만 검증
     if need_db && (c.db_name.trim().is_empty() || c.db_user.trim().is_empty() || c.db_pass.is_empty()) {
@@ -2132,6 +2182,519 @@ fn ssh_admin_site(s: &Settings) -> Result<Site, String> {
         ftp_pw: s.ssh_pass.clone(),
         ssh_port: s.ssh_port.trim().to_string(),
         ..Default::default()
+    })
+}
+
+const SERVER_SNAPSHOT_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+HIST=/var/lib/hm-disk-monitor/history.tsv
+echo "===== 서버 상태 스냅샷 ====="
+
+echo "[호스트]"
+echo "  $(hostname) · $(uname -r)"
+UP=$(uptime -p 2>/dev/null | sed 's/^up //'); echo "  가동 ${UP:-?}"
+echo "HM_DASH_HOST=$(hostname)"
+echo "HM_DASH_UPTIME=${UP:-?}"
+
+echo "[부하]"
+read L1 L5 L15 REST < /proc/loadavg
+CORES=$(nproc 2>/dev/null); [ -z "$CORES" ] && CORES=1
+echo "  load $L1 / $L5 / $L15  (코어 ${CORES})"
+echo "HM_DASH_LOAD1=$L1"
+echo "HM_DASH_LOAD5=$L5"
+echo "HM_DASH_CORES=$CORES"
+
+echo "[메모리]"
+MT=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+MA=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+[ -z "$MT" ] && MT=0; [ -z "$MA" ] && MA=0
+MU=$((MT - MA)); MP=0; [ "$MT" -gt 0 ] && MP=$((MU * 100 / MT))
+echo "  ${MU}MB / ${MT}MB (${MP}%)"
+echo "HM_DASH_MEMPCT=$MP"
+echo "HM_DASH_MEMTOTAL=$MT"
+
+echo "[디스크]"
+MAXP=0; MAXMP="-"
+while read -r FS SZ USED AVAIL PCT MP; do
+  # 실제 블록장치만 (efivarfs·tmpfs·overlay 같은 가상 fs 가 최대치를 오염시킨다)
+  case "$FS" in /dev/*) ;; *) continue ;; esac
+  P=${PCT%\%}
+  printf '  %-24s %5s  %5s 남음\n' "$MP" "$PCT" "$AVAIL"
+  if [ "$P" -gt "$MAXP" ] 2>/dev/null; then MAXP=$P; MAXMP=$MP; fi
+done < <(df -hP 2>/dev/null | awk 'NR>1')
+echo "HM_DASH_DISKMAX=$MAXP"
+echo "HM_DASH_DISKMAXMP=$MAXMP"
+
+echo "[서비스]"
+SVCFAIL=""
+for S in nginx apache2 mysql mariadb exim4 dovecot cron; do
+  systemctl list-unit-files "$S.service" >/dev/null 2>&1 || continue
+  if systemctl is-active --quiet "$S" 2>/dev/null; then
+    echo "  ✓ $S"
+  else
+    echo "  ✗ $S 정지"
+    SVCFAIL="$SVCFAIL $S"
+  fi
+done
+for U in $(systemctl list-units --type=service --state=running,failed 'php*-fpm.service' --no-legend 2>/dev/null | awk '{print $1}'); do
+  systemctl is-active --quiet "$U" 2>/dev/null || SVCFAIL="$SVCFAIL ${U%.service}"
+done
+NPHP=$(systemctl list-units --type=service 'php*-fpm.service' --no-legend 2>/dev/null | grep -c .)
+NPHPBAD=$(systemctl list-units --type=service --state=failed 'php*-fpm.service' --no-legend 2>/dev/null | grep -c .)
+echo "  php-fpm ${NPHP}개 중 실패 ${NPHPBAD}개"
+echo "HM_DASH_SVCFAIL=$(echo $SVCFAIL | sed 's/^ *//')"
+echo "HM_DASH_PHPFPM=$NPHP"
+echo "HM_DASH_PHPFPMBAD=$NPHPBAD"
+
+echo "[HestiaCP]"
+if [ -x "$VBIN/v-list-users" ]; then
+  NU=$("$VBIN/v-list-users" plain 2>/dev/null | grep -c .)
+  ND=0
+  for U in $("$VBIN/v-list-users" plain 2>/dev/null | awk '{print $1}'); do
+    N=$("$VBIN/v-list-web-domains" "$U" plain 2>/dev/null | grep -c .)
+    ND=$((ND + N))
+  done
+  echo "  계정 ${NU} · 웹도메인 ${ND}"
+  echo "HM_DASH_USERS=$NU"
+  echo "HM_DASH_DOMAINS=$ND"
+else
+  echo "  (HestiaCP CLI 없음)"
+  echo "HM_DASH_USERS=-"
+  echo "HM_DASH_DOMAINS=-"
+fi
+
+echo "[자동 감시]"
+if [ -f /etc/cron.d/hm-disk-monitor ]; then
+  DL=$(cat /var/lib/hm-disk-monitor/last-run 2>/dev/null)
+  DR=$(grep -v '^date' /var/lib/hm-disk-monitor/history.tsv 2>/dev/null | tail -1 | awk '{print $2}')
+  # 서버 타임존으로 epoch 변환 — 앱이 타임존을 추측하지 않게 한다
+  DLTS=""
+  [ -n "$DL" ] && DLTS=$(date -d "$DL" +%s 2>/dev/null)
+  echo "  디스크 감시 설치됨 · 마지막 ${DL:-기록없음} · 최근판정 ${DR:-?}"
+  echo "HM_DASH_DISKMON=1"
+  echo "HM_DASH_DISKMON_LAST=${DL:-}"
+  echo "HM_DASH_DISKMON_LAST_TS=${DLTS:-}"
+  echo "HM_DASH_DISKMON_RESULT=${DR:-}"
+else
+  echo "  디스크 감시 미설치"
+  echo "HM_DASH_DISKMON=0"
+  echo "HM_DASH_DISKMON_LAST="
+  echo "HM_DASH_DISKMON_LAST_TS="
+  echo "HM_DASH_DISKMON_RESULT="
+fi
+if [ -f /etc/cron.d/hm-traffic-monitor ]; then
+  echo "  트래픽 감시 설치됨"
+  echo "HM_DASH_TRAFFICMON=1"
+else
+  echo "  트래픽 감시 미설치"
+  echo "HM_DASH_TRAFFICMON=0"
+fi
+
+echo "[추이·구성 점검]"
+
+# 1) 디스크 사용률 전체 추이 — 디스크별 기록이 아직 없는 전환기 폴백
+RATE=""; ETA=""; SPAN=""
+if [ -s "$HIST" ]; then
+  ROWS=$(grep -v '^date' "$HIST" 2>/dev/null | awk -F'\t' 'NF>=6' | tail -30)
+  N=$(printf '%s\n' "$ROWS" | grep -c .)
+  if [ "${N:-0}" -ge 2 ] 2>/dev/null; then
+    F=$(printf '%s\n' "$ROWS" | head -1); L=$(printf '%s\n' "$ROWS" | tail -1)
+    D1=$(printf '%s' "$F" | cut -f1); U1=$(printf '%s' "$F" | cut -f6 | tr -d '%')
+    D2=$(printf '%s' "$L" | cut -f1); U2=$(printf '%s' "$L" | cut -f6 | tr -d '%')
+    S1=$(date -d "$D1" +%s 2>/dev/null); S2=$(date -d "$D2" +%s 2>/dev/null)
+    if [ -n "$S1" ] && [ -n "$S2" ]; then
+      DAYS=$(( (S2 - S1) / 86400 ))
+      if [ "$DAYS" -gt 0 ] 2>/dev/null; then
+        SPAN=$DAYS
+        RATE=$(awk -v a="$U1" -v b="$U2" -v d="$DAYS" 'BEGIN{printf "%.2f", (b-a)/d}')
+        ETA=$(awk -v u="$U2" -v r="$RATE" 'BEGIN{ if (r > 0.02 && u < 95) printf "%d", (95-u)/r }')
+      fi
+    fi
+  fi
+fi
+if [ -n "$RATE" ]; then
+  echo "  디스크 추이: ${SPAN}일간 하루 ${RATE}%p"
+  [ -n "$ETA" ] && echo "  95% 도달 예상: 약 ${ETA}일 후"
+else
+  echo "  디스크 추이: 데이터 부족 (감시 기록 2일 이상 필요)"
+fi
+echo "HM_DASH_DISKRATE=${RATE}"
+echo "HM_DASH_DISKETA=${ETA}"
+echo "HM_DASH_DISKSPAN=${SPAN}"
+
+# 2) 백업 위치가 데이터 파티션과 같은지
+BSRC=$(df -P /backup 2>/dev/null | awk 'NR==2{print $1}')
+HSRC=$(df -P /home 2>/dev/null | awk 'NR==2{print $1}')
+BSAME=0
+if [ -n "$BSRC" ] && [ "$BSRC" = "$HSRC" ]; then BSAME=1; fi
+if [ -z "$BSRC" ]; then
+  echo "  백업 경로: /backup 없음 (v-backup-user 가 실패할 수 있음)"
+else
+  echo "  백업 경로: $BSRC $([ "$BSAME" = 1 ] && echo '← /home 과 같은 파티션' || echo '(별도 파티션)')"
+fi
+echo "HM_DASH_BACKUPSAME=$BSAME"
+echo "HM_DASH_BACKUPSRC=${BSRC:-}"
+
+# 3) PHP-FPM 버전 공존
+PHPV=$(systemctl list-units --type=service 'php*-fpm.service' --no-legend 2>/dev/null \
+  | awk '{print $1}' | grep -oE '[0-9]+\.[0-9]+' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+NPV=$(printf '%s' "$PHPV" | wc -w)
+echo "  PHP-FPM 버전: ${PHPV:-없음} (${NPV}개)"
+echo "HM_DASH_PHPVERS=${PHPV}"
+echo "HM_DASH_PHPVERN=${NPV}"
+
+# 4) 버전을 넘나드는 소켓 중복
+DUP=$(grep -rhE '^[[:space:]]*listen[[:space:]]*=' /etc/php/*/fpm/pool.d/*.conf 2>/dev/null \
+  | sed 's/.*=[[:space:]]*//' | sort | uniq -d | grep -c .)
+[ -z "$DUP" ] && DUP=0
+echo "  소켓 중복 정의: ${DUP}건"
+echo "HM_DASH_SOCKDUP=$DUP"
+
+echo "[디스크별 헬스]"
+
+# 물리 디스크 SMART는 파티션마다 다시 묻지 않고 캐시한다.
+SMCACHE=$(mktemp)
+smart_of() {
+  local D="$1" line
+  line=$(grep -m1 "^$D " "$SMCACHE" 2>/dev/null)
+  if [ -n "$line" ]; then printf '%s' "${line#* }"; return; fi
+  local H="-" RS="-" PS="-" POH="-" TMP="-"
+  if command -v smartctl >/dev/null 2>&1 && [ -b "/dev/$D" ]; then
+    H=$(smartctl -H "/dev/$D" 2>/dev/null | grep -iE 'overall-health|SMART Health Status' | sed 's/.*: *//' | tr -d ' ')
+    [ -z "$H" ] && H="-"
+    local A
+    A=$(smartctl -A "/dev/$D" 2>/dev/null)
+    RS=$(printf '%s' "$A" | awk '/Reallocated_Sector_Ct/{print $10; exit}')
+    PS=$(printf '%s' "$A" | awk '/Current_Pending_Sector/{print $10; exit}')
+    POH=$(printf '%s' "$A" | awk '/Power_On_Hours/{print $10; exit}')
+    TMP=$(printf '%s' "$A" | awk '/Temperature_Celsius|Airflow_Temperature/{print $10; exit}')
+    if [ "$RS" = "" ] || [ "$POH" = "" ]; then
+      local N
+      N=$(smartctl -A "/dev/$D" 2>/dev/null)
+      [ -z "$POH" ] && POH=$(printf '%s' "$N" | awk -F: '/Power On Hours/{gsub(/[ ,]/,"",$2); print $2; exit}')
+      [ -z "$TMP" ] && TMP=$(printf '%s' "$N" | awk -F: '/Temperature:/{gsub(/[^0-9]/,"",$2); print $2; exit}')
+      [ -z "$RS" ] && RS=$(printf '%s' "$N" | awk -F: '/Available Spare:/{gsub(/[^0-9]/,"",$2); print "spare"$2; exit}')
+    fi
+  fi
+  [ -z "$RS" ] && RS="-"; [ -z "$PS" ] && PS="-"; [ -z "$POH" ] && POH="-"; [ -z "$TMP" ] && TMP="-"
+  echo "$D $H $RS $PS $POH $TMP" >> "$SMCACHE"
+  printf '%s' "$H $RS $PS $POH $TMP"
+}
+
+DUSAGE=/var/lib/hm-disk-monitor/disk-usage.tsv
+trend_of() {
+  local MP="$1" ROWS N F L D1 U1 D2 U2 S1 S2 DAYS RATE ETA
+  [ -s "$DUSAGE" ] || { printf -- '- - -'; return; }
+  ROWS=$(awk -F'\t' -v m="$MP" '$1!="date" && $2==m' "$DUSAGE" 2>/dev/null | tail -60)
+  N=$(printf '%s\n' "$ROWS" | grep -c .)
+  if [ "${N:-0}" -lt 2 ] 2>/dev/null; then printf -- '- - -'; return; fi
+  F=$(printf '%s\n' "$ROWS" | head -1); L=$(printf '%s\n' "$ROWS" | tail -1)
+  D1=$(printf '%s' "$F" | cut -f1); U1=$(printf '%s' "$F" | cut -f4)
+  D2=$(printf '%s' "$L" | cut -f1); U2=$(printf '%s' "$L" | cut -f4)
+  S1=$(date -d "$D1" +%s 2>/dev/null); S2=$(date -d "$D2" +%s 2>/dev/null)
+  if [ -z "$S1" ] || [ -z "$S2" ]; then printf -- '- - -'; return; fi
+  DAYS=$(( (S2 - S1) / 86400 ))
+  if [ "$DAYS" -le 0 ] 2>/dev/null; then printf -- '- - -'; return; fi
+  RATE=$(awk -v a="$U1" -v b="$U2" -v d="$DAYS" 'BEGIN{printf "%.2f", (b-a)/d}')
+  ETA=$(awk -v u="$U2" -v r="$RATE" 'BEGIN{ if (r > 0.02 && u < 95) printf "%d", (95-u)/r }')
+  printf -- '%s %s %s' "$RATE" "${ETA:--}" "$DAYS"
+}
+
+NDISK=0
+while read -r FS SZ USED AVAIL PCT MP; do
+  case "$FS" in /dev/*) ;; *) continue ;; esac
+  case "$MP" in /boot*|/efi*) continue ;; esac
+  P=${PCT%\%}
+  IP=$(df -iP "$MP" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}'); [ -z "$IP" ] && IP="-"
+  PK=$(lsblk -no PKNAME "$FS" 2>/dev/null | head -1 | tr -d ' ')
+  [ -z "$PK" ] && PK=$(basename "$FS")
+  FE="-"
+  if [ -b "$FS" ]; then
+    FE=$(tune2fs -l "$FS" 2>/dev/null | awk -F: '/FS Error count/{gsub(/ /,"",$2); print $2; exit}')
+    [ -z "$FE" ] && FE="-"
+  fi
+  ROLE=other
+  case "$MP" in
+    /backup*|*backup*|*Backup*) ROLE=backup ;;
+    /|/home|/home/*|/var|/var/*) ROLE=main ;;
+  esac
+  SM=$(smart_of "$PK")
+  TR=$(trend_of "$MP")
+  NDISK=$((NDISK + 1))
+  RATE=$(printf '%s' "$TR" | awk '{print $1}'); ETA=$(printf '%s' "$TR" | awk '{print $2}')
+  TRTXT=""
+  [ "$RATE" != "-" ] && TRTXT="  추이 ${RATE}%p/일"
+  [ "$ETA" != "-" ] && [ -n "$ETA" ] && TRTXT="$TRTXT (95% 약 ${ETA}일 후)"
+  printf '  %-14s %-16s %-7s %4s%%  %6s 남음  inode %3s%%  %s%s\n' "$MP" "$FS" "$ROLE" "$P" "$AVAIL" "$IP" "$SM" "$TRTXT"
+  printf 'HM_DISK %s %s %s %s %s %s %s %s %s %s\n' "$MP" "$FS" "$PK" "$ROLE" "$P" "$AVAIL" "$IP" "$FE" "$SM" "$TR"
+done < <(df -hP 2>/dev/null | awk 'NR>1')
+
+[ "$NDISK" = 0 ] && echo "  (검사 가능한 디스크를 찾지 못했습니다)"
+echo "HM_DASH_DISKN=$NDISK"
+rm -f "$SMCACHE"
+
+echo "===== 스냅샷 끝 =====""#;
+
+/// 서버 상태 스냅샷 (SSH, sudo, 읽기 전용).
+/// 부하·메모리·디스크·서비스·HestiaCP 규모·감시 설치 상태를 한 번에 모은다.
+pub fn build_server_snapshot(s: &Settings) -> Result<Job, String> {
+    let srv = ssh_admin_site(s)?;
+    let (script, sshpass, env) = eondcms_exec(&srv, SERVER_SNAPSHOT_BODY, false, true);
+    Ok(Job {
+        title: "서버 상태 스냅샷".into(),
+        script,
+        sshpass,
+        env,
+        note: "SSH 1회 · 읽기 전용 서버 상태 조회".into(),
+    })
+}
+
+const DOMAIN_HEALTH_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+PAR=8
+TMO=8
+
+echo "===== 도메인별 헬스 점검 ====="
+
+# 이 서버의 대표 IP — DNS 가 이 서버를 가리키는지 비교하는 기준
+MYIP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+[ -z "$MYIP" ] && MYIP=$(hostname -I 2>/dev/null | awk '{print $1}')
+echo "  서버 IP ${MYIP:-?} · 동시 ${PAR} · 타임아웃 ${TMO}s"
+echo "HM_DASH_MYIP=${MYIP:-}"
+echo
+
+# 검사 대상 수집: <계정> <도메인>
+LIST=$(mktemp)
+OUT=$(mktemp)
+if [ -x "$VBIN/v-list-users" ]; then
+  for U in $("$VBIN/v-list-users" plain 2>/dev/null | awk '{print $1}'); do
+    "$VBIN/v-list-web-domains" "$U" plain 2>/dev/null | awk -v u="$U" '{print u" "$1}'
+  done > "$LIST"
+fi
+NTOT=$(grep -c . "$LIST" 2>/dev/null); [ -z "$NTOT" ] && NTOT=0
+if [ "$NTOT" = 0 ]; then
+  echo "  검사할 도메인이 없습니다 (HestiaCP CLI 미검출 또는 도메인 0개)"
+  echo "HM_DASH_DOMTOTAL=0"
+  rm -f "$LIST" "$OUT"
+  echo "===== 점검 끝 ====="
+  exit 0
+fi
+
+# 도메인 1개 검사 — 병렬 실행되므로 한 줄로 결과를 출력한다
+CHK=$(mktemp)
+cat > "$CHK" <<'EOS'
+#!/usr/bin/env bash
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+U="$1"; D="$2"; MYIP="$HM_MYIP"; TMO="$HM_TMO"
+# 0) 웹루트 존재 — vhost 설정만 남고 파일이 없는 경우를 잡는다
+ROOT=no; [ -d "/home/$U/web/$D/public_html" ] && ROOT=yes
+# 1) 이 서버의 vhost 응답 (DNS 우회, 서버 자신에게 물어본다)
+#    ※ Host 매칭이 실패하면 기본 vhost 가 200 을 주므로 이 값만으로 정상 판정하지 않는다.
+LH=$(curl -sS -o /dev/null -m "$TMO" -k --resolve "$D:443:127.0.0.1" -w '%{http_code}' "https://$D/" 2>/dev/null)
+[ -z "$LH" ] && LH=000
+[ "$LH" = 000 ] && LH=$(curl -sS -o /dev/null -m "$TMO" --resolve "$D:80:127.0.0.1" -w '%{http_code}' "http://$D/" 2>/dev/null)
+[ -z "$LH" ] && LH=000
+# 2) 공개 경로 응답 (실제 방문자 관점 — DNS 를 따른다). 주 판정 지표.
+PH=$(curl -sS -o /dev/null -m "$TMO" -k -w '%{http_code}' "https://$D/" 2>/dev/null)
+[ -z "$PH" ] && PH=000
+[ "$PH" = 000 ] && PH=$(curl -sS -o /dev/null -m "$TMO" -w '%{http_code}' "http://$D/" 2>/dev/null)
+[ -z "$PH" ] && PH=000
+# 3) DNS A 레코드가 이 서버인지 (IPv4 만 비교 — MYIP 가 IPv4 다)
+A=$(dig +short +time=3 +tries=1 A "$D" 2>/dev/null | grep -E '^[0-9]+\.[0-9.]+$' | head -1)
+[ -z "$A" ] && A=$(getent ahostsv4 "$D" 2>/dev/null | awk '{print $1}' | grep -E '^[0-9]+\.[0-9.]+$' | head -1)
+if [ -z "$A" ]; then DNS=none; elif [ "$A" = "$MYIP" ]; then DNS=ok; else DNS=other; fi
+# 4) 인증서 만료 D-day — 파일에서 읽는다(네트워크 불필요, 훨씬 빠르다)
+CD=-
+for C in "/home/$U/conf/web/$D/ssl/$D.crt" "/home/$U/conf/web/$D/ssl/$D.pem"; do
+  [ -s "$C" ] || continue
+  E=$(openssl x509 -enddate -noout -in "$C" 2>/dev/null | cut -d= -f2)
+  [ -z "$E" ] && continue
+  ES=$(date -d "$E" +%s 2>/dev/null) || continue
+  CD=$(( (ES - $(date +%s)) / 86400 ))
+  break
+done
+printf 'HM_DOMH %s %s %s %s %s %s %s %s\n' "$U" "$D" "$LH" "$PH" "$DNS" "$CD" "$ROOT" "${A:--}"
+EOS
+chmod +x "$CHK"
+
+export HM_MYIP="$MYIP" HM_TMO="$TMO"
+awk '{print $1" "$2}' "$LIST" | xargs -P "$PAR" -n 2 "$CHK" > "$OUT" 2>/dev/null
+
+# 판정 규칙
+#   DNS=ok   → 공개응답(PH)이 주 지표 (실제 방문자가 보는 것)
+#   DNS=other/none → 그 자체가 이상. 이 경우 PH 는 남의 서버 응답이라 판정에 쓰지 않는다.
+#   LH 단독으로는 정상 판정하지 않는다 — Host 매칭 실패 시 기본 vhost 가 200 을 준다.
+issue_of() {
+  local LH="$1" PH="$2" DNS="$3" CD="$4" ROOT="$5" A="$6" M=""
+  [ "$ROOT" = no ] && M="웹루트 없음"
+  if [ "$DNS" = none ]; then M="$M${M:+ · }DNS 레코드 없음"
+  elif [ "$DNS" = other ]; then M="$M${M:+ · }DNS 가 다른 서버($A)"
+  else
+    case "$PH" in 2*|3*) ;; 000) M="$M${M:+ · }응답 없음(타임아웃/거부)" ;; *) M="$M${M:+ · }HTTP $PH" ;; esac
+  fi
+  if [ "$CD" != "-" ]; then
+    if [ "$CD" -lt 0 ] 2>/dev/null; then M="$M${M:+ · }인증서 만료 — 접속이 차단됩니다"
+    elif [ "$CD" -le 14 ] 2>/dev/null; then M="$M${M:+ · }인증서 D-$CD — 자동 갱신이 실패하고 있을 수 있습니다"; fi
+  fi
+  printf '%s' "$M"
+}
+
+ISSUES=0; CERTSOON=0; CERTEXP=0; DNSBAD=0; HTTPBAD=0; NOROOT=0
+while read -r _ U D LH PH DNS CD ROOT A; do
+  [ -n "$(issue_of "$LH" "$PH" "$DNS" "$CD" "$ROOT" "$A")" ] && ISSUES=$((ISSUES+1))
+  { [ "$DNS" = other ] || [ "$DNS" = none ]; } && DNSBAD=$((DNSBAD+1))
+  [ "$ROOT" = no ] && NOROOT=$((NOROOT+1))
+  if [ "$DNS" = ok ]; then
+    case "$PH" in 2*|3*) ;; *) HTTPBAD=$((HTTPBAD+1)) ;; esac
+  fi
+  if [ "$CD" != "-" ]; then
+    if [ "$CD" -lt 0 ] 2>/dev/null; then CERTEXP=$((CERTEXP+1))
+    elif [ "$CD" -le 14 ] 2>/dev/null; then CERTSOON=$((CERTSOON+1)); fi
+  fi
+done < "$OUT"
+
+echo "[이상 감지]"
+while read -r _ U D LH PH DNS CD ROOT A; do
+  M=$(issue_of "$LH" "$PH" "$DNS" "$CD" "$ROOT" "$A")
+  [ -n "$M" ] && printf '  %-36s %s\n' "$D" "$M"
+done < "$OUT"
+[ "$ISSUES" = 0 ] && echo "  없음 — 전부 정상"
+echo
+
+echo "[원자료]"
+cat "$OUT"
+echo
+echo "HM_DASH_DOMTOTAL=$NTOT"
+echo "HM_DASH_DOMISSUES=$ISSUES"
+echo "HM_DASH_DOMOK=$((NTOT - ISSUES))"
+echo "HM_DASH_HTTPBAD=$HTTPBAD"
+echo "HM_DASH_DNSBAD=$DNSBAD"
+echo "HM_DASH_NOROOT=$NOROOT"
+echo "HM_DASH_CERTSOON=$CERTSOON"
+echo "HM_DASH_CERTEXP=$CERTEXP"
+rm -f "$LIST" "$OUT" "$CHK"
+echo "===== 점검 끝 =====""#;
+
+/// 도메인별 헬스 점검 (SSH, sudo, 읽기 전용).
+/// HestiaCP 웹도메인 전체를 병렬로: 웹루트 존재·서버응답·공개응답·DNS·인증서 만료.
+pub fn build_domain_health(s: &Settings) -> Result<Job, String> {
+    let srv = ssh_admin_site(s)?;
+    let (script, sshpass, env) = eondcms_exec(&srv, DOMAIN_HEALTH_BODY, false, true);
+    Ok(Job {
+        title: "도메인별 헬스 점검".into(),
+        script,
+        sshpass,
+        env,
+        note: "SSH 1회 · 도메인 8개 병렬 · 도메인 100개면 약 2분".into(),
+    })
+}
+
+const UPKEEP_CHECK_BODY: &str = r#"set +e
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+VBIN=/usr/local/hestia/bin
+BDIR=/backup
+NOW=$(date +%s)
+
+echo "[백업 현황]"
+BCRON=0
+grep -rqi 'backup' /etc/cron.d/hestia 2>/dev/null && BCRON=1
+BKEEP=$(grep -E "^BACKUPS=" /usr/local/hestia/conf/hestia.conf 2>/dev/null | cut -d"'" -f2)
+[ -z "$BKEEP" ] && BKEEP="-"
+echo "  자동 백업 cron: $([ "$BCRON" = 1 ] && echo 등록됨 || echo '없음(수동 백업만)')   보관 세대: $BKEEP"
+echo "HM_BK_CRON=$BCRON"
+echo "HM_BK_KEEP=$BKEEP"
+
+if [ ! -d "$BDIR" ]; then
+  echo "  ✗ $BDIR 없음"
+  echo "HM_BK_TOTAL=0"; echo "HM_BK_USERS=0"; echo "HM_BK_MISSING="
+else
+  NTAR=$(ls -1 "$BDIR"/*.tar 2>/dev/null | grep -c .)
+  SIZE=$(du -sh "$BDIR" 2>/dev/null | cut -f1)
+  echo "  파일 ${NTAR}개 · ${SIZE:-?}"
+  echo "HM_BK_TOTAL=$NTAR"
+  echo "HM_BK_SIZE=${SIZE:-}"
+
+  USERS=$("$VBIN/v-list-users" plain 2>/dev/null | awk '{print $1}')
+  NU=$(printf '%s\n' "$USERS" | grep -c .)
+  MISSING=""; NEWEST=0; OLDESTU=""; OLDESTT=0
+  for U in $USERS; do
+    LAST=$(ls -1t "$BDIR/$U".*.tar 2>/dev/null | head -1)
+    if [ -z "$LAST" ]; then MISSING="$MISSING $U"; continue; fi
+    N=$(ls -1 "$BDIR/$U".*.tar 2>/dev/null | grep -c .)
+    T=$(stat -c %Y "$LAST" 2>/dev/null); [ -z "$T" ] && T=0
+    [ "$T" -gt "$NEWEST" ] 2>/dev/null && NEWEST=$T
+    # 가장 오래된 '최신 백업' = 제일 방치된 계정
+    if [ "$OLDESTT" = 0 ] || { [ "$T" -lt "$OLDESTT" ] 2>/dev/null; }; then OLDESTT=$T; OLDESTU="$U"; fi
+    AGE=$(( (NOW - T) / 86400 ))
+    printf 'HM_BKU %s %s %s\n' "$U" "$N" "$AGE"
+  done
+  NMISS=$(printf '%s' "$MISSING" | wc -w)
+  echo "  계정 ${NU}개 중 백업 있음 $((NU - NMISS))개 · 없음 ${NMISS}개"
+  [ -n "$MISSING" ] && echo "    백업 없는 계정:$MISSING"
+  if [ "$NEWEST" -gt 0 ] 2>/dev/null; then
+    echo "  가장 최근 백업: $(date -d "@$NEWEST" '+%F %T') ($(( (NOW - NEWEST) / 86400 ))일 전)"
+  else
+    echo "  ✗ 백업 파일이 하나도 없습니다"
+  fi
+  echo "HM_BK_USERS=$NU"
+  echo "HM_BK_MISSING=$(printf '%s' "$MISSING" | sed 's/^ *//')"
+  echo "HM_BK_NEWEST=$NEWEST"
+  [ -n "$OLDESTU" ] && echo "HM_BK_STALEST=$OLDESTU $(( (NOW - OLDESTT) / 86400 ))"
+fi
+echo
+
+echo "[휴면 후보 — 오래 방치된 사이트]"
+echo "  ※ 삭제 대상이 아니라 '확인해볼 곳' 이다. 계절성·내부용 사이트가 섞일 수 있다."
+HITDAYS=90
+MODDAYS=180
+NCAND=0
+shopt -s nullglob
+for WR in /home/*/web/*/public_html; do
+  [ -d "$WR" ] || continue
+  DOM="$(basename "$(dirname "$WR")")"
+  OWN="$(stat -c %U "$WR" 2>/dev/null)"; [ -z "$OWN" ] && continue
+
+  HITT=0
+  for L in /var/log/apache2/domains/"$DOM".log /var/log/nginx/domains/"$DOM".log \
+           /home/"$OWN"/web/"$DOM"/logs/"$DOM".log; do
+    [ -s "$L" ] || continue
+    T=$(stat -c %Y "$L" 2>/dev/null); [ -z "$T" ] && continue
+    [ "$T" -gt "$HITT" ] 2>/dev/null && HITT=$T
+  done
+  if [ "$HITT" = 0 ]; then HITD=-1; else HITD=$(( (NOW - HITT) / 86400 )); fi
+
+  FRESH=$(find "$WR" -type f -mtime -"$MODDAYS" \
+            -not -path "$WR/*cache/*" -not -path "$WR/logs/*" -not -path "$WR/tmp/*" \
+            -not -path "$WR/wp-content/uploads/*" -print -quit 2>/dev/null)
+  [ -n "$FRESH" ] && MODOLD=0 || MODOLD=1
+
+  SIG=0; WHY=""
+  if [ "$HITD" = -1 ]; then SIG=$((SIG+1)); WHY="접근로그 없음"
+  elif [ "$HITD" -ge "$HITDAYS" ] 2>/dev/null; then SIG=$((SIG+1)); WHY="${HITD}일간 접근 없음"; fi
+  if [ "$MODOLD" = 1 ]; then SIG=$((SIG+1)); WHY="$WHY${WHY:+ · }${MODDAYS}일+ 파일 변경 없음"; fi
+
+  if [ "$SIG" -ge 2 ] 2>/dev/null; then
+    NCAND=$((NCAND+1))
+    printf '  %-34s %-10s %s\n' "$DOM" "$OWN" "$WHY"
+    printf 'HM_IDLE %s %s %s %s %s\n' "$OWN" "$DOM" "$HITD" "$MODOLD" "$SIG"
+  fi
+done
+[ "$NCAND" = 0 ] && echo "  없음 — 최근 활동이 확인되지 않는 사이트가 없습니다"
+echo "HM_IDLE_COUNT=$NCAND""#;
+
+/// 백업 현황 + 휴면 사이트 점검 (SSH, sudo, 읽기 전용).
+/// 백업 누락 계정·마지막 백업 시각과, 오래 방치된 사이트 후보를 한 번에 조사한다.
+pub fn build_upkeep_check(s: &Settings) -> Result<Job, String> {
+    let srv = ssh_admin_site(s)?;
+    let (script, sshpass, env) = eondcms_exec(&srv, UPKEEP_CHECK_BODY, false, true);
+    Ok(Job {
+        title: "백업·정리 점검".into(),
+        script,
+        sshpass,
+        env,
+        note: "SSH 1회 · 읽기 전용 백업·휴면 현황 조회".into(),
     })
 }
 
@@ -3850,6 +4413,87 @@ mod tests {
         }
     }
 
+    fn assert_bash_syntax(script: &str, label: &str) {
+        let out = std::process::Command::new("bash").args(["-n", "-c", script]).output().expect("bash");
+        assert!(out.status.success(), "{label} bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn rhymix_install_cfg() -> CmsInstall {
+        CmsInstall {
+            kind: CmsKind::Rhymix,
+            hestia_user: "bybiz".into(),
+            db_name: "bybiz_rx".into(),
+            db_user: "bybiz_rx".into(),
+            db_pass: "dbpw".into(),
+            admin_pass: "adminpw".into(),
+            admin_email: "a@b.c".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 서버루트 ID가 비면 예전에는 FTP(호스팅) 계정으로 조용히 폴백해 그 계정으로 sudo 를 시도했고,
+    /// `"bybiz is not in the sudoers file"` 로 스크립트 첫 줄도 못 돌고 전량 실패했다.
+    /// 이제는 잡을 만들기 전에 막는다.
+    #[test]
+    fn sudo_jobs_reject_hosting_account_fallback() {
+        let server = sample_site(); // root_id 비어 있음, ftp_id = "ftpuser"
+        // Job 은 비밀번호를 담고 있어 Debug 를 안 붙였다 → unwrap_err() 대신 err()
+        let err = build_cms_install(&server, &rhymix_install_cfg(), "bybiz.kr", true)
+            .err()
+            .expect("FTP 계정 폴백은 막혀야 한다");
+        assert!(err.contains("서버루트 ID"), "CMS 설치 안내 문구가 다름: {err}");
+
+        let eond = EondInstall {
+            hestia_user: "bybiz".into(),
+            db_name: "bybiz_e".into(),
+            db_user: "bybiz_e".into(),
+            db_pass: "dbpw".into(),
+            ..Default::default()
+        };
+        let err = build_eondcms_resources(&server, &eond, "bybiz.kr", true)
+            .err()
+            .expect("FTP 계정 폴백은 막혀야 한다");
+        assert!(err.contains("서버루트 ID"), "eondcms 안내 문구가 다름: {err}");
+    }
+
+    /// 사이트에 서버루트 ID가 없으면 설정 > 서버 SSH 의 sudo 계정(tong)이 그 자리를 채우고,
+    /// 실제 ssh 로그인도 그 계정으로 나간다.
+    #[test]
+    fn admin_login_uses_settings_sudo_account() {
+        let st = Settings { ssh_user: "tong".into(), ssh_pass: "tongpw".into(), ..Default::default() };
+        let srv = with_admin_login(&sample_site(), &st);
+        assert_eq!(srv.root_id, "tong");
+        assert_eq!(srv.root_pw, "tongpw");
+        // FTP 계정은 건드리지 않는다 — 설치 대상 HestiaCP 유저 산출에 계속 쓰인다
+        assert_eq!(srv.ftp_id, "ftpuser");
+
+        let job = build_cms_install(&srv, &rhymix_install_cfg(), "bybiz.kr", true).unwrap();
+        assert!(job.script.contains("'tong'@"), "sudo 계정으로 로그인하지 않음: {}", job.script);
+        assert!(!job.script.contains("'ftpuser'@"), "FTP 계정으로 폴백함: {}", job.script);
+        assert!(job.script.contains("sudo -S"), "sudo 경유가 아님: {}", job.script);
+        assert_bash_syntax(&job.script, "rhymix install (설정 sudo 계정)");
+    }
+
+    /// 사이트에 서버루트 ID가 이미 있으면 설정값이 덮어쓰지 않는다.
+    #[test]
+    fn admin_login_keeps_site_root_id() {
+        let mut server = sample_site();
+        server.root_id = "root".into();
+        server.root_pw = "rootpw".into();
+        let st = Settings { ssh_user: "tong".into(), ssh_pass: "tongpw".into(), ..Default::default() };
+        let srv = with_admin_login(&server, &st);
+        assert_eq!(srv.root_id, "root");
+        assert_eq!(srv.root_pw, "rootpw");
+    }
+
+    /// 설정에도 sudo 계정이 없으면 채우지 않고, 검증에서 막힌다 (FTP 폴백 금지).
+    #[test]
+    fn admin_login_without_settings_stays_empty() {
+        let srv = with_admin_login(&sample_site(), &Settings::default());
+        assert!(srv.root_id.is_empty(), "빈 설정인데 계정이 채워짐: {}", srv.root_id);
+        assert!(build_cms_install(&srv, &rhymix_install_cfg(), "bybiz.kr", true).is_err());
+    }
+
     #[test]
     fn db_backup_script_shape() {
         std::env::set_var("HOME", std::env::temp_dir());
@@ -4357,6 +5001,97 @@ mod tests {
         assert!(job.script.contains("ADMINU='admin'"), "{}", job.script);
         assert!(job.script.contains("NEWPASS='p'\\''w \"x\"$(id)'"), "{}", job.script);
         assert!(job.script.contains("wp_pw_one \"$VUSER\" \"$DOMAIN\" \"$WEBROOT\""), "{}", job.script);
+    }
+
+    #[test]
+    fn server_snapshot_is_safe_valid_bash() {
+        let st = Settings {
+            ssh_host: "10.0.0.1".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "tongpw".into(),
+            ..Default::default()
+        };
+        let job = build_server_snapshot(&st).unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        assert_bash_syntax(SERVER_SNAPSHOT_BODY, "서버 스냅샷 원문");
+        for destructive in ["rm -rf", "v-delete-", "DROP"] {
+            assert!(!SERVER_SNAPSHOT_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
+        }
+        assert_eq!(SERVER_SNAPSHOT_BODY.matches("HM_DASH_DISKMON_LAST_TS=").count(), 2,
+            "설치·미설치 양쪽 분기에서 epoch 마커를 출력해야 함");
+        assert!(SERVER_SNAPSHOT_BODY.contains("date -d \"$DL\" +%s"));
+        for marker in ["DISKRATE", "DISKETA", "DISKSPAN", "BACKUPSAME", "BACKUPSRC", "PHPVERS", "PHPVERN", "SOCKDUP"] {
+            assert!(SERVER_SNAPSHOT_BODY.contains(&format!("HM_DASH_{marker}=")), "추이 마커 누락: {marker}");
+        }
+        assert!(SERVER_SNAPSHOT_BODY.contains("HM_DISK %s %s %s %s %s %s %s %s %s %s"));
+        assert!(SERVER_SNAPSHOT_BODY.contains("/boot*|/efi*"));
+    }
+
+    #[test]
+    fn disk_monitor_usage_history_is_valid_bash() {
+        let st = Settings { ssh_host: "10.0.0.1".into(), ssh_user: "tong".into(), ssh_pass: "tongpw".into(), ..Default::default() };
+        let job = build_disk_monitor_install(&st, "admin@example.com", "/backup").unwrap();
+        let out = std::process::Command::new("bash").args(["-n", "-c", &job.script]).output().expect("bash");
+        assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        let daily = DISK_MONITOR_INSTALL_BODY
+            .split_once("cat > /usr/local/sbin/hm-disk-monitor.sh <<'EOS'\n").expect("일일 감시 시작").1
+            .split_once("\nEOS\n").expect("일일 감시 끝").0;
+        assert_bash_syntax(daily, "일일 디스크 감시 원문");
+        assert!(DISK_MONITOR_INSTALL_BODY.contains("disk-usage.tsv"));
+        assert!(DISK_MONITOR_INSTALL_BODY.contains("grep -v \"^$DAY\"$'\\t'"), "같은 날 기록 교체 필요");
+        assert!(DISK_MONITOR_INSTALL_BODY.contains("tail -n 4000"), "기록 무한 증가 방지 필요");
+    }
+
+    #[test]
+    fn domain_health_is_safe_valid_bash() {
+        let st = Settings {
+            ssh_host: "10.0.0.1".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "tongpw".into(),
+            ..Default::default()
+        };
+        let job = build_domain_health(&st).unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        assert_bash_syntax(DOMAIN_HEALTH_BODY, "도메인 헬스 원문");
+        for destructive in ["rm -rf", "v-delete-", "DROP"] {
+            assert!(!DOMAIN_HEALTH_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
+        }
+        assert!(DOMAIN_HEALTH_BODY.contains("getent ahostsv4"));
+        assert!(DOMAIN_HEALTH_BODY.contains("case \"$PH\" in 2*|3*)"));
+        assert!(DOMAIN_HEALTH_BODY.contains("자동 갱신이 실패하고 있을 수 있습니다"));
+    }
+
+    #[test]
+    fn upkeep_check_is_read_only_valid_bash() {
+        let st = Settings {
+            ssh_host: "10.0.0.1".into(),
+            ssh_user: "tong".into(),
+            ssh_pass: "tongpw".into(),
+            ..Default::default()
+        };
+        let job = build_upkeep_check(&st).unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", "-c", &job.script])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "bash 구문 오류: {}", String::from_utf8_lossy(&out.stderr));
+        assert_bash_syntax(UPKEEP_CHECK_BODY, "백업·휴면 점검 원문");
+        assert!(!UPKEEP_CHECK_BODY.split_whitespace().any(|word| word == "rm"), "rm 명령 포함");
+        for destructive in ["v-delete-", "DROP"] {
+            assert!(!UPKEEP_CHECK_BODY.contains(destructive), "파괴 명령 포함: {destructive}");
+        }
+        assert!(UPKEEP_CHECK_BODY.contains("\"$BDIR/$U\".*.tar"), "계정 접두어가 겹치지 않는 glob 필요");
+        assert!(UPKEEP_CHECK_BODY.contains("-mtime -\"$MODDAYS\""));
+        assert!(!UPKEEP_CHECK_BODY.contains("-newermt"));
+        assert!(UPKEEP_CHECK_BODY.contains("-print -quit"));
     }
 
     #[test]
