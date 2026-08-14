@@ -163,7 +163,18 @@ SHOW GLOBAL STATUS LIKE 'Table_locks_immediate';
 
 전체 백업 파일: `/backup/manual/<db>-preinnodb-20260814.sql.gz` (DB 단위, counter_log/documents 전환 대상 DB 전부 커버, 백업 있으면 재사용).
 
-### 2.6 향후 재발 방지 (별도 논의 필요, 이번 범위 밖)
+### 2.6 서버 전체 잔여 MyISAM 일괄 전환 (2026-08-14 완료)
+
+우선순위 테이블(counter_log·documents, 42개) 전환 후에도 서버엔 여전히 MyISAM 테이블 3,193개(총 2.7GB, 33개 DB에 분산 — 대부분 XE/Rhymix 모듈별 소규모 설정·메타 테이블)가 남아 있었다. FULLTEXT 인덱스는 전무함을 확인 후, DB 단위로 묶어 일괄 전환:
+
+- 33개 DB, DB별로 (기존 백업 재사용 또는 신규 백업) → 해당 DB의 모든 MyISAM 테이블을 **하나의 mysql 세션에서 일괄 `ALTER TABLE ... ENGINE=InnoDB`** 실행(테이블마다 개별 접속하지 않아 SSH/커넥션 오버헤드 최소화) → 전환 후 남은 MyISAM 개수 검증.
+- **33개 DB 전부 `[OK]`, 에러/경고 0건.**
+- 서버 전체 최종 확인: `SELECT ENGINE, COUNT(*) FROM information_schema.tables ...` → **MyISAM 0개**, InnoDB 8,673개, MEMORY 4개(세션/캐시용, 정상).
+- `Table_locks_waited` 최종 측정: 30초 구간 **증가 0건** (이전 §2.5 단계에서 초당 0.03건 → 사실상 완전 해소).
+- 여러 도메인(`swslr.com`, `ibsq.co.kr`, `eond.com` 등) curl 재확인 — 전부 0.1~0.2초 내 정상 응답.
+- 점검 중 `makkuk.eond.com`이 403을 반환하는 걸 발견했으나, 로그 확인 결과 **2026-08-09부터(오늘 작업 훨씬 이전) 그 도메인 자체 nginx 설정의 `deny all;`로 인한 기존 상태**이며 오늘 작업과 무관함을 확인함(그 사이트 자체가 PHP Fatal Error로 이미 깨져 있어 운영자가 막아둔 것으로 추정).
+
+### 2.7 향후 재발 방지 (별도 논의 필요, 이번 범위 밖)
 
 - XE/Rhymix 신규 설치 시 `*_counter_log`류를 기본 InnoDB로 생성하도록 설정/스킨 점검.
 - 방문자 로그 자동 정리(retention) 정책: **데이터 삭제 없이 집계+아카이브로 테이블 크기를 관리하는 설계**를 별도 문서로 남김 — [`2026-08-14-counter-log-archive-design.md`](./2026-08-14-counter-log-archive-design.md). 이번 InnoDB 전환과는 독립적으로, 여유를 갖고 별도 진행.
