@@ -153,7 +153,17 @@ SHOW GLOBAL STATUS LIKE 'Table_locks_immediate';
 - 전환 전: 재시작 9분 만에 `Table_locks_waited` 2,065건(초당 ~3.75건).
 - 목표: 전환 완료 구간(1~13번)에 한해 이 수치의 증가 속도가 뚜렷이 감소하는지 관찰.
 
-### 2.5 향후 재발 방지 (별도 논의 필요, 이번 범위 밖)
+### 2.5 실행 결과 (2026-08-14 완료)
+
+**counter_log 13개 테이블** (§2.3 목록 전체) — 전부 백업 후 `ALTER TABLE ENGINE=InnoDB` 성공. 행수는 13개 중 7개 완전 일치, 6개는 전환 도중 실사용자 트래픽으로 +1~+6행 증가(감소는 0건 — 데이터 손실 없음, `information_schema.tables.TABLE_ROWS`는 InnoDB에서 추정치라 참고용일 뿐 검증엔 `SELECT COUNT(*)` 사용). 가장 큰 `hb_counter_log`(2.5GB, 1,767만 행)도 94초 만에 무중단 전환.
+
+**`*_documents` 계열 29개 테이블 추가 전환** — counter_log 전환만으로는 `Table_locks_waited` 증가율이 초당 3.75건→2.3건(39% 감소)에 그쳐, 게시글 본문 테이블(`xe_documents`류)도 같은 방식으로 전환. 가장 큰 `hani_hani.xe_documents`(allofhani.com, 2.5GB)는 27초, 나머지는 전부 수 초 이내. 29개 전부 행수 완전 일치, `ENGINE=InnoDB` 확인.
+
+**최종 효과**: `Table_locks_waited` 증가율 **초당 3.75건 → 초당 0.03건 (98%+ 감소)**. `allofhani.com`·`haebyeong.com`·`namwon.net`·`neosol.co.kr`·`sclink.co.kr`·`pooyas.com` 전부 0.1~1.1초 내 정상 응답 재확인.
+
+전체 백업 파일: `/backup/manual/<db>-preinnodb-20260814.sql.gz` (DB 단위, counter_log/documents 전환 대상 DB 전부 커버, 백업 있으면 재사용).
+
+### 2.6 향후 재발 방지 (별도 논의 필요, 이번 범위 밖)
 
 - XE/Rhymix 신규 설치 시 `*_counter_log`류를 기본 InnoDB로 생성하도록 설정/스킨 점검.
 - 방문자 로그 자동 정리(retention) 정책: **데이터 삭제 없이 집계+아카이브로 테이블 크기를 관리하는 설계**를 별도 문서로 남김 — [`2026-08-14-counter-log-archive-design.md`](./2026-08-14-counter-log-archive-design.md). 이번 InnoDB 전환과는 독립적으로, 여유를 갖고 별도 진행.
