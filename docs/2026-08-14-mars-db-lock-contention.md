@@ -156,5 +156,5 @@ SHOW GLOBAL STATUS LIKE 'Table_locks_immediate';
 ### 2.5 향후 재발 방지 (별도 논의 필요, 이번 범위 밖)
 
 - XE/Rhymix 신규 설치 시 `*_counter_log`류를 기본 InnoDB로 생성하도록 설정/스킨 점검.
-- 방문자 로그 자동 정리(retention) 정책 도입 여부는 **데이터 삭제라 고객 협의 필요** — 이번엔 보류, 별도 안건으로 다룰 것.
+- 방문자 로그 자동 정리(retention) 정책: **데이터 삭제 없이 집계+아카이브로 테이블 크기를 관리하는 설계**를 별도 문서로 남김 — [`2026-08-14-counter-log-archive-design.md`](./2026-08-14-counter-log-archive-design.md). 이번 InnoDB 전환과는 독립적으로, 여유를 갖고 별도 진행.
 - mysqldump가 매번 이런 대형 로그 테이블을 통째로 백업하는 것 자체도 백업 시간·부하의 원인이므로, 정리/InnoDB 전환 이후에도 백업 전략(예: 로그성 테이블 백업 주기 분리) 재검토 여지 있음.
