@@ -101,15 +101,35 @@ OPTIMIZE TABLE hb_counter_log;   -- 삭제로 생긴 여유 공간을 파일에�
 
 **핵심 확인 사항**: ARCHIVE 엔진의 압축률이 기대 이상 — InnoDB로 707만 행을 유지했다면 1GB를 훌쩍 넘었을 것을 113MB로 압축. 전체 디스크 사용량도 3,290MB → 2,057MB(핫+아카이브 합)로 실질 절감됨.
 
-## 5. 열린 질문 (남은 12개 테이블 확대 적용 전 결정 필요)
+## 5. 나머지 12개 테이블 일괄 적용 결과 (2026-08-14 완료)
 
-1. **보관 기간 기준**: 이번엔 3개월로 했지만, 이는 `hb_counter_log`의 트래픽 패턴(6월 폭증)에 맞춘 것 — 테이블마다 트래픽 분포가 다를 수 있으니 나머지 12개도 각각 월별 집계를 먼저 보고 기간을 정하는 게 안전.
-2. **archive 데이터의 조회 경로**: XE/Rhymix 관리자 화면이 `hb_counter_log` 하나만 보고 있다면, 오래된 데이터를 보려면 별도 조회(직접 SQL 또는 관리자 화면에 `UNION` 뷰 추가)가 필요할 수 있음 — 고객이 오래된 방문자 통계를 실제로 UI에서 봐야 하는지 확인 필요.
-3. **고객 고지 여부**: 상세 데이터 자체는 보존되지만 "최근 화면에서 안 보이게" 되는 변화이므로, 사전 고지가 필요한지 판단.
+파일럿에서 검증된 절차(§3)로 12개 테이블 전부 동일 기준(3개월 보관)으로 일괄 실행. 실행 전 월별 집계를 훑어 `pooyas_pooyas.xe_counter_log`(2026-07 953만 건, 2026-08 513만 건)와 `rokmc_rokmcgolf.mg_counter_log`(2026-07 232만 건)에 최근 트래픽 폭증이 있음을 미리 확인함 — 이 둘은 3개월 기준으로도 감소폭이 작을 것으로 예상하고 진행.
 
-## 6. 진행 순서 (남은 12개 테이블)
+**실행 중 버그 1건 추가 발견**: `yncare_xe.xe_counter_log`·`eond_yncare.xe_counter_log` 두 테이블만 컬럼 순서가 달랐다(`ipaddress, regdate, user_agent, site_srl` — 다른 테이블은 `site_srl`이 첫 컬럼). `INSERT ... SELECT *`는 위치 기준 매칭이라 `ipaddress`(문자열)가 아카이브 테이블의 `site_srl`(정수) 자리에 들어가려다 `ERROR 1265 Data truncated`로 실패. **`--force` 없이 실행해서 에러 즉시 스크립트가 중단됐고, 삭제 단계 전이라 원본은 전혀 안 건드려짐** — 컬럼명을 명시(`INSERT INTO archive (site_srl, ipaddress, regdate, user_agent) SELECT site_srl, ipaddress, regdate, user_agent FROM ...`)해서 재실행, 성공.
+
+| 테이블 | 원본 행수 | 남은 행수(핫) | 아카이브 행수 | 감소율 | 비고 |
+|---|---:|---:|---:|---:|---|
+| pooyas_pooyas.xe_counter_log | 17,447,524 | 15,409,705 | 2,037,913 | 12% | 최근 폭증(7·8월)으로 감소폭 작음 |
+| rokmc_namwon.nw_counter_log | 11,523,193 | 376,054 | 11,147,139 | 96.7% | |
+| rokmc_haebyeongcokr.hb_counter_log | 6,354,559 | 519,732 | 5,834,828 | 91.8% | |
+| rokmc_rokmcgolf.mg_counter_log | 4,255,188 | 3,399,218 | 855,970 | 20% | 최근 폭증(7월)으로 감소폭 작음 |
+| rokmc_bsuperman.sp_counter_log | 2,392,069 | 454,488 | 1,937,581 | 81% | |
+| insoo_bbib.xe_counter_log | 2,215,220 | 735,429 | 1,479,792 | 66.8% | |
+| yncare_xe.xe_counter_log | 2,039,139 | 7,558 | 2,031,581 | 99.6% | 컬럼순서 버그 수정 후 성공 |
+| eond_yncare.xe_counter_log | 2,023,301 | 0 | 2,023,301 | 100% | 최근 3개월 활동 없음(사실상 비활성) |
+| fgsmc_fgsmc.fgsmc_counter_log | 1,517,993 | 473,759 | 1,044,234 | 68.8% | |
+| rokmc_jjhyanggyo.xe_counter_log | 1,302,861 | 676,168 | 626,693 | 48.1% | |
+| swslr_swslr.xe_counter_log | 1,089,747 | 630,169 | 459,578 | 42.2% | |
+| rokmc_rokmcva.rv_counter_log | 939,893 | 9,848 | 930,045 | 99% | |
+
+**합계**: 12개 테이블에서 약 3,040만 행이 아카이브로 이관(원본에서 삭제, 데이터는 압축 보존). §4의 `hb_counter_log` 707만 행까지 합치면 오늘 하루 총 **약 3,748만 행**을 hot 테이블에서 archive로 옮김.
+
+**전부 검증 통과**(원본 = 아카이브 + 남을 것, 삭제 후 재확인까지 일치), 에러 없이 완료. `pooyas.com`·`namwon.net`·`yncare.net`·`swslr.com` 등 재확인 결과 전부 정상 응답(0.1~0.4초).
+
+## 6. 진행 순서 — 전체 완료
 
 1. ~~InnoDB 전환(락 경합 해결)~~ — 완료.
-2. ~~파일럿 1개(`hb_counter_log`)로 절차 검증~~ — 완료, 절차의 버그 2건 수정됨(§3).
-3. 나머지 12개 테이블(`xe_counter_log`(pooyas), `nw_counter_log`, `hb_counter_log`(haebyeongcokr), `mg_counter_log`, `sp_counter_log`, `xe_counter_log`(insoo_bbib/yncare_xe/eond_yncare), `fgsmc_counter_log`, `xe_counter_log`(jjhyanggyo/swslr), `rv_counter_log`) — 각각 월별 집계 먼저 확인 후 보관 기간 정하고 순차 적용.
-4. 며칠 관찰(사이트 정상 동작, 관리자 통계 화면 이상 없는지) 후 완료 처리.
+2. ~~파일럿 1개(`hb_counter_log`)로 절차 검증~~ — 완료, 버그 2건 수정(§3).
+3. ~~나머지 12개 테이블 일괄 적용~~ — 완료, 추가 버그 1건 수정(§5).
+4. 며칠 관찰(사이트 정상 동작, 관리자 통계 화면 이상 없는지) — 남은 할 일. 특히 `eond_yncare`(핫 테이블 0행)처럼 극단적으로 줄어든 곳은 관리자 화면에서 "최근 방문자 없음"으로 보이는 게 맞는지 확인 필요.
+5. §5의 열린 질문(archive 조회 경로, 고객 고지 여부)은 여전히 미결 — 필요 시 별도 진행.
