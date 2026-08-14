@@ -28,25 +28,52 @@ v0.1.0  (21c4383 · 2026-07-25 07:36)
 
 ---
 
-## 2. 표준 업데이트 절차
+## 2. 표준 업데이트 절차 — `./install-linux.sh` 하나로 끝낸다
 
 ```bash
-cd ~/dev/hostmover
-git pull                      # 또는 브랜치 머지
-cargo build --release
+./install-linux.sh            # 릴리스 빌드 + 설치 + 런처/독바 갱신
+./install-linux.sh --no-build # 이미 빌드했을 때
 ```
 
-런처(`~/.local/share/applications/hostmover.desktop`)의 `Exec` 이
-`~/dev/hostmover/target/release/hostmover` 를 가리키므로, **여기서 빌드하면 런처에 바로 반영된다.**
-앱이 떠 있으면 껐다 켜야 한다.
+**worktree 안에서 실행해도 된다.** 오히려 그게 정상 경로다 — 빌드 산출물은 worktree 안에
+생기지만 설치는 항상 `~/.local/bin/hostmover` 로 간다.
 
-반영됐는지는 앱을 켜서 §1 의 버전 문자열이 바뀌었는지로 확인한다.
+스크립트가 하는 일:
+
+| 단계 | 내용 |
+|---|---|
+| ① | `cargo build --release` (런처는 debug 를 보지 않는다) |
+| ② | 바이너리를 `~/.local/bin/hostmover` 로 **복사** — `cargo clean` 에 안 날아간다 |
+| ③ | 아이콘을 `~/.local/share/icons/hicolor/256x256/apps/` 로 |
+| ④ | `.desktop` 을 다시 쓰고 `update-desktop-database` |
+| ⑤ | 옛 경로(`<메인체크아웃>/target/release/hostmover`)가 남아 있으면 **같이 덮는다** (§3-4 독바 캐시 대비) |
+| ⑥ | 설치된 바이너리의 커밋 해시를 찍고, 앱이 실행 중이면 껐다 켜라고 알린다 |
+
+끝나면 앱을 껐다 켜고, §1 의 버전 문자열이 스크립트가 찍은 해시와 같은지 확인한다.
+
+> **수동으로 할 때도 `Exec` 은 절대 `target/release` 를 직접 가리키지 말 것.**
+> 빌드 산출물 경로라 `cargo clean` 한 번에 사라지고, 그러면 `Terminal=false` 라 에러 한 줄 없이
+> 아이콘이 먹통이 된다(§3-0).
 
 ---
 
 ## 3. 함정 — "고쳤는데 런처에서 안 보인다"
 
-가장 흔한 사고이고, 2026-07-25 에 실제로 겪었다.
+가장 흔한 사고다. 2026-07-25, 2026-08-05 에 실제로 겪었다.
+**아래 전부 `./install-linux.sh` 로 예방된다.** 수동으로 할 때만 신경 쓰면 된다.
+
+### 3-0. release 바이너리가 아예 없다 (2026-08-05)
+
+런처 `Exec` 이 `target/release/hostmover` 를 직접 가리키던 시절, `cargo clean`(또는 재체크아웃)
+이후 릴리스 빌드를 안 하면 그 파일이 **존재하지 않는다.** `Terminal=false` 라서 아이콘을 눌러도
+에러창 하나 없이 아무 일도 안 일어난다 — "앱이 실행이 안 된다" 로 보이는 전형적 증상이다.
+
+```bash
+ls -la ~/dev/hostmover/target/release/hostmover   # 없으면 이 경우
+```
+
+그래서 지금은 `Exec` 이 `~/.local/bin/hostmover` 를 가리킨다. `install` 은 복사이므로
+`cargo clean` 을 해도 살아남는다.
 
 ### 3-1. worktree 에서 빌드했다
 
@@ -57,19 +84,19 @@ cargo build --release
 ~/dev/hostmover/target/release/hostmover                        ← 런처가 실행하는 것 (옛것)
 ```
 
-런처는 원본 경로만 보므로 아무리 빌드해도 화면이 그대로다. 해결:
+런처가 worktree 안을 볼 리 없으니 아무리 빌드해도 화면이 그대로다. 해결:
 
 ```bash
-# (권장) 브랜치를 머지한 뒤 원본에서 빌드
-cd ~/dev/hostmover && git merge <브랜치> && cargo build --release
-
-# (급할 때) 바이너리만 얹기 — 소스와 어긋나므로 임시 조치로만
-cp -a ~/dev/hostmover/target/release/hostmover{,.bak-$(date +%Y%m%d)}
-cp -f .claude/worktrees/<이름>/target/release/hostmover ~/dev/hostmover/target/release/hostmover
+# worktree 안에서 그냥 이걸 실행하면 된다 (설치 경로는 항상 ~/.local/bin)
+./install-linux.sh
 ```
 
-바이너리만 얹으면 소스와 실행파일이 어긋난다. 버전 문자열에 그 커밋 해시가 그대로 찍히므로
-나중에 추적은 되지만, 되도록 머지 후 정식 빌드를 한다.
+이때 실행파일은 worktree 커밋으로 만들어지고 메인 체크아웃의 소스와는 어긋난다. 버전 문자열에
+그 커밋 해시가 찍히므로 추적은 되지만, 검증이 끝나면 머지하고 다시 설치한다:
+
+```bash
+cd ~/dev/hostmover && git merge <브랜치> && ./install-linux.sh
+```
 
 ### 3-2. 디버그 빌드만 했다
 
@@ -79,27 +106,57 @@ cp -f .claude/worktrees/<이름>/target/release/hostmover ~/dev/hostmover/target
 ### 3-3. 앱을 안 껐다
 
 실행 중인 프로세스는 옛 바이너리를 그대로 물고 있다. 껐다 켠다.
+어느 파일을 물고 있는지는 이렇게 본다:
+
+```bash
+pgrep -af hostmover        # 실행 중인 프로세스의 실제 경로
+ps -p <PID> -o lstart      # 언제 떴는지 (설치 시각보다 이전이면 그냥 옛 창이다)
+```
+
+### 3-4. 독바(COSMIC)가 옛 `Exec` 을 캐시하고 있다 (2026-08-05)
+
+이 데스크톱은 COSMIC 이고, 하단 독바 즐겨찾기는
+`~/.config/cosmic/com.system76.CosmicAppList/v1/favorites` 에 **desktop ID**(`"hostmover"`)로만
+들어 있다. 즉 경로가 아니라 `.desktop` 파일을 따라간다 — 그래서 `.desktop` 만 고치면 될 것 같지만,
+**COSMIC AppList 가 `Exec` 값을 캐시한다.** `.desktop` 을 고치고 `update-desktop-database` 까지
+돌려도 독바 아이콘은 한동안 옛 경로로 앱을 띄운다.
+
+실제로 겪은 순서가 이랬다: `Exec` 을 `~/.local/bin` 으로 바꾸고 새 바이너리를 설치했는데,
+독바로 띄운 앱이 계속 **옛 커밋 해시**를 보여줬다. 프로세스를 보니 옛 경로였다.
+
+```bash
+pgrep -af hostmover
+# → /home/dell/dev/hostmover/target/release/hostmover   ← 캐시된 옛 Exec
+```
+
+대응은 둘 중 하나다:
+
+1. **옛 경로에도 새 바이너리를 얹는다** — `install-linux.sh` 가 ⑤에서 자동으로 한다.
+   캐시가 남아 있어도 실행 결과가 같아지므로 가장 확실하다.
+2. 독바/패널을 재시작해 캐시를 비운다. (세션이 잠깐 깜빡인다)
 
 ---
 
 ## 4. 런처 항목 (.desktop)
 
-`~/.local/share/applications/hostmover.desktop`
+`~/.local/share/applications/hostmover.desktop` — **`install-linux.sh` 가 매번 다시 쓴다.**
+손으로 고칠 일은 거의 없다.
 
 ```ini
 [Desktop Entry]
 Type=Application
 Name=Hostmover
-Exec=/home/dell/dev/hostmover/target/release/hostmover
+Exec=/home/dell/.local/bin/hostmover
 Icon=hostmover
 Terminal=false
 Categories=Network;
 StartupWMClass=hostmover
 ```
 
-- 아이콘 원본은 `assets/hostmover.png`.
-- 파일을 고쳤는데 메뉴에 안 뜨면 `update-desktop-database ~/.local/share/applications` 를 돌린다.
-- 항목 자체가 사라진 게 아니라 **Exec 이 옛 바이너리를 가리키는 것**이 대부분이다(§3).
+- **`Exec` 은 `~/.local/bin/hostmover`.** 빌드 산출물 경로를 직접 가리키지 않는다(§3-0).
+- 아이콘 원본은 `assets/hostmover.png` → `~/.local/share/icons/hicolor/256x256/apps/hostmover.png`.
+- 파일을 고쳤는데 메뉴에 안 뜨면 `update-desktop-database ~/.local/share/applications`.
+- 항목이 사라진 게 아니라 **Exec 이 옛 바이너리를 가리키거나(§3-0) 독바가 캐시 중(§3-4)** 인 경우가 대부분이다.
 
 ---
 
@@ -113,10 +170,38 @@ egui 앱은 사실상 크로스컴파일이 안 되므로 macOS 에서 직접 �
 ## 6. 되돌리기
 
 ```bash
-# 바이너리만 얹었다가 되돌릴 때
-mv ~/dev/hostmover/target/release/hostmover.bak-YYYYMMDD \
-   ~/dev/hostmover/target/release/hostmover
-
-# 소스까지 되돌릴 때
-cd ~/dev/hostmover && git checkout <이전커밋> && cargo build --release
+# 소스를 되돌리고 다시 설치
+cd ~/dev/hostmover && git checkout <이전커밋> && ./install-linux.sh
 ```
+
+설치가 복사(`install`)라서 되돌리기도 "옛 커밋으로 다시 설치" 한 번이면 된다.
+별도 `.bak` 을 두지 않는다 — 어느 바이너리가 어느 커밋인지는 §1 의 버전 문자열로 항상 확인된다.
+
+---
+
+## 7. 변경 이력
+
+이 문서가 다루는 **설치·배포 방식 자체가 바뀐 기록.** 기능 변경은 git log 를 본다.
+
+### 2026-08-05 — `~/.local/bin` 설치 + `install-linux.sh` 도입
+
+하루에 같은 증상("앱이 실행 안 된다" / "고쳤는데 옛 버전이 뜬다")을 두 번 겪고 방식을 바꿨다.
+
+| 무엇 | 전 | 후 |
+|---|---|---|
+| 런처 `Exec` | `~/dev/hostmover/target/release/hostmover` | `~/.local/bin/hostmover` |
+| 설치 방법 | `cargo build --release` (런처가 산출물을 직접 실행) | `./install-linux.sh` (복사 설치) |
+| `cargo clean` 후 | 런처 먹통 (§3-0) | 영향 없음 |
+| 독바 캐시 | 옛 바이너리가 계속 뜸 (§3-4) | 옛 경로도 같이 갱신해 무력화 |
+
+- **사고 ①** `target/` 이 재생성(8/2)된 뒤 릴리스 빌드를 안 해 `Exec` 대상 파일이 없었다.
+  `Terminal=false` 라 에러 한 줄 없이 아이콘이 무반응 → §3-0
+- **사고 ②** `~/.local/bin` 으로 옮긴 뒤에도 COSMIC 독바가 옛 `Exec` 을 캐시해,
+  설치 4분 뒤에 띄운 앱이 여전히 옛 커밋 해시를 보여줬다 → §3-4
+- 재발 방지 규칙을 `CLAUDE.md` 에도 박았다: 빌드로 끝내지 말고 `install-linux.sh` 까지 갈 것.
+
+### 2026-07-25 — 버전 문자열을 실행파일에 새김
+
+`build.rs` 가 빌드 시점의 git 커밋/커밋날짜를 `HM_GIT_HASH`/`HM_GIT_DATE` 로 새긴다(§1).
+"고쳤는데 런처에서 안 바뀐다"(§3) 를 눈으로 판별하려고 넣었다. 빌드 시각이 아니라 **커밋 시각**을
+쓰므로 같은 소스는 몇 번을 빌드해도 같은 값이 나온다.

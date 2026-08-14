@@ -70,7 +70,15 @@ cargo build --release
 ./target/release/hostmover
 ```
 
+**런처(앱 아이콘·하단 독바)까지 반영하려면** 직접 빌드하지 말고 설치 스크립트를 쓴다.
+worktree 안에서 실행해도 된다:
+
+```bash
+./install-linux.sh        # 릴리스 빌드 + ~/.local/bin 설치 + 런처/독바 갱신
+```
+
 앱 첫 화면·상단바·로그 첫 줄에 `v0.1.0 (커밋 · 날짜)` 형태로 실행 중인 빌드가 표시된다.
+설치 후 앱을 껐다 켜서 이 해시가 바뀌었는지 확인한다.
 업데이트 절차와 "고쳤는데 런처에서 안 바뀐다" 문제 해결은 **[docs/updating.md](docs/updating.md)** 참고.
 
 ### macOS
