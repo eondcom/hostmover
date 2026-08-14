@@ -1,6 +1,6 @@
-# `*_counter_log` 집계·아카이브 설계 (안 — 미실행)
+# `*_counter_log` 집계·아카이브 설계 및 파일럿 결과
 
-> **상태**: 설계만. 아직 실행 안 함. [`2026-08-14-mars-db-lock-contention.md`](./2026-08-14-mars-db-lock-contention.md)의 InnoDB 전환(락 경합 근본 해결)과는 별개 작업이며, 그쪽이 끝난 뒤 여유를 갖고 진행한다.
+> **상태**: `rokmc_haebyeongcom.hb_counter_log` 파일럿 완료(2026-08-14). 나머지 12개 테이블은 아직 미실행 — §4 참고.
 > **원칙**: 상세 데이터를 그냥 지우지 않는다. "몇 년 몇 월에 몇 건"이라는 집계는 물론, **개별 방문 기록(IP·UA·시각)도 압축된 형태로 계속 보존**하면서 활성(hot) 테이블만 가볍게 만드는 것이 목표.
 
 ## 1. 배경
@@ -26,53 +26,90 @@
 - `ARCHIVE` 엔진 특징: 매우 높은 압축률(이런 narrow-column 로그성 데이터는 보통 원본 대비 큰 폭으로 축소), `INSERT`/`SELECT`만 지원(`UPDATE`/`DELETE` 불가 — 애초에 안 건드릴 데이터라 적합), 인덱스는 PK만. "가끔 조회는 하지만 다시는 안 바꿀 로그"에 정확히 맞는 용도.
 - 세 테이블을 합치면 **원본과 동일한 정보량**을 유지한다 — 상세 조회가 필요하면 archive를, 빠른 통계가 필요하면 summary를, 최근 데이터는 지금처럼 hot 테이블을 쓰면 된다.
 
-## 3. 이관 절차 (사이트 1개 기준, 안)
+## 3. 이관 절차 (실제 검증된 버전 — 파일럿에서 발견한 문제 2건 반영)
+
+파일럿(§4) 도중 아래 절차의 최초 안(v1)에서 실제로 실패했던 두 가지를 먼저 기록한다:
+
+1. **`year_month`는 예약어다.** MySQL/MariaDB의 `INTERVAL ... YEAR_MONTH` 구문에 쓰이는 예약 키워드라 컬럼명으로 못 쓴다(백틱으로 감싸거나 이름을 바꿔야 함). 아래 절차는 `ym`으로 변경.
+2. **`ARCHIVE` 스토리지 엔진이 기본 설치돼 있지 않았다.** `SHOW ENGINES;`에 없었고, 플러그인 파일(`/usr/lib/mysql/plugin/ha_archive.so`)은 있지만 로드가 안 된 상태였음 — `INSTALL SONAME 'ha_archive';`로 최초 1회 활성화 필요(서버 전체에 한 번만 하면 됨, 이후 다른 테이블도 바로 사용 가능).
 
 ```sql
+-- -1) (서버당 최초 1회만) ARCHIVE 엔진 활성화 — SHOW ENGINES로 이미 있으면 스킵
+INSTALL SONAME 'ha_archive';
+
 -- 0) 사전 백업은 InnoDB 전환 때와 동일 (mysqldump, 이미 있으면 재사용)
 
 -- 1) 집계 테이블 생성 및 전체 기간 채우기 (원본 안 건드림, 읽기만)
 CREATE TABLE hb_counter_log_summary (
-  year_month CHAR(7) PRIMARY KEY,   -- 'YYYY-MM'
+  ym CHAR(6) PRIMARY KEY,   -- 'YYYYMM' (regdate가 VARCHAR(14) 'YYYYMMDDHHMMSS' 형식이라 LEFT()로 바로 추출)
   cnt INT UNSIGNED NOT NULL
 ) ENGINE=InnoDB;
 
-INSERT INTO hb_counter_log_summary (year_month, cnt)
-SELECT DATE_FORMAT(regdate, '%Y-%m'), COUNT(*)
+INSERT INTO hb_counter_log_summary (ym, cnt)
+SELECT LEFT(regdate,6), COUNT(*)
 FROM hb_counter_log
-GROUP BY DATE_FORMAT(regdate, '%Y-%m');
+GROUP BY LEFT(regdate,6);
 
--- 2) 아카이브 테이블 생성 (원본과 동일 스키마), 오래된 행 복사 (원본 안 지움 — 아직은 복사만)
-CREATE TABLE hb_counter_log_archive LIKE hb_counter_log;
-ALTER TABLE hb_counter_log_archive ENGINE=ARCHIVE;
+-- 2) 아카이브 테이블 생성 (컬럼만 동일하게 명시 — ARCHIVE는 보조 인덱스 미지원이라 CREATE...LIKE로
+--    인덱스까지 그대로 복사하면 실패하므로 인덱스 없이 새로 정의), 오래된 행 복사
+CREATE TABLE hb_counter_log_archive (
+  site_srl bigint(11) NOT NULL,
+  ipaddress varchar(250) NOT NULL,
+  regdate varchar(14) DEFAULT NULL,
+  user_agent varchar(250) DEFAULT NULL
+) ENGINE=ARCHIVE;
+
+-- 컷오프는 한 번 계산해서 변수/파일에 저장해두고 이후 단계(삭제)에서도 반드시 같은 값을 재사용할 것
+-- (재계산하면 그 사이 시간차만큼 값이 달라져 archive와 delete 대상이 어긋날 수 있음)
+SET @cutoff = DATE_FORMAT(DATE_SUB(NOW(), INTERVAL 3 MONTH), '%Y%m%d%H%i%s');
 
 INSERT INTO hb_counter_log_archive
 SELECT * FROM hb_counter_log
-WHERE regdate < DATE_SUB(NOW(), INTERVAL 6 MONTH);
+WHERE regdate < @cutoff;
 
--- 3) 검증 — 반드시 셋 다 맞아야 다음 단계로 진행
+-- 3) 검증 — 반드시 맞아야 다음 단계로 진행
 --    (archive 행수 + hot에 남을 최근 행수) == 원본 전체 행수
-SELECT COUNT(*) FROM hb_counter_log_archive;                                    -- A
-SELECT COUNT(*) FROM hb_counter_log WHERE regdate >= DATE_SUB(NOW(), INTERVAL 6 MONTH); -- B
-SELECT COUNT(*) FROM hb_counter_log;                                            -- A + B 와 같아야 함(이관 전 원본 전체)
+SELECT
+  (SELECT COUNT(*) FROM hb_counter_log) AS 원본_전체,
+  (SELECT COUNT(*) FROM hb_counter_log_archive) AS 아카이브,
+  (SELECT COUNT(*) FROM hb_counter_log WHERE regdate >= @cutoff) AS 남을것,
+  (SELECT COUNT(*) FROM hb_counter_log_archive) + (SELECT COUNT(*) FROM hb_counter_log WHERE regdate >= @cutoff) AS 합계검산;
 
 -- 4) 검증 통과한 경우에만 — 유일한 실제 삭제 단계 (hot 테이블에서만 삭제, archive엔 이미 보존됨)
-DELETE FROM hb_counter_log WHERE regdate < DATE_SUB(NOW(), INTERVAL 6 MONTH);
+--    @cutoff는 2)에서 쓴 것과 반드시 동일한 값(세션 유지 또는 저장해둔 값 재사용)
+DELETE FROM hb_counter_log WHERE regdate < @cutoff;
 OPTIMIZE TABLE hb_counter_log;   -- 삭제로 생긴 여유 공간을 파일에서도 회수
 ```
 
 - **4번(DELETE)이 유일하게 되돌릴 수 없는 단계**다 — 단, 그 시점엔 이미 archive 테이블에 동일 데이터가 안전하게 있고 2)~3)에서 행수까지 대조 확인한 뒤이므로 실질적 데이터 손실은 없다. 그래도 이 단계 직전에 한 번 더 사람이 확인하고 진행해야 한다.
 
-## 4. 열린 질문 (실행 전 결정 필요)
+## 4. 파일럿 실행 결과 — `rokmc_haebyeongcom.hb_counter_log` (2026-08-14 완료)
 
-1. **보관 기간(hot 테이블에 남길 기간)**: 안은 6개월. 사이트 관리자가 "최근 몇 개월치"를 실제로 조회/통계에 쓰는지 확인 후 조정.
+**보관 기간 결정**: 최초 안(6개월)으로 집계해보니 **2026년 6월에 트래픽이 유독 튀어(690만 건, 다른 달의 5~10배)** 6개월 기준으로도 핫 테이블에 1,165만 행(원본의 66%)이 남아 용량 절감 효과가 작았음. **3개월로 조정**해서 재실행.
+
+| 단계 | 결과 |
+|---|---|
+| 월별 집계(`hb_counter_log_summary`) | 정상 생성, 전체 기간(2021-01 ~ 2026-08) 커버 |
+| 아카이브 이관 (3개월 이전 대상) | 7,073,479행 → `hb_counter_log_archive` |
+| 검증 | 원본 전체(17,681,101) = 아카이브(7,073,479) + 남을 것(10,607,622) — **정확히 일치** |
+| 삭제 직전 재확인 | 삭제 대상 행수(7,073,479) == 이미 아카이브된 행수(7,073,479) — **정확히 일치** |
+| 삭제 실행 | 18초 |
+| 삭제 후 검증 | 남은 행 10,607,636 + 아카이브 7,073,479 ≈ 집계 합계(17,681,100) — 오차 15행은 삭제 진행 중 실시간 방문 트래픽으로 자연 증가(데이터 손실 아님) |
+| OPTIMIZE TABLE | 28초 (InnoDB는 내부적으로 "recreate + analyze"로 처리됨 — 정상 메시지) |
+| **용량 변화** | `hb_counter_log`: 3,290MB → **1,944MB** (41% 감소) / `hb_counter_log_archive`: **113MB**(707만 행이 gzip 압축) / `hb_counter_log_summary`: 1MB 미만 |
+| 사이트 정상 동작 | `haebyeong.com` 301 리다이렉트 정상 응답(0.88초) 재확인 |
+
+**핵심 확인 사항**: ARCHIVE 엔진의 압축률이 기대 이상 — InnoDB로 707만 행을 유지했다면 1GB를 훌쩍 넘었을 것을 113MB로 압축. 전체 디스크 사용량도 3,290MB → 2,057MB(핫+아카이브 합)로 실질 절감됨.
+
+## 5. 열린 질문 (남은 12개 테이블 확대 적용 전 결정 필요)
+
+1. **보관 기간 기준**: 이번엔 3개월로 했지만, 이는 `hb_counter_log`의 트래픽 패턴(6월 폭증)에 맞춘 것 — 테이블마다 트래픽 분포가 다를 수 있으니 나머지 12개도 각각 월별 집계를 먼저 보고 기간을 정하는 게 안전.
 2. **archive 데이터의 조회 경로**: XE/Rhymix 관리자 화면이 `hb_counter_log` 하나만 보고 있다면, 오래된 데이터를 보려면 별도 조회(직접 SQL 또는 관리자 화면에 `UNION` 뷰 추가)가 필요할 수 있음 — 고객이 오래된 방문자 통계를 실제로 UI에서 봐야 하는지 확인 필요.
 3. **고객 고지 여부**: 상세 데이터 자체는 보존되지만 "최근 화면에서 안 보이게" 되는 변화이므로, 사전 고지가 필요한지 판단.
-4. **대상 범위**: [인시던트 문서](./2026-08-14-mars-db-lock-contention.md) §2.3의 13개 테이블 전부 할지, 가장 큰 것(haebyeong.com, pooyas.com 등) 먼저 파일럿으로 할지.
 
-## 5. 진행 순서 (제안)
+## 6. 진행 순서 (남은 12개 테이블)
 
-1. InnoDB 전환(락 경합 해결) 먼저 전부 완료 — 진행 중.
-2. 위 열린 질문 답 정하기(특히 보관 기간, archive 조회 필요 여부).
-3. 가장 큰 테이블 1개(`hb_counter_log`)로 파일럿 — 이관 후 며칠 관찰(사이트 정상 동작, 관리자 통계 화면 이상 없는지).
-4. 문제 없으면 나머지 12개 테이블에 순차 적용.
+1. ~~InnoDB 전환(락 경합 해결)~~ — 완료.
+2. ~~파일럿 1개(`hb_counter_log`)로 절차 검증~~ — 완료, 절차의 버그 2건 수정됨(§3).
+3. 나머지 12개 테이블(`xe_counter_log`(pooyas), `nw_counter_log`, `hb_counter_log`(haebyeongcokr), `mg_counter_log`, `sp_counter_log`, `xe_counter_log`(insoo_bbib/yncare_xe/eond_yncare), `fgsmc_counter_log`, `xe_counter_log`(jjhyanggyo/swslr), `rv_counter_log`) — 각각 월별 집계 먼저 확인 후 보관 기간 정하고 순차 적용.
+4. 며칠 관찰(사이트 정상 동작, 관리자 통계 화면 이상 없는지) 후 완료 처리.
