@@ -126,10 +126,40 @@ OPTIMIZE TABLE hb_counter_log;   -- 삭제로 생긴 여유 공간을 파일에�
 
 **전부 검증 통과**(원본 = 아카이브 + 남을 것, 삭제 후 재확인까지 일치), 에러 없이 완료. `pooyas.com`·`namwon.net`·`yncare.net`·`swslr.com` 등 재확인 결과 전부 정상 응답(0.1~0.4초).
 
-## 6. 진행 순서 — 전체 완료
+## 6. 서버 전체 재조사 후 나머지 13개 테이블 (2026-08-14 완료)
+
+§5까지 처리한 13개(§4 파일럿 1개 + §5 배치 12개)는 애초에 "100MB 이상"으로 뽑았던 우선순위 리스트 기준이었다. 서버 전체를 `%counter_log` 패턴으로 재조사한 결과, 그 기준에 못 미쳐 빠졌던(또는 그사이 커진) 테이블이 더 있었음이 드러났다 — 예: `neosol_sclink`·`neosol_neosol`은 최초 조사 때 1~8MB였으나 재조사 시점엔 100MB 이상으로 성장.
+
+`eond_eond.xe_counter_log`(1,035MB, 운영자 자체 계정)는 **사용자 지시로 이번엔 제외**. 그 외 1만 행 이상인 13개 테이블을 동일 절차(3개월 보관)로 처리(0~2행짜리 빈 테이블 다수는 처리 실익 없어 스킵):
+
+**사전 스키마 점검에서 버그 재발 방지**: 13개 중 `rokmc_hgstudio.rx_counter_log`만 컬럼 구성이 달랐다(`id, site_srl, regdate, ipaddress, user_agent` — PK `id` 컬럼 추가 + 순서도 다름). §5에서 겪은 컬럼 순서 버그를 반복하지 않도록, 이번엔 전 테이블에 대해 사전에 컬럼 순서를 조회하고 **모든 INSERT에 컬럼명을 명시**(`INSERT INTO archive (site_srl, ipaddress, regdate, user_agent) SELECT site_srl, ipaddress, regdate, user_agent FROM ...`)해서 실행 — 13개 전부 에러 없이 성공.
+
+| 테이블 | 원본 행수 | 남은 행수 | 아카이브 행수 | 비고 |
+|---|---:|---:|---:|---|
+| oracall_jslocal.rx_counter_log | 2,135,693 | 214,634 | 1,921,060 | |
+| neosol_sclink.xe_counter_log | 577,223 | 89,293 | 487,930 | |
+| neosol_neosol.xe_counter_log | 568,508 | 393,122 | 175,386 | |
+| daoom_daoom.xe_counter_log | 388,751 | 117,162 | 271,589 | |
+| itmang_itmang.xe_counter_log | 222,571 | 0 | 222,571 | 최근 3개월 활동 없음 |
+| hani_hani.xe_counter_log | 218,032 | 47,205 | 170,827 | allofhani.com |
+| rokmc_ibsq.iq_counter_log | 197,739 | 28,804 | 168,935 | |
+| rokmc_hanjischool.hs_counter_log | 153,231 | 20,402 | 132,829 | |
+| oracall_dev.rx_counter_log | 79,490 | 0 | 79,490 | 최근 3개월 활동 없음 |
+| rokmc_jbmice.rx_counter_log | 26,858 | 5,214 | 21,644 | |
+| rokmc_hgstudio.rx_counter_log | 16,720 | 14,363 | 2,357 | 스키마 다름(§6 참고), 정상 처리됨 |
+| eond_aithres.rx_counter_log | 12,443 | 0 | 12,443 | 최근 3개월 활동 없음 |
+| rokmc_dmovie.rx_counter_log | 12,118 | 2,249 | 9,869 | |
+
+전부 검증 통과(원본 = 아카이브 + 남을 것). `jslocal.org`·`itmang.co.kr`·`allofhani.com` 재확인 정상(200 OK).
+
+**서버 전체 counter_log 현황(2026-08-14 기준)**: 유의미한 크기의 테이블은 `eond_eond.xe_counter_log`(1,035MB, 미처리·제외됨) 1개만 남았다. 나머지는 전부 처리했거나(총 §4+§5+§6 = 26개 테이블, 약 3,780만 행 아카이브) 원래 빈 테이블(0~2행)이라 처리 불필요.
+
+## 7. 진행 순서 — 전체 완료
 
 1. ~~InnoDB 전환(락 경합 해결)~~ — 완료.
 2. ~~파일럿 1개(`hb_counter_log`)로 절차 검증~~ — 완료, 버그 2건 수정(§3).
-3. ~~나머지 12개 테이블 일괄 적용~~ — 완료, 추가 버그 1건 수정(§5).
-4. 며칠 관찰(사이트 정상 동작, 관리자 통계 화면 이상 없는지) — 남은 할 일. 특히 `eond_yncare`(핫 테이블 0행)처럼 극단적으로 줄어든 곳은 관리자 화면에서 "최근 방문자 없음"으로 보이는 게 맞는지 확인 필요.
-5. §5의 열린 질문(archive 조회 경로, 고객 고지 여부)은 여전히 미결 — 필요 시 별도 진행.
+3. ~~우선순위 12개 테이블 일괄 적용~~ — 완료, 추가 버그 1건 수정·문서화(§5).
+4. ~~서버 전체 재조사 후 나머지 13개(eond_eond 제외)~~ — 완료, 스키마 사전 점검으로 버그 재발 방지(§6).
+5. 며칠 관찰(사이트 정상 동작, 관리자 통계 화면 이상 없는지) — 남은 할 일. 특히 `eond_yncare`·`itmang_itmang`·`oracall_dev`·`eond_aithres`처럼 핫 테이블이 0행이 된 곳은 관리자 화면에서 "최근 방문자 없음"으로 보이는 게 맞는지 확인 필요.
+6. `eond_eond.xe_counter_log`(1,035MB) — 사용자 지시로 제외한 상태. 필요 시 별도 진행.
+7. §5의 열린 질문(archive 조회 경로, 고객 고지 여부)은 여전히 미결 — 필요 시 별도 진행.
