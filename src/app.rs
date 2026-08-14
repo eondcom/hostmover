@@ -157,6 +157,18 @@ fn dashboard_stat_card(ui: &mut egui::Ui, index: usize, stats: &LocalStats, cach
     go_all
 }
 
+/// mailto: 링크용 최소 percent-encoding (RFC 3986 unreserved 문자만 그대로 둔다).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn server_snapshot_from_markers(values: &HashMap<String, String>) -> ServerSnapshot {
     let get = |key: &str| values.get(key).cloned().unwrap_or_default();
     ServerSnapshot {
@@ -186,6 +198,8 @@ fn server_snapshot_from_markers(values: &HashMap<String, String>) -> ServerSnaps
         php_vers: get("PHPVERS"),
         php_vern: get("PHPVERN"),
         sock_dup: get("SOCKDUP"),
+        myisam_count: get("MYISAM_COUNT"),
+        myisam_mb: get("MYISAM_MB"),
     }
 }
 
@@ -388,6 +402,13 @@ fn grade_items(store: &Store) -> Vec<(String, Grade, bool, String)> {
             let grade = match bad { 0 => Grade::A, 1 => Grade::D, _ => Grade::E };
             items.push(("PHP-FPM".into(), grade, false, format!("PHP-FPM {}개 중 실패 {bad}개", s.phpfpm)));
         }
+        if let (Ok(cnt), Ok(mb)) = (s.myisam_count.parse::<u32>(), s.myisam_mb.parse::<u32>()) {
+            // MyISAM은 테이블 단위 락이라 개수보다 용량(=락 지속시간·경합 확률)이 위험도에 직결된다.
+            let grade = percent_grade(mb, [1, 100, 500, 2000]);
+            items.push(("DB 엔진".into(), grade, false,
+                if cnt == 0 { "MyISAM 테이블 없음 — 전부 InnoDB".into() }
+                else { format!("MyISAM 테이블 {cnt}개 · {mb}MB (기준: A=0 B<100 C<500 D<2000 E≥2000MB) — 락 경합으로 응답 지연을 일으킬 수 있음") }));
+        }
         let monitor_grade = if s.diskmon != "1" { Grade::C }
             else if diskmon_last_at(s).is_some_and(|at| now_unix() - at > 36 * 3600) { Grade::B }
             else { Grade::A };
@@ -467,6 +488,11 @@ fn advisories(store: &Store) -> Vec<(String, Option<&'static str>)> {
         }
         if s.diskmon == "0" { out.push(("디스크 자동 감시가 설치되지 않았습니다".into(), Some("디스크 점검"))); }
         if s.trafficmon == "0" { out.push(("트래픽 감시가 설치되지 않았습니다".into(), None)); }
+        if let Ok(mb) = s.myisam_mb.parse::<u32>() {
+            if mb >= 100 {
+                out.push((format!("MyISAM 테이블 {}개 · {mb}MB — 테이블 단위 락이라 트래픽이 몰리면 사이트가 느려질 수 있습니다. InnoDB 전환은 스키마·데이터 확인이 필요한 작업이라 이 화면에서 자동으로 하지 않습니다.", s.myisam_count), Some("eond에 문의")));
+            }
+        }
     }
     if store.domain_health.is_empty() {
         out.push(("도메인 헬스를 아직 점검하지 않았습니다 — 서버가 멀쩡해도 개별 사이트는 죽어 있을 수 있습니다".into(), Some("도메인 점검")));
@@ -1306,6 +1332,12 @@ impl App {
                 if phpfpm_bad > 0 {
                     alerts.push((format!("PHP-FPM 실패 {phpfpm_bad}개"), color::DANGER, "PHP-FPM 진단"));
                 }
+                let myisam_mb = snapshot.myisam_mb.parse::<u32>().unwrap_or(0);
+                if myisam_mb >= 2000 {
+                    alerts.push((format!("MyISAM 테이블 {}MB — 락 경합으로 사이트 응답 지연 위험", myisam_mb), color::DANGER, "서버 설정"));
+                } else if myisam_mb >= 500 {
+                    alerts.push((format!("MyISAM 테이블 {}MB", myisam_mb), color::WARN, "서버 설정"));
+                }
                 let disk = snapshot.disk_max.parse::<u32>().unwrap_or(0);
                 if disk >= 95 {
                     alerts.push((format!("디스크 {}% ({})", snapshot.disk_max, snapshot.disk_max_mp), color::DANGER, "디스크 점검"));
@@ -1359,6 +1391,19 @@ impl App {
                                         "디스크 점검" | "점검 기록 보기" => go_disk = true,
                                         "PHP-FPM 진단" => go_php = true,
                                         "도메인 점검" => do_domain_health = true,
+                                        "eond에 문의" => {
+                                            let host = if snapshot.host.is_empty() { "서버" } else { &snapshot.host };
+                                            let subject = format!("[hostmover] {host} MyISAM 전환 문의");
+                                            let body = format!(
+                                                "서버: {host}\nMyISAM 테이블: {}개, {}MB\n\n전환 검토 부탁드립니다.",
+                                                snapshot.myisam_count, snapshot.myisam_mb
+                                            );
+                                            let url = format!(
+                                                "mailto:eond@eond.com?subject={}&body={}",
+                                                urlencode(&subject), urlencode(&body)
+                                            );
+                                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                                        }
                                         _ => {}
                                     }
                                 }

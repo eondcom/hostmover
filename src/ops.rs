@@ -2247,6 +2247,27 @@ echo "HM_DASH_SVCFAIL=$(echo $SVCFAIL | sed 's/^ *//')"
 echo "HM_DASH_PHPFPM=$NPHP"
 echo "HM_DASH_PHPFPMBAD=$NPHPBAD"
 
+echo "[DB 엔진]"
+MYISAM_CNT=""; MYISAM_MB=""
+if command -v mysql >/dev/null 2>&1; then
+  MYISAM_ROW=$(mysql -N -B -e "SELECT COUNT(*), IFNULL(ROUND(SUM(data_length+index_length)/1024/1024),0) FROM information_schema.tables WHERE ENGINE='MyISAM' AND TABLE_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null)
+  if [ -n "$MYISAM_ROW" ]; then
+    MYISAM_CNT=$(printf '%s' "$MYISAM_ROW" | awk '{print $1}')
+    MYISAM_MB=$(printf '%s' "$MYISAM_ROW" | awk '{print $2}')
+  fi
+fi
+if [ -n "$MYISAM_CNT" ]; then
+  if [ "$MYISAM_CNT" = 0 ]; then
+    echo "  MyISAM 테이블 없음 (전부 InnoDB)"
+  else
+    echo "  MyISAM 테이블 ${MYISAM_CNT}개 · ${MYISAM_MB}MB — 테이블 단위 락이라 트래픽 몰리면 응답 지연 원인이 될 수 있음"
+  fi
+else
+  echo "  (mysql 클라이언트 없음 또는 조회 실패)"
+fi
+echo "HM_DASH_MYISAM_COUNT=${MYISAM_CNT}"
+echo "HM_DASH_MYISAM_MB=${MYISAM_MB}"
+
 echo "[HestiaCP]"
 if [ -x "$VBIN/v-list-users" ]; then
   NU=$("$VBIN/v-list-users" plain 2>/dev/null | grep -c .)
@@ -5024,7 +5045,7 @@ mod tests {
         assert_eq!(SERVER_SNAPSHOT_BODY.matches("HM_DASH_DISKMON_LAST_TS=").count(), 2,
             "설치·미설치 양쪽 분기에서 epoch 마커를 출력해야 함");
         assert!(SERVER_SNAPSHOT_BODY.contains("date -d \"$DL\" +%s"));
-        for marker in ["DISKRATE", "DISKETA", "DISKSPAN", "BACKUPSAME", "BACKUPSRC", "PHPVERS", "PHPVERN", "SOCKDUP"] {
+        for marker in ["DISKRATE", "DISKETA", "DISKSPAN", "BACKUPSAME", "BACKUPSRC", "PHPVERS", "PHPVERN", "SOCKDUP", "MYISAM_COUNT", "MYISAM_MB"] {
             assert!(SERVER_SNAPSHOT_BODY.contains(&format!("HM_DASH_{marker}=")), "추이 마커 누락: {marker}");
         }
         assert!(SERVER_SNAPSHOT_BODY.contains("HM_DISK %s %s %s %s %s %s %s %s %s %s"));

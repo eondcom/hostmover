@@ -141,6 +141,10 @@ pub struct ServerSnapshot {
     #[serde(default)] pub php_vers: String,
     #[serde(default)] pub php_vern: String,
     #[serde(default)] pub sock_dup: String,
+    /// MySQL/MariaDB 전체에서 MyISAM 엔진으로 남은 테이블 수(고객 DB만, 시스템 스키마 제외).
+    #[serde(default)] pub myisam_count: String,
+    /// 그 테이블들의 총 용량(MB). MyISAM은 테이블 단위 락이라 용량이 클수록 락 경합 위험이 큼.
+    #[serde(default)] pub myisam_mb: String,
 }
 
 /// 재시작 시 복원할 마지막 화면 위치 (인덱스 대신 id 로 저장해 정렬/추가에도 안정적)
