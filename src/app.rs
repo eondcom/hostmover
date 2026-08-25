@@ -3347,6 +3347,48 @@ impl App {
                                 }
                             });
                         });
+                        ui.add_space(6.0);
+                        card(ui, |ui| {
+                            ui.strong(format!("{}  진단 (설치가 안 됐거나 화면이 안 뜰 때)", ph::STETHOSCOPE));
+                            ui.label(egui::RichText::new("서비스·포트·환경변수·DB연결·에러로그를 한 번에 수집. 읽기 전용이라 아무것도 바꾸지 않는다.").weak());
+                            ui.label(egui::RichText::new("비밀번호는 *** 로 가려서 출력하므로 결과를 그대로 공유해도 안전.").weak());
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!running, egui::Button::new(format!("{}  진단 실행", ph::STETHOSCOPE)).min_size(egui::vec2(150.0, 0.0)))
+                                    .on_hover_text("앱이 실제로 본 DATABASE_URL 과 .env 를 해시로 비교하고, pymysql/aiomysql 양쪽으로 DB 접속을 시험한다")
+                                    .clicked()
+                                {
+                                    eond_step = Some((5, true));
+                                }
+                                if ui.button(ph::FILE_TEXT).on_hover_text("명령어 보기").clicked() {
+                                    eond_step = Some((5, false));
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                        card(ui, |ui| {
+                            ui.strong(format!("{}  DB 스키마 (Unknown column 오류가 날 때)", ph::DATABASE));
+                            ui.label(egui::RichText::new("③ 은 alembic stamp head 로 표시만 하고 마이그레이션을 돌리지 않는다. create_all 은 이미 있는 테이블(Rhymix xe_*)에 컬럼을 추가하지 못해, 나중에 추가된 컬럼이 빠진 채로 남는다.").weak());
+                            ui.label(egui::RichText::new("모델과 실제 테이블을 대조해 누락 컬럼을 찾는다. NULL 허용 컬럼만 자동 추가하고, NOT NULL·기본값 없는 것은 목록만 보여준다.").weak());
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!running, egui::Button::new(format!("{}  스키마 점검", ph::MAGNIFYING_GLASS)).min_size(egui::vec2(150.0, 0.0)))
+                                    .on_hover_text("읽기 전용 — 누락 컬럼과 실행될 ALTER 문만 출력한다")
+                                    .clicked()
+                                {
+                                    eond_step = Some((6, true));
+                                }
+                                if ui.add_enabled(!running, btn_primary(format!("{}  스키마 복구(적용)", ph::DATABASE)).min_size(egui::vec2(170.0, 0.0)))
+                                    .on_hover_text("누락 컬럼을 실제로 추가하고 서비스를 재시작한다. 먼저 점검으로 내용을 확인할 것")
+                                    .clicked()
+                                {
+                                    eond_step = Some((7, true));
+                                }
+                                if ui.button(ph::FILE_TEXT).on_hover_text("명령어 보기 (적용)").clicked() {
+                                    eond_step = Some((7, false));
+                                }
+                            });
+                        });
                     }
                     // ───────── 작업 기록 ─────────
                     Tab::History => {
@@ -3443,14 +3485,40 @@ impl App {
 
             // eondcms 설치 단계 처리 (별도 빌더, EondInstall 사용)
             if let Some((step, run)) = eond_step {
-                let dom = &self.store.customers[ci].domains[di];
-                let eond = dom.eond.clone();
-                let server = if eond.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
-                let dn = dom.name.clone();
+                let (mut eond, mut server, dn) = {
+                    let dom = &self.store.customers[ci].domains[di];
+                    let eond = dom.eond.clone();
+                    let server = if eond.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                    (eond, server, dom.name.clone())
+                };
+                // 도메인(ASIS/TOBE)에 루트 계정이 비어 있으면 전역 설정의 SSH 계정
+                // (설정 탭의 "SSH 유저" — root 직접 로그인 대신 쓰는 sudo 권한 계정, 예: tong)으로
+                // 폴백한다. 이게 없으면 Site::login_id() 가 조용히 FTP 계정으로 내려가
+                // 'xxx is not in the sudoers file' 로 끝난다 (2026-08-25 진단 실행 실패).
+                if self.use_root && server.root_id.trim().is_empty() {
+                    let u = self.store.settings.ssh_user.trim().to_string();
+                    let p = self.store.settings.ssh_pass.clone();
+                    let sp = self.store.settings.ssh_port.trim().to_string();
+                    if !u.is_empty() {
+                        server.root_id = u.clone();
+                        server.root_pw = p;
+                        if server.ssh_port.trim().is_empty() && !sp.is_empty() {
+                            server.ssh_port = sp;
+                        }
+                        // 전역 SSH 계정은 sudo 권한 계정 전제이므로 sudo 경유로 실행한다
+                        eond.sudo = true;
+                        self.log.push(format!(
+                            "eondcms: 도메인 루트 계정이 비어 전역 SSH 계정 '{u}' 으로 sudo 경유 접속합니다"
+                        ));
+                    }
+                }
                 let built = match step {
                     1 => ops::build_eondcms_resources(&server, &eond, &dn, self.use_root),
                     2 => ops::build_eondcms_upload(&server, &eond, &dn, self.use_root),
                     3 => ops::build_eondcms_finalize(&server, &eond, &dn, self.use_root),
+                    5 => ops::build_eondcms_diagnose(&server, &eond, &dn, self.use_root),
+                    6 => ops::build_eondcms_schema_fix(&server, &eond, &dn, self.use_root, false),
+                    7 => ops::build_eondcms_schema_fix(&server, &eond, &dn, self.use_root, true),
                     _ => ops::build_eondcms_update(&server, &eond, &dn, self.use_root),
                 };
                 match built {
