@@ -1031,6 +1031,9 @@ PYTMP=$(mktemp /tmp/hm-schema-XXXXXX.py) || exit 1
 trap 'rm -f "$PYTMP"' EXIT
 cat > "$PYTMP" <<'PYEOF'
 import importlib, os, pkgutil, re, sys
+# 이 파일은 /tmp 에 있으므로 sys.path[0] 가 /tmp 가 된다(cwd 가 아니다).
+# APPDIR 을 직접 얹어야 app.* 를 import 할 수 있다.
+sys.path.insert(0, os.environ.get('HM_APPDIR') or os.getcwd())
 import sqlalchemy as sa
 from sqlalchemy.schema import CreateColumn
 from app.config import settings
@@ -1105,12 +1108,15 @@ print('')
 print('  완료: 컬럼 %d/%d 개 추가' % (ok, len(miss_c)))
 PYEOF
 chmod 644 "$PYTMP"
-sudo -u "$VUSER" bash -lc "cd '$APPDIR' && HM_APPLY='$HM_APPLY' .venv/bin/python '$PYTMP'" 2>&1 | grep -v "Event loop is closed"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && HM_APPLY='$HM_APPLY' HM_APPDIR='$APPDIR' PYTHONPATH='$APPDIR' .venv/bin/python '$PYTMP'" 2>&1 | grep -v "Event loop is closed"
 RC=${PIPESTATUS[0]}
-if [ "$HM_APPLY" = "1" ]; then
+if [ "$HM_APPLY" = "1" ] && [ "$RC" = "0" ]; then
   echo
   echo "-- 서비스 재시작 (새 스키마 반영) --"
   systemctl restart "eondcms-$VUSER" && echo "재시작 완료" || echo "※ 재시작 실패 - 권한 확인"
+elif [ "$HM_APPLY" = "1" ]; then
+  echo
+  echo "※ 스키마 적용이 실패해 재시작을 건너뛴다 (위 오류 확인)"
 fi
 echo
 echo "===== 끝 ====="
