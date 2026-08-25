@@ -573,7 +573,47 @@ echo "리소스 OK (DB=$FULLDB)"; ls -ld "/home/$VUSER/web/$DOMAIN" 2>/dev/null 
     })
 }
 
+/// ② 업로드 직후 서버에서 돌리는 문법 검사 스크립트.
+///
+/// 개발 PC 의 파이썬이 서버보다 최신이면(3.12 vs 3.11) 로컬에서 멀쩡한 코드가 서버에서만
+/// SyntaxError 로 죽는다 — 2026-08-25 f-string 안 백슬래시(PEP 701, 3.12+) 사고. 그때는
+/// ③ 까지 다 돌고 나서야 uvicorn 이 기동 실패하는 걸로 알게 됐다.
+/// 여기서 배포 대상 인터프리터로 직접 파싱해 ③ 이전에 잡는다.
+/// compileall 대신 ast.parse 를 쓴다 — 검사 결과가 같으면서 __pycache__ 를 남기지 않는다.
+const EONDCMS_SYNTAX_CHECK: &str = r#"PY=python3.11
+command -v "$PY" >/dev/null 2>&1 || PY=python3
+echo "[문법 검사] 서버 $("$PY" -V 2>&1) 로 업로드된 코드를 파싱"
+"$PY" - <<'PYEOF'
+import ast, pathlib, sys
+crit, warn = [], []
+for root in ('app', 'alembic', 'scripts'):
+    d = pathlib.Path(root)
+    if not d.is_dir():
+        continue
+    for p in sorted(d.rglob('*.py')):
+        if '__pycache__' in p.parts:
+            continue
+        try:
+            ast.parse(p.read_text(encoding='utf-8', errors='replace'), filename=str(p))
+        except SyntaxError as e:
+            (crit if root == 'app' else warn).append('%s:%s: %s' % (p, e.lineno, e.msg))
+        except Exception as e:
+            warn.append('%s: %s' % (p, e))
+for m in warn:
+    print('  경고(앱 기동엔 무관) %s' % m)
+for m in crit:
+    print('  [X] %s' % m)
+if crit:
+    print('')
+    print('[X] app/ 에 문법 오류 %d 건 - 이 코드로 3 을 실행하면 앱이 기동하지 못한다.' % len(crit))
+    print('    개발 PC 파이썬이 서버보다 최신이면 3.12 전용 문법이 섞일 수 있다.')
+    print('    로컬 확인: ruff check .   (pyproject 의 target-version 을 서버 버전에 맞출 것)')
+    sys.exit(1)
+print('  문법 검사 통과')
+PYEOF"#;
+
 /// ② 코드 업로드 (dev → 서버 $APPDIR, rsync push). root 로 올리고 ③에서 chown.
+/// 업로드 후 서버 파이썬으로 문법 검사까지 하고, 실패하면 non-zero 로 끝나 ③ 진행을 막는다.
 pub fn build_eondcms_upload(server: &Site, eond: &EondInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
     eondcms_validate(server, eond, use_root)?;
     if eond.code_local.trim().is_empty() { return Err("코드 소스 경로(code_local)가 비어 있습니다".into()); }
@@ -592,12 +632,20 @@ pub fn build_eondcms_upload(server: &Site, eond: &EondInstall, domain_name: &str
         src = sq(src), sshopt = sq(&ssh_e(server)),
         user = sq(server.login_id(use_root)), host = sq(server.ip.trim()), staging = sq(&staging),
     );
+    // 업로드된 코드를 서버 파이썬으로 파싱해 본다. 실패하면 ssh 가 non-zero 로 끝나므로
+    // 이 단계가 통째로 실패 처리되고, 사용자는 ③ 을 돌리기 전에 알게 된다.
+    let script = format!(
+        "{script}\necho\ncat <<'HM_SYNTAX' | sshpass -e {ssh} {user}@{host} \"bash -s\"\ncd {staging} || exit 1\n{check}\nHM_SYNTAX\n",
+        script = script, ssh = ssh_e(server),
+        user = sq(server.login_id(use_root)), host = sq(server.ip.trim()),
+        staging = sq(&staging), check = EONDCMS_SYNTAX_CHECK,
+    );
     Ok(Job {
         title: format!("eondcms ② 코드 업로드 : {domain_name}"),
         script,
         sshpass: server.login_pw(use_root).to_string(),
         env: Vec::new(),
-        note: format!("{src}/ → {staging}/ (.rsyncignore 적용, mobile/venv/node_modules 제외). ③에서 $APPDIR 복사"),
+        note: format!("{src}/ → {staging}/ (.rsyncignore 적용) + 서버 파이썬으로 문법 검사. ③에서 $APPDIR 복사"),
     })
 }
 
