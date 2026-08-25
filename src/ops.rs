@@ -740,7 +740,12 @@ echo "-- ② alembic stamp head (모델=최신 기준으로 표시) --"
 sudo -u "$VUSER" bash -lc "cd '$APPDIR' && .venv/bin/alembic stamp head" && echo "stamp head OK"
 echo "-- eond_projects 존재 확인 --"
 sudo -u "$VUSER" bash -lc "cd '$APPDIR' && .venv/bin/alembic current" 2>/dev/null || true
-echo "-- 관리자 비번 세팅 (.env ADMIN_PASSWORD → <prefix>member, seed의 *LOCKED* 해소) --"
+"#;
+    // stamp head 는 마이그레이션을 실행하지 않고 표시만 한다. create_all 도 이미 있는
+    // 테이블에는 컬럼을 못 넣으므로, Rhymix seed 로 들어온 xe_* 와 구식 eond_schema.sql 로
+    // 만들어진 eond_* 에 모델의 새 컬럼이 빠진 채 남는다. 여기서 모델과 대조해 보강한다.
+    // (2026-08-25: xe_member.signup_referrer / eond_orders.quantity 누락으로 로그인 전부 503)
+    let body1_tail = r#"echo "-- 관리자 비번 세팅 (.env ADMIN_PASSWORD → <prefix>member, seed의 *LOCKED* 해소) --"
 sudo -u "$VUSER" bash -lc "cd '$APPDIR' && .venv/bin/python -c \"import re,sqlalchemy as sa; from app.config import settings; from app.routers.auth import _hash_password_bcrypt as H; e=sa.create_engine(re.sub('[+]aiomysql','+pymysql',settings.database_url)); c=e.connect(); r=c.execute(sa.text('UPDATE '+settings.table_prefix+'member SET password=:p WHERE user_id=:u'),{'p':H(settings.admin_password),'u':settings.admin_username}); c.commit(); print('admin 비번 세팅 행수:', r.rowcount, settings.admin_username)\"" \
   || echo "※ 관리자 비번 세팅 실패 — 수동 필요(아래 안내)"
 echo "-- systemd --"
@@ -791,7 +796,12 @@ echo "-- 최종 확인 --"
 curl -sI "https://$DOMAIN" 2>/dev/null | head -1 || true
 echo "== eondcms 설치 완료: https://$DOMAIN (관리자 $ADMINU) =="
 "#;
-    let remote = eondcms_finalize_remote(&head, body1, body2);
+    let mut b1 = String::from(body1);
+    b1.push_str("echo \"-- 모델 <-> 실제 스키마 대조 (stamp head 가 건너뛴 컬럼 보강) --\"\n");
+    b1.push_str(&eondcms_schema_block(true));
+    b1.push_str("[ \"$SCHEMA_RC\" = \"0\" ] || echo \"※ 스키마 보강 실패 - 설치 후 [DB 스키마 점검] 으로 확인할 것\"\n");
+    b1.push_str(body1_tail);
+    let remote = eondcms_finalize_remote(&head, &b1, body2);
     let (script, sshpass, env) = eondcms_exec(server, &remote, use_root, eond.sudo);
     Ok(Job {
         title: format!("eondcms ③ 설치 마무리 : {domain_name}"),
@@ -1003,34 +1013,10 @@ echo "※ [6] 양쪽 OK 인데 [10] 이 503 → 앱 기동 시점의 커넥션 �
     })
 }
 
-/// 🛠 DB 스키마 복구: SQLAlchemy 모델과 실제 테이블을 대조해 누락 컬럼을 채운다.
-///
-/// ③ 은 `alembic stamp head` 로 "이미 최신"이라고 표시만 하고 마이그레이션을 실행하지 않는다.
-/// eond_ 테이블은 create_all 이 만들어주지만, create_all 은 **이미 있는 테이블에 컬럼을 추가하지
-/// 않는다.** 그래서 Rhymix seed 로 들어온 xe_* 테이블에 eondcms 가 나중에 추가한 컬럼
-/// (alembic 마이그레이션에만 있는 것)이 영영 생기지 않는다.
-/// 2026-08-25: `Unknown column 'xe_member.signup_referrer'` 로 로그인이 전부 503.
-///
-/// NULL 허용 컬럼만 자동으로 추가한다. NOT NULL 인데 기본값이 없는 컬럼은 기존 행을 깨뜨릴 수
-/// 있어 사람이 판단하도록 목록만 출력한다. 실행하는 SQL 은 전부 찍는다.
-pub fn build_eondcms_schema_fix(server: &Site, eond: &EondInstall, domain_name: &str, use_root: bool, apply: bool) -> Result<Job, String> {
-    eondcms_validate(server, eond, use_root)?;
-    let domain = to_ascii_domain(domain_name);
-    let head = format!(
-        "export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/local/mysql/bin\"\nVUSER={u}\nDOMAIN={d}\nHM_APPLY={a}\n",
-        u = sq(eond.hestia_user.trim()), d = sq(&domain), a = if apply { "1" } else { "0" },
-    );
-    let body = r#"APPDIR=/home/$VUSER/web/$DOMAIN/pythonapp
-export HM_APPLY
-if [ ! -f "$APPDIR/app/main.py" ]; then echo "코드 없음: $APPDIR"; exit 1; fi
-if [ "$HM_APPLY" = "1" ]; then echo "===== DB 스키마 복구 (적용) : $DOMAIN ====="; else echo "===== DB 스키마 점검 (읽기 전용) : $DOMAIN ====="; fi
-# 파이썬 코드는 반드시 quoted heredoc 으로 임시 파일에 쓴다.
-# bash -lc "..." 의 큰따옴표 안에 넣으면 SQL 식별자를 감싼 백틱을 바깥 셸이 명령 치환으로
-# 해석해 ALTER TABLE 문에서 테이블명이 통째로 사라진다 (실측 확인).
-PYTMP=$(mktemp /tmp/hm-schema-XXXXXX.py) || exit 1
-trap 'rm -f "$PYTMP"' EXIT
-cat > "$PYTMP" <<'PYEOF'
-import importlib, os, pkgutil, re, sys
+/// 모델 metadata 와 실제 테이블을 대조해 누락 컬럼을 찾는 파이썬 스크립트.
+/// ③ 설치 마무리와 🛠 스키마 도구가 **같은 코드**를 쓴다 (한쪽만 고쳐져 어긋나는 걸 막는다).
+/// HM_APPLY=1 이면 실제로 ALTER 를 실행하고, 아니면 목록과 ALTER 문만 출력한다.
+const EONDCMS_SCHEMA_PY: &str = r#"import importlib, os, pkgutil, re, sys
 # 이 파일은 /tmp 에 있으므로 sys.path[0] 가 /tmp 가 된다(cwd 가 아니다).
 # APPDIR 을 직접 얹어야 app.* 를 import 할 수 있다.
 sys.path.insert(0, os.environ.get('HM_APPDIR') or os.getcwd())
@@ -1106,22 +1092,78 @@ with eng.begin() as conn:
             print('    실패: %s' % str(e)[:160])
 print('')
 print('  완료: 컬럼 %d/%d 개 추가' % (ok, len(miss_c)))
-PYEOF
-chmod 644 "$PYTMP"
-sudo -u "$VUSER" bash -lc "cd '$APPDIR' && HM_APPLY='$HM_APPLY' HM_APPDIR='$APPDIR' PYTHONPATH='$APPDIR' .venv/bin/python '$PYTMP'" 2>&1 | grep -v "Event loop is closed"
-RC=${PIPESTATUS[0]}
-if [ "$HM_APPLY" = "1" ] && [ "$RC" = "0" ]; then
+"#;
+
+/// 위 파이썬을 실행하는 bash 블록을 조립한다. `$VUSER`/`$APPDIR` 이 정의된 문맥에서 쓴다.
+/// 결과 종료코드는 `$SCHEMA_RC` 로 남긴다.
+///
+/// 파이썬 코드는 반드시 quoted heredoc 으로 임시 파일에 쓴다. `bash -lc "..."` 의 큰따옴표
+/// 안에 넣으면 SQL 식별자를 감싼 백틱을 바깥 셸이 명령 치환으로 해석해, ALTER TABLE 문에서
+/// 테이블명이 통째로 사라진다 (실측 확인).
+fn eondcms_schema_block(apply: bool) -> String {
+    let mut s = String::new();
+    s.push_str("PYTMP=$(mktemp /tmp/hm-schema-XXXXXX.py) || exit 1\n");
+    s.push_str("cat > \"$PYTMP\" <<'PYEOF'\n");
+    s.push_str(EONDCMS_SCHEMA_PY);
+    s.push_str("PYEOF\n");
+    s.push_str("chmod 644 \"$PYTMP\"\n");
+    // ③ 은 set -e 로 돈다. 파이프라인이 실패하면 SCHEMA_RC 를 담기도 전에 스크립트가 끊기므로
+    // 이 구간만 끄고 종료코드를 직접 챙긴다(grep 은 걸러낼 줄이 없으면 1 을 반환한다).
+    s.push_str("set +e\n");
+    // python /tmp/x.py 는 sys.path[0] 가 /tmp 가 되므로 PYTHONPATH 로 APPDIR 을 얹어야 한다.
+    s.push_str(&format!(
+        "sudo -u \"$VUSER\" bash -lc \"cd '$APPDIR' && HM_APPLY={a} HM_APPDIR='$APPDIR' PYTHONPATH='$APPDIR' .venv/bin/python '$PYTMP'\" 2>&1 | grep -v 'Event loop is closed'\n",
+        a = if apply { "1" } else { "0" },
+    ));
+    s.push_str("SCHEMA_RC=${PIPESTATUS[0]}\n");
+    s.push_str("set -e\n");
+    s.push_str("rm -f \"$PYTMP\"\n");
+    s
+}
+
+/// 🛠 DB 스키마 복구: SQLAlchemy 모델과 실제 테이블을 대조해 누락 컬럼을 채운다.
+///
+/// ③ 은 `alembic stamp head` 로 "이미 최신"이라고 표시만 하고 마이그레이션을 실행하지 않는다.
+/// eond_ 테이블은 create_all 이 만들어주지만, create_all 은 **이미 있는 테이블에 컬럼을 추가하지
+/// 않는다.** 그래서 Rhymix seed 로 들어온 xe_* 테이블에 eondcms 가 나중에 추가한 컬럼
+/// (alembic 마이그레이션에만 있는 것)이 영영 생기지 않는다.
+/// 2026-08-25: `Unknown column 'xe_member.signup_referrer'` 로 로그인이 전부 503.
+///
+/// NULL 허용 컬럼만 자동으로 추가한다. NOT NULL 인데 기본값이 없는 컬럼은 기존 행을 깨뜨릴 수
+/// 있어 사람이 판단하도록 목록만 출력한다. 실행하는 SQL 은 전부 찍는다.
+pub fn build_eondcms_schema_fix(server: &Site, eond: &EondInstall, domain_name: &str, use_root: bool, apply: bool) -> Result<Job, String> {
+    eondcms_validate(server, eond, use_root)?;
+    let domain = to_ascii_domain(domain_name);
+    let head = format!(
+        "export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/local/mysql/bin\"\nVUSER={u}\nDOMAIN={d}\n",
+        u = sq(eond.hestia_user.trim()), d = sq(&domain),
+    );
+    let mut body = String::from(
+        r#"APPDIR=/home/$VUSER/web/$DOMAIN/pythonapp
+if [ ! -f "$APPDIR/app/main.py" ]; then echo "코드 없음: $APPDIR (먼저 ② 코드 업로드)"; exit 1; fi
+"#,
+    );
+    body.push_str(if apply {
+        "echo \"===== DB 스키마 복구 (적용) : $DOMAIN =====\"\n"
+    } else {
+        "echo \"===== DB 스키마 점검 (읽기 전용) : $DOMAIN =====\"\n"
+    });
+    body.push_str(&eondcms_schema_block(apply));
+    if apply {
+        // 적용에 실패했는데 재시작하면 아무것도 안 바뀐 채 "재시작 완료" 만 찍혀 오해를 부른다
+        body.push_str(
+            r#"if [ "$SCHEMA_RC" = "0" ]; then
   echo
   echo "-- 서비스 재시작 (새 스키마 반영) --"
   systemctl restart "eondcms-$VUSER" && echo "재시작 완료" || echo "※ 재시작 실패 - 권한 확인"
-elif [ "$HM_APPLY" = "1" ]; then
+else
   echo
   echo "※ 스키마 적용이 실패해 재시작을 건너뛴다 (위 오류 확인)"
 fi
-echo
-echo "===== 끝 ====="
-exit $RC
-"#;
+"#,
+        );
+    }
+    body.push_str("echo\necho \"===== 끝 =====\"\nexit $SCHEMA_RC\n");
     let remote = format!("{head}{body}");
     let (script, sshpass, env) = eondcms_exec(server, &remote, use_root, eond.sudo);
     Ok(Job {
@@ -4176,6 +4218,106 @@ mod tests {
             path: "/home/www".into(),
             ..Default::default()
         }
+    }
+
+    /// eondcms 설치용 Site — root 계정이 있어야 eondcms_validate 를 통과한다
+    fn sample_eond_site() -> Site {
+        Site { root_id: "rootuser".into(), root_pw: "dummy-pw".into(), ..sample_site() }
+    }
+
+    fn sample_eond() -> crate::model::EondInstall {
+        crate::model::EondInstall {
+            use_asis: true,
+            sudo: true,
+            hestia_user: "webwoori".into(),
+            hestia_pass: "dummy-pw".into(),
+            hestia_email: "a@example.com".into(),
+            package: "default".into(),
+            port: "8003".into(),
+            db_name: "webwoori_eondcms".into(),
+            db_user: "webwoori_eondcms".into(),
+            db_pass: "dummy-pw".into(),
+            table_prefix: "xe_".into(),
+            admin_user: "admin".into(),
+            admin_pass: "dummy-pw".into(),
+            code_local: "/tmp/hm-test-src".into(),
+        }
+    }
+
+    /// eondcms_exec 이 sudo 모드에서 원격 스크립트를 heredoc 으로 감싸므로 그 안을 꺼낸다.
+    fn extract_remote(script: &str) -> String {
+        const OPEN: &str = "<<'HM_EOF'\n";
+        match script.find(OPEN) {
+            Some(i) => {
+                let rest = &script[i + OPEN.len()..];
+                let end = rest.find("\nHM_EOF").unwrap_or(rest.len());
+                rest[..end].to_string()
+            }
+            None => script.to_string(),
+        }
+    }
+
+    /// 원격에서 실제로 실행될 스크립트가 유효한 bash 인지 확인한다.
+    /// 여기서 깨지면 서버에 붙고 나서야 알게 된다.
+    fn assert_bash_ok(script: &str, label: &str) {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("hm-test-{label}.sh"));
+        let mut f = std::fs::File::create(&path).expect("임시 파일 생성");
+        f.write_all(script.as_bytes()).expect("쓰기");
+        drop(f);
+        let out = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&path)
+            .output()
+            .expect("bash 실행");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.status.success(),
+            "{label}: bash 문법 오류\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// ③ 은 alembic stamp head 로 마이그레이션을 건너뛰므로, 모델과 실제 스키마를 대조해
+    /// 누락 컬럼을 보강하는 단계가 반드시 들어 있어야 한다.
+    /// (2026-08-25: 이 단계가 없어 xe_member.signup_referrer 누락으로 로그인이 전부 503)
+    #[test]
+    fn eondcms_finalize_includes_schema_backfill() {
+        let job = build_eondcms_finalize(&sample_eond_site(), &sample_eond(), "ex.com", true).unwrap();
+        let remote = extract_remote(&job.script);
+        assert!(remote.contains("alembic stamp head"), "stamp head 단계가 사라졌다");
+        assert!(remote.contains("Base.metadata.sorted_tables"), "모델 대조 코드가 없다");
+        assert!(remote.contains("HM_APPLY=1"), "스키마 보강이 적용 모드로 돌지 않는다");
+        // 보강은 stamp head 뒤, 서비스 재시작 앞이어야 의미가 있다
+        let i_stamp = remote.find("alembic stamp head").unwrap();
+        let i_schema = remote.find("Base.metadata.sorted_tables").unwrap();
+        let i_restart = remote.find("systemctl restart").unwrap();
+        assert!(i_stamp < i_schema, "스키마 보강이 stamp head 보다 앞에 있다");
+        assert!(i_schema < i_restart, "스키마 보강이 서비스 재시작 뒤에 있다");
+        assert_bash_ok(&remote, "finalize");
+    }
+
+    #[test]
+    fn eondcms_schema_fix_scripts_are_valid_bash() {
+        for apply in [false, true] {
+            let job =
+                build_eondcms_schema_fix(&sample_eond_site(), &sample_eond(), "ex.com", true, apply).unwrap();
+            let remote = extract_remote(&job.script);
+            assert!(remote.contains("Base.metadata.sorted_tables"));
+            assert!(remote.contains(if apply { "HM_APPLY=1" } else { "HM_APPLY=0" }));
+            // 적용 모드에서만 재시작한다
+            assert_eq!(remote.contains("systemctl restart"), apply);
+            assert_bash_ok(&remote, if apply { "schema-apply" } else { "schema-check" });
+        }
+    }
+
+    /// ② 는 업로드된 코드를 서버 파이썬으로 파싱해 ③ 이전에 문법 오류를 잡아야 한다.
+    #[test]
+    fn eondcms_upload_has_syntax_gate() {
+        let job = build_eondcms_upload(&sample_eond_site(), &sample_eond(), "ex.com", true).unwrap();
+        assert!(job.script.contains("python3.11"), "배포 대상 인터프리터로 검사하지 않는다");
+        assert!(job.script.contains("ast.parse"), "문법 검사 코드가 없다");
+        assert_bash_ok(&job.script, "upload");
     }
 
     #[test]
