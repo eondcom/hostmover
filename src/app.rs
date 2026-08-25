@@ -3365,6 +3365,30 @@ impl App {
                                 }
                             });
                         });
+                        ui.add_space(6.0);
+                        card(ui, |ui| {
+                            ui.strong(format!("{}  DB 스키마 (Unknown column 오류가 날 때)", ph::DATABASE));
+                            ui.label(egui::RichText::new("③ 은 alembic stamp head 로 표시만 하고 마이그레이션을 돌리지 않는다. create_all 은 이미 있는 테이블(Rhymix xe_*)에 컬럼을 추가하지 못해, 나중에 추가된 컬럼이 빠진 채로 남는다.").weak());
+                            ui.label(egui::RichText::new("모델과 실제 테이블을 대조해 누락 컬럼을 찾는다. NULL 허용 컬럼만 자동 추가하고, NOT NULL·기본값 없는 것은 목록만 보여준다.").weak());
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!running, egui::Button::new(format!("{}  스키마 점검", ph::MAGNIFYING_GLASS)).min_size(egui::vec2(150.0, 0.0)))
+                                    .on_hover_text("읽기 전용 — 누락 컬럼과 실행될 ALTER 문만 출력한다")
+                                    .clicked()
+                                {
+                                    eond_step = Some((6, true));
+                                }
+                                if ui.add_enabled(!running, btn_primary(format!("{}  스키마 복구(적용)", ph::DATABASE)).min_size(egui::vec2(170.0, 0.0)))
+                                    .on_hover_text("누락 컬럼을 실제로 추가하고 서비스를 재시작한다. 먼저 점검으로 내용을 확인할 것")
+                                    .clicked()
+                                {
+                                    eond_step = Some((7, true));
+                                }
+                                if ui.button(ph::FILE_TEXT).on_hover_text("명령어 보기 (적용)").clicked() {
+                                    eond_step = Some((7, false));
+                                }
+                            });
+                        });
                     }
                     // ───────── 작업 기록 ─────────
                     Tab::History => {
@@ -3493,6 +3517,8 @@ impl App {
                     2 => ops::build_eondcms_upload(&server, &eond, &dn, self.use_root),
                     3 => ops::build_eondcms_finalize(&server, &eond, &dn, self.use_root),
                     5 => ops::build_eondcms_diagnose(&server, &eond, &dn, self.use_root),
+                    6 => ops::build_eondcms_schema_fix(&server, &eond, &dn, self.use_root, false),
+                    7 => ops::build_eondcms_schema_fix(&server, &eond, &dn, self.use_root, true),
                     _ => ops::build_eondcms_update(&server, &eond, &dn, self.use_root),
                 };
                 match built {

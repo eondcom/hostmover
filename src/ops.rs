@@ -897,7 +897,10 @@ echo "[2] 포트 $PORT LISTEN 여부"
 ss -ltnp 2>/dev/null | grep ":$PORT " || echo "  LISTEN 없음 (앱 미기동)"
 echo
 echo "[3] 앱 프로세스가 실제로 본 환경변수 (systemd EnvironmentFile 주입분)"
-PID=$(pgrep -f "uvicorn app.main:app" | head -1)
+# 한 서버에 eondcms 인스턴스가 여러 개 돌므로 pgrep 로 아무거나 잡으면 남의 프로세스를 본다
+# (2026-08-25: omg 인스턴스를 보고 DATABASE_URL 이 다르다고 오진했다). 유닛의 MainPID 를 쓴다.
+PID=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null)
+[ "${PID:-0}" = "0" ] && PID=$(pgrep -f "uvicorn app.main:app.*--port $PORT" | head -1)
 if [ -n "$PID" ]; then
   echo "  PID=$PID"
   tr '\0' '\n' < "/proc/$PID/environ" 2>/dev/null \
@@ -997,6 +1000,134 @@ echo "※ [6] 양쪽 OK 인데 [10] 이 503 → 앱 기동 시점의 커넥션 �
         sshpass,
         env,
         note: "서비스·포트·환경변수·DB연결·에러로그 수집 (읽기 전용, 비번 마스킹)".into(),
+    })
+}
+
+/// 🛠 DB 스키마 복구: SQLAlchemy 모델과 실제 테이블을 대조해 누락 컬럼을 채운다.
+///
+/// ③ 은 `alembic stamp head` 로 "이미 최신"이라고 표시만 하고 마이그레이션을 실행하지 않는다.
+/// eond_ 테이블은 create_all 이 만들어주지만, create_all 은 **이미 있는 테이블에 컬럼을 추가하지
+/// 않는다.** 그래서 Rhymix seed 로 들어온 xe_* 테이블에 eondcms 가 나중에 추가한 컬럼
+/// (alembic 마이그레이션에만 있는 것)이 영영 생기지 않는다.
+/// 2026-08-25: `Unknown column 'xe_member.signup_referrer'` 로 로그인이 전부 503.
+///
+/// NULL 허용 컬럼만 자동으로 추가한다. NOT NULL 인데 기본값이 없는 컬럼은 기존 행을 깨뜨릴 수
+/// 있어 사람이 판단하도록 목록만 출력한다. 실행하는 SQL 은 전부 찍는다.
+pub fn build_eondcms_schema_fix(server: &Site, eond: &EondInstall, domain_name: &str, use_root: bool, apply: bool) -> Result<Job, String> {
+    eondcms_validate(server, eond, use_root)?;
+    let domain = to_ascii_domain(domain_name);
+    let head = format!(
+        "export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/local/mysql/bin\"\nVUSER={u}\nDOMAIN={d}\nHM_APPLY={a}\n",
+        u = sq(eond.hestia_user.trim()), d = sq(&domain), a = if apply { "1" } else { "0" },
+    );
+    let body = r#"APPDIR=/home/$VUSER/web/$DOMAIN/pythonapp
+export HM_APPLY
+if [ ! -f "$APPDIR/app/main.py" ]; then echo "코드 없음: $APPDIR"; exit 1; fi
+if [ "$HM_APPLY" = "1" ]; then echo "===== DB 스키마 복구 (적용) : $DOMAIN ====="; else echo "===== DB 스키마 점검 (읽기 전용) : $DOMAIN ====="; fi
+# 파이썬 코드는 반드시 quoted heredoc 으로 임시 파일에 쓴다.
+# bash -lc "..." 의 큰따옴표 안에 넣으면 SQL 식별자를 감싼 백틱을 바깥 셸이 명령 치환으로
+# 해석해 ALTER TABLE 문에서 테이블명이 통째로 사라진다 (실측 확인).
+PYTMP=$(mktemp /tmp/hm-schema-XXXXXX.py) || exit 1
+trap 'rm -f "$PYTMP"' EXIT
+cat > "$PYTMP" <<'PYEOF'
+import importlib, os, pkgutil, re, sys
+import sqlalchemy as sa
+from sqlalchemy.schema import CreateColumn
+from app.config import settings
+from app.models.base import Base
+import app.models as _M
+
+APPLY = os.environ.get('HM_APPLY') == '1'
+
+# 모델 모듈을 전부 로드해야 Base.metadata 가 채워진다
+for _m in pkgutil.iter_modules(_M.__path__):
+    try:
+        importlib.import_module('app.models.' + _m.name)
+    except Exception as e:
+        print('  모델 로드 경고 %s: %s' % (_m.name, str(e)[:120]))
+
+url = re.sub(r'[+]aiomysql', '+pymysql', settings.database_url)
+eng = sa.create_engine(url)
+insp = sa.inspect(eng)
+have = set(insp.get_table_names())
+print('  table_prefix=%s  테이블 %d 개' % (settings.table_prefix, len(have)))
+
+miss_t, miss_c, risky = [], [], []
+for t in Base.metadata.sorted_tables:
+    if t.name not in have:
+        miss_t.append(t.name)
+        continue
+    cols = set(c['name'] for c in insp.get_columns(t.name))
+    for c in t.columns:
+        if c.name in cols:
+            continue
+        if (not c.nullable) and c.default is None and c.server_default is None:
+            risky.append('%s.%s (NOT NULL, 기본값 없음)' % (t.name, c.name))
+        else:
+            miss_c.append((t.name, c))
+
+print('')
+print('  누락 테이블 %d 개%s' % (len(miss_t), ' (setup_eond_tables 가 만든다)' if miss_t else ''))
+for n in miss_t:
+    print('    - %s' % n)
+print('  누락 컬럼 %d 개 (NULL 허용 - 자동 추가 가능)' % len(miss_c))
+for tn, c in miss_c:
+    print('    - %s.%s' % (tn, c.name))
+if risky:
+    print('  누락 컬럼 %d 개 (NOT NULL/기본값 없음 - 수동 판단 필요)' % len(risky))
+    for r in risky:
+        print('    ! %s' % r)
+
+if not miss_c:
+    print('')
+    print('  자동으로 채울 컬럼이 없다.')
+    sys.exit(0)
+
+if not APPLY:
+    print('')
+    print('  [점검 모드] 아래를 적용하려면 스키마 복구(적용) 버튼을 실행하세요.')
+    for tn, c in miss_c:
+        print('    ALTER TABLE `%s` ADD COLUMN %s' % (tn, CreateColumn(c).compile(dialect=eng.dialect)))
+    sys.exit(0)
+
+print('')
+ok = 0
+with eng.begin() as conn:
+    for tn, c in miss_c:
+        sql = 'ALTER TABLE `%s` ADD COLUMN %s' % (tn, CreateColumn(c).compile(dialect=eng.dialect))
+        print('  실행: %s' % sql)
+        try:
+            conn.execute(sa.text(sql))
+            ok += 1
+        except Exception as e:
+            print('    실패: %s' % str(e)[:160])
+print('')
+print('  완료: 컬럼 %d/%d 개 추가' % (ok, len(miss_c)))
+PYEOF
+chmod 644 "$PYTMP"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && HM_APPLY='$HM_APPLY' .venv/bin/python '$PYTMP'" 2>&1 | grep -v "Event loop is closed"
+RC=${PIPESTATUS[0]}
+if [ "$HM_APPLY" = "1" ]; then
+  echo
+  echo "-- 서비스 재시작 (새 스키마 반영) --"
+  systemctl restart "eondcms-$VUSER" && echo "재시작 완료" || echo "※ 재시작 실패 - 권한 확인"
+fi
+echo
+echo "===== 끝 ====="
+exit $RC
+"#;
+    let remote = format!("{head}{body}");
+    let (script, sshpass, env) = eondcms_exec(server, &remote, use_root, eond.sudo);
+    Ok(Job {
+        title: format!("eondcms 🛠 DB 스키마 {} : {domain_name}", if apply { "복구(적용)" } else { "점검" }),
+        script,
+        sshpass,
+        env,
+        note: if apply {
+            "모델과 대조해 누락 컬럼 추가 + 서비스 재시작 (NULL 허용 컬럼만)".into()
+        } else {
+            "모델과 실제 테이블 대조 — 누락 컬럼 목록만 출력 (읽기 전용)".into()
+        },
     })
 }
 
