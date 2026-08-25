@@ -535,6 +535,14 @@ fn eondcms_validate(server: &Site, eond: &EondInstall, use_root: bool) -> Result
     if server.ip.trim().is_empty() { return Err("설치 대상 서버 IP가 비어 있습니다".into()); }
     if !use_root { return Err("eondcms 설치는 root 권한 필요 — '루트로 실행'을 켜고 서버루트 계정을 입력하세요".into()); }
     if server.login_id(use_root).is_empty() { return Err("서버 루트 로그인 아이디가 비어 있습니다".into()); }
+    // login_id() 는 루트 아이디가 비면 조용히 FTP 계정으로 내려간다. eondcms 는 root 가 필수라
+    // 그 폴백이 걸리면 'xxx is not in the sudoers file' 로 끝나므로 여기서 미리 막는다.
+    // (app.rs 가 전역 설정의 SSH 유저로 채워주므로, 여기까지 비어 있으면 양쪽 다 비었다는 뜻)
+    if server.root_id.trim().is_empty() {
+        return Err("서버 루트 계정이 비어 있습니다 — 도메인의 ASIS/TOBE 서버 루트 계정을 입력하거나, \
+                    설정 탭의 'SSH 유저'(sudo 권한 계정, 예: tong)를 채우세요. \
+                    비워두면 FTP 계정으로 접속해 권한이 부족합니다".into());
+    }
     if eond.hestia_user.trim().is_empty() { return Err("HestiaCP 유저가 비어 있습니다".into()); }
     Ok(())
 }
@@ -880,6 +888,7 @@ SERVICE=eondcms-$VUSER
 MASK='s#(://)[^/]*@#\1***@#'
 echo "===== eondcms 진단: $DOMAIN (포트 $PORT) ====="
 echo "APPDIR=$APPDIR  SERVICE=$SERVICE"
+echo "실행 계정=$(id -un 2>/dev/null)  (root 가 아니면 [7][9] 는 권한 부족으로 비어 있을 수 있다)"
 echo
 echo "[1] 서비스 상태"
 systemctl --no-pager -l status "$SERVICE" 2>/dev/null | head -8 || echo "  유닛 없음: $SERVICE"

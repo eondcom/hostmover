@@ -3461,10 +3461,33 @@ impl App {
 
             // eondcms 설치 단계 처리 (별도 빌더, EondInstall 사용)
             if let Some((step, run)) = eond_step {
-                let dom = &self.store.customers[ci].domains[di];
-                let eond = dom.eond.clone();
-                let server = if eond.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
-                let dn = dom.name.clone();
+                let (mut eond, mut server, dn) = {
+                    let dom = &self.store.customers[ci].domains[di];
+                    let eond = dom.eond.clone();
+                    let server = if eond.use_asis { dom.asis.clone() } else { dom.tobe.clone() };
+                    (eond, server, dom.name.clone())
+                };
+                // 도메인(ASIS/TOBE)에 루트 계정이 비어 있으면 전역 설정의 SSH 계정
+                // (설정 탭의 "SSH 유저" — root 직접 로그인 대신 쓰는 sudo 권한 계정, 예: tong)으로
+                // 폴백한다. 이게 없으면 Site::login_id() 가 조용히 FTP 계정으로 내려가
+                // 'xxx is not in the sudoers file' 로 끝난다 (2026-08-25 진단 실행 실패).
+                if self.use_root && server.root_id.trim().is_empty() {
+                    let u = self.store.settings.ssh_user.trim().to_string();
+                    let p = self.store.settings.ssh_pass.clone();
+                    let sp = self.store.settings.ssh_port.trim().to_string();
+                    if !u.is_empty() {
+                        server.root_id = u.clone();
+                        server.root_pw = p;
+                        if server.ssh_port.trim().is_empty() && !sp.is_empty() {
+                            server.ssh_port = sp;
+                        }
+                        // 전역 SSH 계정은 sudo 권한 계정 전제이므로 sudo 경유로 실행한다
+                        eond.sudo = true;
+                        self.log.push(format!(
+                            "eondcms: 도메인 루트 계정이 비어 전역 SSH 계정 '{u}' 으로 sudo 경유 접속합니다"
+                        ));
+                    }
+                }
                 let built = match step {
                     1 => ops::build_eondcms_resources(&server, &eond, &dn, self.use_root),
                     2 => ops::build_eondcms_upload(&server, &eond, &dn, self.use_root),
