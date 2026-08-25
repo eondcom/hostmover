@@ -809,6 +809,140 @@ echo "== eondcms 업데이트 완료: $DOMAIN =="
     })
 }
 
+/// 🩺 진단 (설치된 인스턴스): 서비스·포트·환경변수·DB연결·에러로그 수집. 읽기 전용, 아무것도 바꾸지 않는다.
+///
+/// 설치 스크립트는 mysql CLI 와 pymysql 로만 DB 를 확인하는데, 앱은 systemd 가 주입한
+/// 환경변수 + aiomysql 로 붙는다. 이 경로 차이 때문에 "설치는 성공했는데 앱만 DB 연결 실패"
+/// 가 나올 수 있어 양쪽을 함께 찍는다. 비밀번호는 전부 *** 로 가리고, 값이 같은지는
+/// 해시로만 비교하므로 결과를 그대로 붙여넣어도 자격증명이 새지 않는다.
+pub fn build_eondcms_diagnose(server: &Site, eond: &EondInstall, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    eondcms_validate(server, eond, use_root)?;
+    if eond.port.trim().is_empty() { return Err("포트가 비어 있습니다 (설치 시 사용한 포트)".into()); }
+    let domain = to_ascii_domain(domain_name);
+    let head = format!(
+        "export PATH=\"$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/mysql/bin\"\nVUSER={u}\nDOMAIN={d}\nPORT={p}\n",
+        u = sq(eond.hestia_user.trim()), d = sq(&domain), p = sq(eond.port.trim()),
+    );
+    // set -e 를 쓰지 않는다 — 진단은 한 항목이 실패해도 나머지를 계속 찍어야 한다.
+    let body = r#"APPDIR=/home/$VUSER/web/$DOMAIN/pythonapp
+SERVICE=eondcms-$VUSER
+# URL 의 자격증명(유저:비번)을 통째로 *** 로 치환 — 결과를 그대로 공유해도 안전.
+# authority 전체를 잡는다: 비번에 '@' 가 섞여 있어도 마지막 '@' 까지 먹으므로 일부가 새지 않는다.
+# (유저:비번만 지우는 패턴은 'p@ssw0rd' 를 '***@ssw0rd' 로 만들어 뒷부분을 노출시킨다)
+MASK='s#(://)[^/]*@#\1***@#'
+echo "===== eondcms 진단: $DOMAIN (포트 $PORT) ====="
+echo "APPDIR=$APPDIR  SERVICE=$SERVICE"
+echo
+echo "[1] 서비스 상태"
+systemctl --no-pager -l status "$SERVICE" 2>/dev/null | head -8 || echo "  유닛 없음: $SERVICE"
+echo
+echo "[2] 포트 $PORT LISTEN 여부"
+ss -ltnp 2>/dev/null | grep ":$PORT " || echo "  LISTEN 없음 (앱 미기동)"
+echo
+echo "[3] 앱 프로세스가 실제로 본 환경변수 (systemd EnvironmentFile 주입분)"
+PID=$(pgrep -f "uvicorn app.main:app" | head -1)
+if [ -n "$PID" ]; then
+  echo "  PID=$PID"
+  tr '\0' '\n' < "/proc/$PID/environ" 2>/dev/null \
+    | grep -E '^(ENV|DEBUG|DATABASE_URL|TABLE_PREFIX|ADMIN_USERNAME|REDIS_URL)=' | sed -E "$MASK" \
+    || echo "  (해당 환경변수 없음 — EnvironmentFile 미적용?)"
+else
+  echo "  실행 중인 uvicorn 프로세스를 찾지 못함"
+fi
+echo
+echo "[4] .env 파일 원본"
+grep -E '^(ENV|DEBUG|DATABASE_URL|TABLE_PREFIX|ADMIN_USERNAME|REDIS_URL)=' "$APPDIR/.env" 2>/dev/null | sed -E "$MASK" \
+  || echo "  .env 없음: $APPDIR/.env"
+echo
+echo "[5] ★ DATABASE_URL 일치 여부 (해시 비교 — 값 자체는 노출되지 않음)"
+HA=""; HB=""
+if [ -n "$PID" ]; then
+  HA=$(tr '\0' '\n' < "/proc/$PID/environ" 2>/dev/null | grep '^DATABASE_URL=' | head -1 | cut -d= -f2- | md5sum 2>/dev/null | cut -c1-12)
+fi
+HB=$(grep '^DATABASE_URL=' "$APPDIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | md5sum 2>/dev/null | cut -c1-12)
+echo "  프로세스 환경변수 : ${HA:-(없음)}"
+echo "  .env 파일         : ${HB:-(없음)}"
+if [ -n "$HA" ] && [ -n "$HB" ]; then
+  if [ "$HA" = "$HB" ]; then
+    echo "  → 동일. systemd 파싱 차이는 원인이 아니다."
+  else
+    echo "  → ★★ 다름! systemd 가 .env 를 다르게 읽었다 (비번의 특수문자/공백 의심) = 원인 확정"
+  fi
+fi
+echo
+echo "[6] DB 연결 테스트 — pymysql(설치 스크립트 경로) / aiomysql(앱 경로) 양쪽"
+sudo -u "$VUSER" bash -lc "cd '$APPDIR' && .venv/bin/python - <<'PYEOF'
+import re, sys, asyncio
+def mask(s):
+    # authority 전체를 지운다 — 비번에 '@' 가 있어도 뒷부분이 새지 않는다
+    return re.sub(r'(://)[^/\s]*@', r'\1***@', str(s))[:250]
+try:
+    from app.config import settings
+    url = settings.database_url
+except Exception as e:
+    print('  settings 로드 실패:', type(e).__name__, mask(e)); sys.exit(0)
+print('  드라이버:', url.split('://')[0])
+import sqlalchemy as sa
+try:
+    eng = sa.create_engine(re.sub(r'[+]aiomysql', '+pymysql', url), connect_args={'connect_timeout': 5})
+    with eng.connect() as c:
+        db = c.execute(sa.text('SELECT DATABASE()')).scalar()
+        n  = c.execute(sa.text(\"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()\")).scalar()
+        adm = c.execute(sa.text('SELECT COUNT(*) FROM '+settings.table_prefix+\"member WHERE user_id=:u AND is_admin='Y' AND status='APPROVED'\"), {'u': settings.admin_username}).scalar()
+    print('  pymysql  OK  db=%s  테이블수=%s  관리자계정(%s)=%s' % (db, n, settings.admin_username, adm))
+except Exception as ex:
+    print('  pymysql  실패:', type(ex).__name__, mask(ex))
+async def _a():
+    from sqlalchemy.ext.asyncio import create_async_engine
+    e = create_async_engine(url)
+    try:
+        async with e.connect() as c:
+            v = await c.execute(sa.text('SELECT VERSION()'))
+            print('  aiomysql OK  mysql=%s' % v.scalar())
+    except Exception as ex:
+        print('  aiomysql 실패:', type(ex).__name__, mask(ex))
+    finally:
+        await e.dispose()
+asyncio.run(_a())
+PYEOF" 2>&1 | grep -v "Event loop is closed"
+echo
+echo "[7] 최근 DB/앱 에러 (journalctl 200줄에서 추출)"
+journalctl -u "$SERVICE" -n 200 --no-pager 2>/dev/null \
+  | grep -iE "OperationalError|Access denied|Unknown database|Can't connect|Connection refused|Traceback|SyntaxError" \
+  | tail -15 | sed -E "$MASK" || echo "  (해당 없음)"
+echo
+echo "[8] server.err.log 마지막 30줄"
+tail -n 30 "$APPDIR/logs/server.err.log" 2>/dev/null | sed -E "$MASK" || echo "  로그 파일 없음"
+echo
+echo "[9] MySQL 쪽 DB/계정 존재 확인 (root 소켓 접속)"
+mysql -N -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE '%${VUSER}%'" 2>/dev/null | sed 's/^/  DB: /' || echo "  (root mysql 접속 불가 — 건너뜀)"
+mysql -N -e "SELECT CONCAT(user,'@',host) FROM mysql.user WHERE user LIKE '%${VUSER}%'" 2>/dev/null | sed 's/^/  계정: /'
+echo
+echo "[10] 내부 HTTP 응답 (nginx 우회, 앱 직접)"
+printf '  GET  /                  → '; curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 "http://127.0.0.1:$PORT/" 2>/dev/null || echo "실패"
+printf '  POST /auth/login-form   → '; curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 -X POST "http://127.0.0.1:$PORT/auth/login-form" -d 'user_id=__hm_diag__&password=__hm_diag__' 2>/dev/null || echo "실패"
+echo "    (302=정상동작[로그인 실패해도 302], 503=DB연결오류, 000=미기동)"
+echo
+echo "[11] 이 서버의 다른 eondcms 인스턴스 (정상 동작 중인 것과 비교용)"
+systemctl list-units --no-pager --plain --all 'eondcms-*' 2>/dev/null | grep eondcms | head -10 || echo "  (없음)"
+echo
+echo "===== 진단 끝 ====="
+echo "※ [5] 가 '다름' → .env 의 DB 비번에 systemd 가 다르게 읽는 문자(공백/따옴표/역슬래시)가 있다"
+echo "※ [6] pymysql OK + aiomysql 실패 → 비동기 드라이버/이벤트루프 문제"
+echo "※ [6] 양쪽 다 실패 → DB 계정·권한·비번 자체 문제 ([9] 와 대조)"
+echo "※ [6] 양쪽 OK 인데 [10] 이 503 → 앱 기동 시점의 커넥션 풀/Redis 문제 ([7][8] 확인)"
+"#;
+    let remote = format!("{head}{body}");
+    let (script, sshpass, env) = eondcms_exec(server, &remote, use_root, eond.sudo);
+    Ok(Job {
+        title: format!("eondcms 🩺 진단 : {domain_name}"),
+        script,
+        sshpass,
+        env,
+        note: "서비스·포트·환경변수·DB연결·에러로그 수집 (읽기 전용, 비번 마스킹)".into(),
+    })
+}
+
 // ===== HestiaCP API 연동 (고객/사이트 불러오기) =====
 
 /// HestiaCP API 호출 스크립트 생성. 해시는 -K(stdin) 설정으로 전달해 argv 노출 방지.

@@ -3347,6 +3347,24 @@ impl App {
                                 }
                             });
                         });
+                        ui.add_space(6.0);
+                        card(ui, |ui| {
+                            ui.strong(format!("{}  진단 (설치가 안 됐거나 화면이 안 뜰 때)", ph::STETHOSCOPE));
+                            ui.label(egui::RichText::new("서비스·포트·환경변수·DB연결·에러로그를 한 번에 수집. 읽기 전용이라 아무것도 바꾸지 않는다.").weak());
+                            ui.label(egui::RichText::new("비밀번호는 *** 로 가려서 출력하므로 결과를 그대로 공유해도 안전.").weak());
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!running, egui::Button::new(format!("{}  진단 실행", ph::STETHOSCOPE)).min_size(egui::vec2(150.0, 0.0)))
+                                    .on_hover_text("앱이 실제로 본 DATABASE_URL 과 .env 를 해시로 비교하고, pymysql/aiomysql 양쪽으로 DB 접속을 시험한다")
+                                    .clicked()
+                                {
+                                    eond_step = Some((5, true));
+                                }
+                                if ui.button(ph::FILE_TEXT).on_hover_text("명령어 보기").clicked() {
+                                    eond_step = Some((5, false));
+                                }
+                            });
+                        });
                     }
                     // ───────── 작업 기록 ─────────
                     Tab::History => {
@@ -3451,6 +3469,7 @@ impl App {
                     1 => ops::build_eondcms_resources(&server, &eond, &dn, self.use_root),
                     2 => ops::build_eondcms_upload(&server, &eond, &dn, self.use_root),
                     3 => ops::build_eondcms_finalize(&server, &eond, &dn, self.use_root),
+                    5 => ops::build_eondcms_diagnose(&server, &eond, &dn, self.use_root),
                     _ => ops::build_eondcms_update(&server, &eond, &dn, self.use_root),
                 };
                 match built {
