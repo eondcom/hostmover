@@ -15,9 +15,132 @@ pub struct Store {
     /// 스캔 캐시 시각 (unix초)
     #[serde(default)]
     pub scan_cache_at: i64,
+    /// 마지막 서버 스냅샷 (대시보드에서 즉시 표시)
+    #[serde(default)]
+    pub server_snapshot: ServerSnapshot,
+    /// 마지막 도메인별 헬스 결과.
+    #[serde(default)]
+    pub domain_health: Vec<DomainHealth>,
+    #[serde(default)]
+    pub domain_health_at: i64,
+    /// 마지막 서버 스냅샷의 디스크별 헬스 결과.
+    #[serde(default)]
+    pub disk_health: Vec<DiskHealth>,
+    /// 마지막 백업·휴면 점검의 백업 요약.
+    #[serde(default)]
+    pub backup_status: BackupStatus,
+    /// 마지막 백업·휴면 점검의 계정별 백업 현황.
+    #[serde(default)]
+    pub backup_users: Vec<BackupUser>,
+    /// 마지막 백업·휴면 점검의 확인 권장 사이트.
+    #[serde(default)]
+    pub idle_sites: Vec<IdleSite>,
+    /// 마지막 백업·휴면 점검 성공 시각 (unix초).
+    #[serde(default)]
+    pub upkeep_at: i64,
     /// 마지막 화면 상태 (재시작 시 복원)
     #[serde(default)]
     pub ui: UiState,
+}
+
+/// 백업 현황 요약 (HM_BK_* 마커).
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct BackupStatus {
+    #[serde(default)] pub cron: bool,
+    #[serde(default)] pub keep: String,
+    #[serde(default)] pub total: u64,
+    #[serde(default)] pub size: String,
+    #[serde(default)] pub users: u64,
+    #[serde(default)] pub missing: Vec<String>,
+    #[serde(default)] pub newest: i64,
+    #[serde(default)] pub stalest_account: String,
+    #[serde(default)] pub stalest_days: i64,
+}
+
+/// 계정별 백업 현황 (HM_BKU 한 줄).
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct BackupUser {
+    #[serde(default)] pub account: String,
+    #[serde(default)] pub generations: u64,
+    #[serde(default)] pub age_days: i64,
+}
+
+/// 오래 방치된 것으로 확인할 신호가 2개 이상인 사이트 (HM_IDLE 한 줄).
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct IdleSite {
+    #[serde(default)] pub account: String,
+    #[serde(default)] pub domain: String,
+    #[serde(default)] pub access_days: i64,
+    #[serde(default)] pub files_old: bool,
+    #[serde(default)] pub signals: u8,
+}
+
+/// 디스크 1건의 헬스 (마커 HM_DISK 한 줄)
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct DiskHealth {
+    #[serde(default)] pub mount: String,
+    #[serde(default)] pub device: String,
+    #[serde(default)] pub disk: String,
+    #[serde(default)] pub role: String,
+    #[serde(default)] pub use_pct: String,
+    #[serde(default)] pub avail: String,
+    #[serde(default)] pub inode_pct: String,
+    #[serde(default)] pub fs_err: String,
+    #[serde(default)] pub smart: String,
+    #[serde(default)] pub realloc: String,
+    #[serde(default)] pub pending: String,
+    #[serde(default)] pub power_h: String,
+    #[serde(default)] pub temp_c: String,
+    #[serde(default)] pub rate: String,
+    #[serde(default)] pub eta: String,
+    #[serde(default)] pub span: String,
+}
+
+/// 도메인 1건의 헬스 (마커 HM_DOMH 한 줄)
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct DomainHealth {
+    #[serde(default)] pub account: String,
+    #[serde(default)] pub domain: String,
+    /// 참고값. 단독으로 정상 판정하지 않는다.
+    #[serde(default)] pub local_code: String,
+    /// DNS=ok 일 때 주 지표.
+    #[serde(default)] pub public_code: String,
+    #[serde(default)] pub dns: String,
+    #[serde(default)] pub cert_days: String,
+    #[serde(default)] pub webroot: String,
+    #[serde(default)] pub a_record: String,
+}
+
+/// 마지막 서버 스냅샷 (대시보드에서 즉시 표시)
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct ServerSnapshot {
+    #[serde(default)] pub at: i64,
+    #[serde(default)] pub host: String,
+    #[serde(default)] pub uptime: String,
+    #[serde(default)] pub load1: String,
+    #[serde(default)] pub cores: String,
+    #[serde(default)] pub mem_pct: String,
+    #[serde(default)] pub disk_max: String,
+    #[serde(default)] pub disk_max_mp: String,
+    #[serde(default)] pub svc_fail: String,
+    #[serde(default)] pub phpfpm: String,
+    #[serde(default)] pub phpfpm_bad: String,
+    #[serde(default)] pub users: String,
+    #[serde(default)] pub domains: String,
+    #[serde(default)] pub diskmon: String,
+    #[serde(default)] pub diskmon_last: String,
+    /// 디스크 감시 마지막 실행 시각(unix초, 서버가 계산). 빈 문자열이면 미상.
+    #[serde(default)] pub diskmon_last_ts: String,
+    #[serde(default)] pub diskmon_result: String,
+    #[serde(default)] pub trafficmon: String,
+    #[serde(default)] pub disk_rate: String,
+    #[serde(default)] pub disk_eta: String,
+    #[serde(default)] pub disk_span: String,
+    #[serde(default)] pub backup_same: String,
+    #[serde(default)] pub backup_src: String,
+    #[serde(default)] pub php_vers: String,
+    #[serde(default)] pub php_vern: String,
+    #[serde(default)] pub sock_dup: String,
 }
 
 /// 재시작 시 복원할 마지막 화면 위치 (인덱스 대신 id 로 저장해 정렬/추가에도 안정적)
@@ -69,8 +192,11 @@ pub struct CachedSite {
 }
 
 /// 앱 설정 (HestiaCP 연동 등). 암호화 저장.
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Settings {
+    /// 시작 화면: "dashboard"(항상 대시보드) | "last"(마지막 화면 복원)
+    #[serde(default = "default_start_view")]
+    pub start_view: String,
     #[serde(default)]
     pub hestia_host: String,
     #[serde(default)]
@@ -99,6 +225,28 @@ pub struct Settings {
     /// WordPress 플러그인 소스 (로컬 PC의 dev/wp 경로 — 하위에 wp-content/plugins/ 포함)
     #[serde(default)]
     pub wp_source_local: String,
+}
+
+fn default_start_view() -> String {
+    "dashboard".into()
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            start_view: default_start_view(),
+            hestia_host: String::new(),
+            hestia_port: String::new(),
+            hestia_hash: String::new(),
+            ssl_verify: false,
+            ssh_host: String::new(),
+            ssh_user: String::new(),
+            ssh_pass: String::new(),
+            ssh_port: String::new(),
+            rx_source_local: String::new(),
+            wp_source_local: String::new(),
+        }
+    }
 }
 
 impl Settings {

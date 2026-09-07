@@ -34,10 +34,13 @@ v0.1.0  (21c4383 · 2026-07-25 07:36)
 cd ~/dev/hostmover
 git pull                      # 또는 브랜치 머지
 cargo build --release
+cp -a ~/.local/bin/hostmover ~/.local/bin/hostmover.bak-$(date +%Y%m%d)   # 되돌리기용
+install -m755 target/release/hostmover ~/.local/bin/hostmover
 ```
 
-런처(`~/.local/share/applications/hostmover.desktop`)의 `Exec` 이
-`~/dev/hostmover/target/release/hostmover` 를 가리키므로, **여기서 빌드하면 런처에 바로 반영된다.**
+런처(`~/.local/share/applications/hostmover.desktop`)의 `Exec` 은
+**`~/.local/bin/hostmover`** 를 가리킨다(2026-08-25 부터. 그 전엔 `target/release/` 직접 참조).
+빌드만으로는 런처가 안 바뀌고, **마지막 `install` 줄까지 해야 반영된다.**
 앱이 떠 있으면 껐다 켜야 한다.
 
 반영됐는지는 앱을 켜서 §1 의 버전 문자열이 바뀌었는지로 확인한다.
@@ -60,21 +63,23 @@ cargo build --release
 런처는 원본 경로만 보므로 아무리 빌드해도 화면이 그대로다. 해결:
 
 ```bash
-# (권장) 브랜치를 머지한 뒤 원본에서 빌드
-cd ~/dev/hostmover && git merge <브랜치> && cargo build --release
+# (권장) 브랜치를 머지한 뒤 원본에서 빌드 → 설치
+cd ~/dev/hostmover && git merge <브랜치> && cargo build --release \
+  && install -m755 target/release/hostmover ~/.local/bin/hostmover
 
-# (급할 때) 바이너리만 얹기 — 소스와 어긋나므로 임시 조치로만
-cp -a ~/dev/hostmover/target/release/hostmover{,.bak-$(date +%Y%m%d)}
-cp -f .claude/worktrees/<이름>/target/release/hostmover ~/dev/hostmover/target/release/hostmover
+# (급할 때) worktree 빌드 산출물을 바로 설치 — 소스(원본 체크아웃)와 어긋나므로 임시 조치로만
+cp -a ~/.local/bin/hostmover ~/.local/bin/hostmover.bak-$(date +%Y%m%d)
+install -m755 .claude/worktrees/<이름>/target/release/hostmover ~/.local/bin/hostmover
 ```
 
 바이너리만 얹으면 소스와 실행파일이 어긋난다. 버전 문자열에 그 커밋 해시가 그대로 찍히므로
 나중에 추적은 되지만, 되도록 머지 후 정식 빌드를 한다.
 
-### 3-2. 디버그 빌드만 했다
+### 3-2. 디버그 빌드만 했다 / 설치를 안 했다
 
 `cargo build` 는 `target/debug/` 에, `cargo build --release` 는 `target/release/` 에 만든다.
-런처는 **release 만** 본다.
+그리고 런처는 `target/` 을 보지 않고 **`~/.local/bin/hostmover` 만** 본다. release 빌드 뒤
+`install` 로 복사하는 단계를 빼먹으면 화면이 그대로다.
 
 ### 3-3. 앱을 안 껐다
 
@@ -90,7 +95,7 @@ cp -f .claude/worktrees/<이름>/target/release/hostmover ~/dev/hostmover/target
 [Desktop Entry]
 Type=Application
 Name=Hostmover
-Exec=/home/dell/dev/hostmover/target/release/hostmover
+Exec=/home/dell/.local/bin/hostmover
 Icon=hostmover
 Terminal=false
 Categories=Network;
@@ -113,9 +118,8 @@ egui 앱은 사실상 크로스컴파일이 안 되므로 macOS 에서 직접 �
 ## 6. 되돌리기
 
 ```bash
-# 바이너리만 얹었다가 되돌릴 때
-mv ~/dev/hostmover/target/release/hostmover.bak-YYYYMMDD \
-   ~/dev/hostmover/target/release/hostmover
+# 설치본만 되돌릴 때 (install 전에 만든 백업으로)
+mv ~/.local/bin/hostmover.bak-YYYYMMDD ~/.local/bin/hostmover
 
 # 소스까지 되돌릴 때
 cd ~/dev/hostmover && git checkout <이전커밋> && cargo build --release

@@ -20,7 +20,12 @@
 ## 기능
 
 - **DB 백업**  : 현재 사이트 → 로컬 (`mysqldump | gzip`, SSH 경유)
+  - **다운로드** 버튼: 최신 백업을 사용자 다운로드 폴더(`xdg-user-dir DOWNLOAD` → `~/Downloads`/`~/다운로드`)에
+    `<도메인>_db_<YYYYMMDD-HHMM>.sql.gz` 로 복사하고 폴더를 연다
 - **DB 복원**  : 로컬 → 신규 사이트 (`gunzip | mysql`)
+  - 백업·복원·직접 이전 모두 로컬 `sed` 로 MariaDB 10.11.8+/11.x mysqldump 의 첫 줄
+    `/*M!999999\- enable the sandbox mode */` 를 지운다. 이 줄을 모르는 구버전 mysql 클라이언트
+    (cafe24 등)는 `ERROR at line 1: Unknown command '\-'` 로 복원을 거부한다
 - **파일 백업**: 현재 사이트 → 로컬 (`rsync -az` pull, 실패 시 `tar`-over-ssh 폴백)
 - **파일 복원**: 로컬 → 신규 사이트 (`rsync -az` push, 실패 시 `tar`-over-ssh 폴백)
 - **묶음 이전** (모두 실행 직전 build, 한 단계 실패 시 즉시 중단):
