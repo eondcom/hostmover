@@ -4236,11 +4236,34 @@ impl App {
                                 card(&mut cols[1], |ui| {
                                     ui.strong("③ 신규 (TOBE)");
                                     let a = site_actions(ui, !running);
+                                    // 라이믹스 도메인 교체 — 이전 후 운영 도메인으로 접속하면 옛 도메인으로 301 되는 문제 해결
+                                    ui.add_space(space::XS);
+                                    let mut rx_switch = false;
+                                    let mut rx_view = false;
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("운영 도메인");
+                                        changed |= ui.add(
+                                            egui::TextEdit::singleline(&mut domain.tobe.live_domain)
+                                                .desired_width(170.0)
+                                                .hint_text("예: 890812.com")
+                                                .margin(FIELD_MARGIN),
+                                        ).changed();
+                                        changed |= ui.checkbox(&mut domain.tobe.live_https, "https")
+                                            .on_hover_text("SSL 설치 뒤에 켜세요. 켜면 rx_domains.security='always' 라 http→https 로 보냅니다 (SSL 없으면 사이트가 안 열림)")
+                                            .changed();
+                                        let ready = !domain.tobe.live_domain.trim().is_empty();
+                                        if ui.add_enabled(!running && ready, egui::Button::new(format!("{}  라이믹스 도메인 교체", ph::GLOBE)))
+                                            .on_hover_text("신규 라이믹스의 기본 도메인(rx_domains)을 운영 도메인으로 바꾸고 config.php url.default 교체 + files/cache 삭제. 끝나면 curl --resolve 로 신규 서버 응답 확인")
+                                            .clicked() { rx_switch = true; }
+                                        if ui.add_enabled(ready, egui::Button::new(ph::COPY.to_string())).on_hover_text("실행할 명령어 보기/복사").clicked() { rx_view = true; }
+                                    });
                                     let mk = |k| Some((Req::Op(k), customer_name.clone(), domain_name.clone(), domain.asis.clone(), domain.tobe.clone()));
                                     if a.cert { request = mk(OpKind::CertTobe); }
                                     if a.verify { request = mk(OpKind::VerifyTobe); }
                                     if a.fix_htaccess { request = mk(OpKind::FixHtaccessTobe); }
                                     if a.set_db { request = mk(OpKind::SetDbTobe); }
+                                    if rx_switch { request = mk(OpKind::RxDomainTobe); }
+                                    if rx_view { view_request = Some((OpKind::RxDomainTobe, customer_name.clone(), domain_name.clone(), domain.asis.clone(), domain.tobe.clone())); }
                                 });
                             });
                         });
@@ -5085,6 +5108,7 @@ impl App {
                     | Req::Op(OpKind::FixHtaccessTobe)
                     | Req::Op(OpKind::SetDbAsis)
                     | Req::Op(OpKind::SetDbTobe)
+                    | Req::Op(OpKind::RxDomainTobe)
                     | Req::Migrate(_) => self.confirm = Some(action),
                     _ => self.start_action(action, ctx),
                 }
@@ -5108,6 +5132,15 @@ impl App {
             Req::Op(OpKind::FixHtaccessTobe) => ("htaccess 수정", format!("신규 사이트 .htaccess @ {}", tobe.ip)),
             Req::Op(OpKind::SetDbAsis) => ("DB정보 반영", format!("현재 설정파일 DB → '{}' @ {}", _asis.db_name, _asis.ip)),
             Req::Op(OpKind::SetDbTobe) => ("DB정보 반영", format!("신규 설정파일 DB → '{}' @ {}", tobe.db_name, tobe.ip)),
+            Req::Op(OpKind::RxDomainTobe) => (
+                "라이믹스 도메인 교체",
+                format!(
+                    "신규 라이믹스 기본 도메인 → '{}' ({}) + config.php + 캐시 삭제 @ {}",
+                    tobe.live_domain.trim(),
+                    if tobe.live_https { "https" } else { "http" },
+                    tobe.ip
+                ),
+            ),
             Req::Op(OpKind::DbDirect) => ("DB 직접 이전", format!("신규 DB '{}' @ {}", tobe.db_name, tobe.ip)),
             Req::Op(OpKind::FileDirect) => ("파일 직접 이전", format!("신규 {} @ {}", tobe.path, tobe.ip)),
             Req::Migrate(MigrateKind::Direct) => (

@@ -38,6 +38,10 @@
   - DB: `ssh 현재 "mysqldump…" | ssh 신규 "mysql…"`
   - 파일: `ssh 현재 "tar czf - ." | ssh 신규 "tar xzf -"` (rsync 불필요)
   - 현재/신규 비번이 달라도 되도록 `SSHPASS`를 `HM_ASIS`/`HM_TOBE` env로 분리(argv 노출 없음)
+- **🌐 라이믹스 도메인 교체** (신규): 이전 직후 운영 도메인으로 접속하면 라이믹스가 "미등록 도메인" 이라며
+  옛 기본 도메인으로 301 을 보내는 문제 해결. `rx_domains` 기본 도메인을 운영 도메인으로 바꾸고
+  `files/config/config.php` 의 `url.default` 교체(백업 후), `files/cache` 삭제. 끝나면 `curl --resolve` 로
+  DNS 와 무관하게 신규 서버 응답을 확인. https 체크는 SSL 설치 뒤에(켜면 `security='always'`)
 - **🔌 접속 테스트**: 현재/신규 사이트 각각 SSH 로그인 성공 여부 + 원격 도구
   (mysqldump/rsync/tar) 가용성 확인
 - **📋 명령어 보기**: 각 작업을 실행하지 않고 실제 쉘 명령만 확인/복사
