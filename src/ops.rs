@@ -219,6 +219,14 @@ fn mysqldump_cmd(site: &Site) -> String {
     )
 }
 
+/// MariaDB 10.11.8+/11.x 의 mysqldump 가 덤프 첫 줄에 넣는 샌드박스 지시문
+/// (`/*!999999\- enable the sandbox mode */` 또는 `/*M!999999\- ... */`) 을 지우는 로컬 필터.
+/// 이 줄을 모르는 구버전 mysql 클라이언트(cafe24 등)는 `ERROR at line 1: Unknown command '\-'` 로
+/// 복원 자체를 거부한다. 필터는 항상 로컬(파이프 중간)에서 돌리므로 원격 셸 제약과 무관하다.
+/// 삭제해도 안전하다 — 이 줄은 클라이언트에게 `\!`(system) 같은 명령을 막으라는 표시일 뿐이며,
+/// 신버전 클라이언트는 없어도 그대로 적재한다.
+pub const SANDBOX_STRIP: &str = "sed -e '/^\\/\\*M*!999999\\\\- enable the sandbox mode \\*\\//d'";
+
 /// SSH 공통 옵션
 fn ssh_e(site: &Site) -> String {
     format!("ssh -p {} -o StrictHostKeyChecking=no -o ConnectTimeout=20", site.ssh_port_or_default())
@@ -4060,8 +4068,9 @@ pub fn build(
             let out = dir.join(format!("db_{}.sql.gz", epoch_secs()));
             let remote = mysqldump_cmd(asis);
             let script = format!(
-                "set -o pipefail; sshpass -e {ssh} {user}@{host} {remote} | gzip > {out}",
+                "set -o pipefail; sshpass -e {ssh} {user}@{host} {remote} | {strip} | gzip > {out}",
                 ssh = ssh_e(asis),
+                strip = SANDBOX_STRIP,
                 user = sq(asis.login_id(use_root)),
                 host = sq(asis.ip.trim()),
                 remote = remote_cmd(&remote),
@@ -4090,8 +4099,9 @@ pub fn build(
                 db = sq(tobe.db_name.trim()),
             );
             let script = format!(
-                "set -o pipefail; gunzip -c {file} | sshpass -e {ssh} {user}@{host} {remote}",
+                "set -o pipefail; gunzip -c {file} | {strip} | sshpass -e {ssh} {user}@{host} {remote}",
                 file = sq(&file.to_string_lossy()),
+                strip = SANDBOX_STRIP,
                 ssh = ssh_e(tobe),
                 user = sq(tobe.login_id(use_root)),
                 host = sq(tobe.ip.trim()),
@@ -4185,8 +4195,9 @@ pub fn build(
             // 현재/신규 비번이 달라도 되도록 SSHPASS 를 단계별 env(HM_ASIS/HM_TOBE)로 분리
             let script = format!(
                 "set -o pipefail\n\
-                 SSHPASS=\"$HM_ASIS\" sshpass -e {ssha} {ua}@{ha} {dumpq} | \
+                 SSHPASS=\"$HM_ASIS\" sshpass -e {ssha} {ua}@{ha} {dumpq} | {strip} | \
                  SSHPASS=\"$HM_TOBE\" sshpass -e {sshb} {ub}@{hb} {loadq}",
+                strip = SANDBOX_STRIP,
                 ssha = ssh_e(asis), ua = sq(asis.login_id(use_root)), ha = sq(asis.ip.trim()), dumpq = remote_cmd(&dump),
                 sshb = ssh_e(tobe), ub = sq(tobe.login_id(use_root)), hb = sq(tobe.ip.trim()), loadq = remote_cmd(&load),
             );
@@ -4437,6 +4448,39 @@ mod tests {
         assert!(j.script.contains("sshpass -e"));
         assert!(j.script.contains("command -v"), "원격 도구 확인 누락");
         assert_eq!(j.sshpass, "ftppass");
+    }
+
+    /// cafe24 회귀: 최신 MariaDB mysqldump 의 샌드박스 헤더를 구버전 mysql 이 `Unknown command '\-'` 로 거부.
+    /// 백업·복원·직접 이전 세 경로 모두 로컬 sed 필터를 거쳐야 한다.
+    #[test]
+    fn db_pipelines_strip_sandbox_header() {
+        std::env::set_var("HOME", std::env::temp_dir());
+        let tobe = Site { ip: "5.6.7.8".into(), ftp_id: "tobeuser".into(), ftp_pw: "tobepw".into(), db_id: "u".into(), db_name: "d".into(), ..Default::default() };
+        let dir = domain_backup_dir("omg", "ex.com");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("db_1.sql.gz"), b"").unwrap();
+        for kind in [OpKind::DbBackup, OpKind::DbRestore, OpKind::DbDirect] {
+            let j = build(kind, "omg", "ex.com", &sample_site(), &tobe, None, false).unwrap();
+            assert!(j.script.contains(SANDBOX_STRIP), "{}: 샌드박스 필터 누락:\n{}", j.title, j.script);
+            // 필터는 원격 명령(작은따옴표 안) 이 아니라 로컬 파이프 단계에 있어야 한다
+            let pos = j.script.find(SANDBOX_STRIP).unwrap();
+            let after = &j.script[pos..];
+            assert!(after.contains("| sshpass") || after.contains("| SSHPASS=") || after.contains("| gzip"), "{}: 필터 위치 이상", j.title);
+            assert_bash_syntax(&j.script, &j.title);
+        }
+    }
+
+    /// 필터가 실제로 두 가지 헤더 형태(`/*!999999\-`, `/*M!999999\-`)만 지우고 나머지는 보존하는지 실행 검증.
+    #[test]
+    fn sandbox_filter_removes_only_header_lines() {
+        let input = "/*!999999\\- enable the sandbox mode */\n/*M!999999\\- enable the sandbox mode */ \n-- MariaDB dump 10.19\nINSERT INTO t VALUES ('/*!999999\\- enable the sandbox mode */');\n";
+        let out = std::process::Command::new("bash")
+            .args(["-c", &format!("printf '%s' \"$1\" | {SANDBOX_STRIP}"), "_", input])
+            .output()
+            .expect("bash");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let got = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(got, "-- MariaDB dump 10.19\nINSERT INTO t VALUES ('/*!999999\\- enable the sandbox mode */');\n");
     }
 
     #[test]

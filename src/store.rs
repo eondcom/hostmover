@@ -18,6 +18,29 @@ pub fn backups_root() -> PathBuf {
     home_dir().join(".local").join("share").join("hostmover").join("backups")
 }
 
+/// 사용자 다운로드 폴더. Linux 는 `xdg-user-dir DOWNLOAD`(한글 로케일이면 ~/다운로드) 를 우선하고,
+/// 실패하면 ~/Downloads → ~/다운로드 → 홈 순으로 존재하는 폴더를 고른다.
+pub fn download_dir() -> PathBuf {
+    let home = home_dir();
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(out) = std::process::Command::new("xdg-user-dir").arg("DOWNLOAD").output() {
+            if out.status.success() {
+                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                // 설정이 없으면 홈을 돌려주는데, 그건 아래 폴백으로 넘긴다
+                if !p.is_empty() && PathBuf::from(&p) != home && PathBuf::from(&p).is_dir() {
+                    return PathBuf::from(p);
+                }
+            }
+        }
+    }
+    for name in ["Downloads", "다운로드"] {
+        let p = home.join(name);
+        if p.is_dir() { return p; }
+    }
+    home
+}
+
 pub fn exists() -> bool {
     store_path().exists()
 }

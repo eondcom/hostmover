@@ -4116,6 +4116,7 @@ impl App {
             let mut dryrun = false;
             let mut delete_domain = false;
             let mut open_backup_dir = false;
+            let mut download_db_backup = false;
 
             let domain = &mut self.store.customers[ci].domains[di];
             let domain_name = domain.name.clone();
@@ -4281,6 +4282,24 @@ impl App {
                                             .clicked()
                                         {
                                             open_backup_dir = true;
+                                        }
+                                        if kind == OpKind::DbBackup {
+                                            let latest = ops::latest_db_backup(&backup_dir);
+                                            let hover = match &latest {
+                                                Some(p) => format!(
+                                                    "최신 DB 백업을 다운로드 폴더로 복사\n원본: {}\n대상: {}/",
+                                                    p.display(),
+                                                    store::download_dir().display()
+                                                ),
+                                                None => "다운로드할 DB 백업이 없습니다 (먼저 DB 백업 실행)".to_string(),
+                                            };
+                                            if ui
+                                                .add_enabled(latest.is_some(), egui::Button::new(format!("{}  다운로드", ph::DOWNLOAD_SIMPLE)))
+                                                .on_hover_text(hover)
+                                                .clicked()
+                                            {
+                                                download_db_backup = true;
+                                            }
                                         }
                                     });
                                 }
@@ -4736,6 +4755,26 @@ impl App {
             } else if changed {
                 self.dirty = true;
                 self.last_edit = ctx.input(|i| i.time);
+            }
+
+            if download_db_backup {
+                match download_latest_db_backup(&backup_dir, &domain_name) {
+                    Ok(dest) => {
+                        self.status = format!("DB 백업 다운로드 완료: {}", dest.display());
+                        self.log.push(self.status.clone());
+                        self.last_ok = Some(true);
+                        if let Some(dir) = dest.parent() {
+                            if let Err(e) = open_local_directory(dir) {
+                                self.log.push(format!("다운로드 폴더 열기 실패: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!("DB 백업 다운로드 실패: {e}");
+                        self.log.push(self.status.clone());
+                        self.last_ok = Some(false);
+                    }
+                }
             }
 
             if open_backup_dir {
@@ -5442,6 +5481,40 @@ fn puny_if_different(s: &str) -> Option<String> {
     }
 }
 
+/// 최신 DB 백업(db_<epoch>.sql.gz)을 사용자 다운로드 폴더로 복사한다.
+/// 파일명은 `<도메인>_db_<YYYYMMDD-HHMM>.sql.gz` (KST) 로 바꿔 어느 사이트의 언제 백업인지 바로 알 수 있게 한다.
+/// 같은 이름이 이미 있으면 덮어쓰지 않고 `_2`, `_3`… 을 붙인다. 복사된 경로를 돌려준다.
+fn download_latest_db_backup(backup_dir: &Path, domain_name: &str) -> Result<std::path::PathBuf, String> {
+    let src = ops::latest_db_backup(backup_dir)
+        .ok_or_else(|| "다운로드할 DB 백업 파일이 없습니다 (먼저 DB 백업을 실행하세요)".to_string())?;
+    let stem = src.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // db_<epoch>.sql.gz → epoch. 파싱 실패 시 파일 수정시각으로 대체
+    let ts: i64 = stem
+        .strip_prefix("db_")
+        .and_then(|r| r.strip_suffix(".sql.gz"))
+        .and_then(|e| e.parse().ok())
+        .or_else(|| {
+            std::fs::metadata(&src).ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+        })
+        .unwrap_or(0);
+    let when = fmt_kst(ts).replace([' ', ':'], "").replace('-', "");
+    let when = if when.len() >= 12 { format!("{}-{}", &when[..8], &when[8..12]) } else { when };
+    let base = format!("{}_db_{when}", store::sanitize(domain_name));
+    let dir = store::download_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("다운로드 폴더 생성 실패 ({}): {e}", dir.display()))?;
+    let mut dest = dir.join(format!("{base}.sql.gz"));
+    let mut n = 2;
+    while dest.exists() {
+        dest = dir.join(format!("{base}_{n}.sql.gz"));
+        n += 1;
+    }
+    std::fs::copy(&src, &dest).map_err(|e| format!("복사 실패 ({} → {}): {e}", src.display(), dest.display()))?;
+    Ok(dest)
+}
+
 /// 운영체제의 파일 관리자로 로컬 디렉터리를 연다. 아직 없으면 먼저 생성한다.
 fn open_local_directory(path: &Path) -> Result<(), String> {
     std::fs::create_dir_all(path)
@@ -5535,6 +5608,29 @@ fn row_secret(ui: &mut egui::Ui, label: &str, value: &mut String, show: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 다운로드: 최신 db_<epoch>.sql.gz 를 `<도메인>_db_<YYYYMMDD-HHMM>.sql.gz` 로 복사, 중복 시 _2.
+    #[test]
+    fn download_latest_db_backup_copies_with_readable_name() {
+        std::env::set_var("HOME", std::env::temp_dir());
+        let uniq = format!("dl-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let dir = std::env::temp_dir().join(&uniq);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("db_1788771513.sql.gz"), b"old").unwrap();
+        std::fs::write(dir.join("db_1788771680.sql.gz"), b"newest").unwrap();
+        let domain = format!("{uniq}.com");
+
+        let dest = download_latest_db_backup(&dir, &domain).unwrap();
+        assert_eq!(dest.file_name().unwrap().to_str().unwrap(), format!("{uniq}.com_db_20260907-1801.sql.gz"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"newest");
+        assert!(dest.starts_with(store::download_dir()));
+
+        let dest2 = download_latest_db_backup(&dir, &domain).unwrap();
+        assert_eq!(dest2.file_name().unwrap().to_str().unwrap(), format!("{uniq}.com_db_20260907-1801_2.sql.gz"));
+
+        assert!(download_latest_db_backup(&std::env::temp_dir().join(format!("{uniq}-empty")), &domain).is_err());
+        let _ = std::fs::remove_file(dest); let _ = std::fs::remove_file(dest2); let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn healthy_domain() -> DomainHealth {
         DomainHealth {
