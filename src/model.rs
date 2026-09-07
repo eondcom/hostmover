@@ -578,6 +578,12 @@ pub struct Site {
     pub db_host: String,
     #[serde(default)]
     pub db_port: String,
+    /// 운영 도메인 — "라이믹스 도메인 교체" 가 rx_domains 기본 도메인을 이 값으로 바꾼다 (신규 사이트에서 사용)
+    #[serde(default)]
+    pub live_domain: String,
+    /// 운영 도메인에 https 를 쓸지. SSL 설치 뒤 켠다 (켜면 security='always' 로 http→https 리다이렉트)
+    #[serde(default)]
+    pub live_https: bool,
 }
 
 impl Site {

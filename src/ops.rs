@@ -153,6 +153,7 @@ pub enum OpKind {
     FixHtaccessTobe, // 신규 .htaccess php_flag 주석처리
     SetDbAsis,   // 현재 설정파일 DB 정보 반영
     SetDbTobe,   // 신규 설정파일 DB 정보 반영(이전 후 갱신)
+    RxDomainTobe, // 신규 라이믹스 기본 도메인을 운영 도메인으로 교체 (rx_domains + config.php + 캐시)
     DbDirect,    // 현재 DB → 신규 DB 직접 스트리밍 (로컬 디스크 미사용)
     FileDirect,  // 현재 파일 → 신규 파일 직접 스트리밍 (tar 파이프, 로컬 디스크 미사용)
 }
@@ -371,6 +372,116 @@ fn build_fix_htaccess_job(site: &Site, label: &str, domain_name: &str, use_root:
 /// 설정파일(wp-config.php 등)의 DB 정보를 사이트의 DB 칸 값으로 교체.
 /// perl 로 값을 $ENV 로 주입해 특수문자(/, &, 따옴표 등)에 안전. 수정 전 백업.
 /// 지원 키: WordPress(DB_*), XE(db_*), 그누보드5(G5_MYSQL_*), Rhymix(dbname 일부).
+/// 운영 도메인 입력값 정리 — 스킴/끝 슬래시 제거, 소문자. 라이믹스는 rx_domains 에 유니코드로,
+/// URL 에는 퓨니코드로 쓰므로 (db용, ascii용) 두 형태를 돌려준다. SQL 에 그대로 들어가므로
+/// 허용 문자를 글자·숫자·'.'·'-' 로 제한한다(따옴표·세미콜론 불가).
+fn normalize_live_domain(raw: &str) -> Result<(String, String), String> {
+    let mut d = raw.trim().to_lowercase();
+    for pfx in ["https://", "http://"] {
+        if let Some(rest) = d.strip_prefix(pfx) { d = rest.to_string(); }
+    }
+    let d = d.trim_end_matches('/').to_string();
+    if d.is_empty() {
+        return Err("운영 도메인이 비어 있습니다 — 신규 사이트의 '운영 도메인' 칸에 예: 890812.com 을 입력하세요".into());
+    }
+    let ok_chars = d.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-');
+    if !ok_chars || !d.contains('.') || d.starts_with('.') || d.ends_with('.') {
+        return Err(format!("운영 도메인 형식이 이상합니다: '{d}' (예: 890812.com)"));
+    }
+    let ascii = to_ascii_domain(&d);
+    Ok((d, ascii))
+}
+
+/// 원격(신규 서버)에서 실행할 도메인 교체 스크립트 본문 — PATH 보강·따옴표 감싸기 전 상태.
+/// 테스트에서 `sh -n` 과 가짜 mysql 드라이런에 그대로 쓴다.
+fn rx_domain_remote(site: &Site, dom: &str, ascii: &str, scheme: &str, sec: &str) -> String {
+    let webroot = site.path.trim().trim_end_matches('/');
+    let wr_cands = if webroot.is_empty() { String::new() } else { format!("\"{webroot}\" ") };
+    format!(
+        "export HM_NEWDOM={dom}; export HM_NEWASCII={ascii}; export HM_SCHEME={scheme}; export HM_SEC={sec}; \
+         CFG=''; \
+         for c in {wr}\"$HOME/www\" \"$HOME/public_html\" \"$HOME/html\" \"$HOME/httpdocs\" .; do \
+           [ -f \"$c/files/config/config.php\" ] && CFG=\"$c/files/config/config.php\" && break; done; \
+         if [ -z \"$CFG\" ]; then echo '라이믹스 설정파일(files/config/config.php) 못 찾음 — 신규 사이트 path(웹루트)를 확인하세요'; exit 1; fi; \
+         RX=$(dirname \"$(dirname \"$(dirname \"$CFG\")\")\"); echo \"라이믹스 루트: $RX\"; \
+         PFX=$(grep -o \"'prefix' => '[^']*'\" \"$CFG\" | head -1 | sed \"s/.*=> '//; s/'$//\"); [ -z \"$PFX\" ] && PFX=rx_; T=\"${{PFX}}domains\"; \
+         MQ() {{ MYSQL_PWD={pw} mysql {conn} -u {user} {db} -N -B -e \"$1\"; }}; \
+         echo \"-- 교체 전 ($T) --\"; MQ \"SELECT domain, is_default_domain, security FROM $T\" || {{ echo 'DB 조회 실패 — 신규 사이트 DB 칸(계정/비번/DB명) 확인'; exit 1; }}; \
+         OLD=$(MQ \"SELECT domain FROM $T WHERE is_default_domain='Y' LIMIT 1\"); \
+         if [ -z \"$OLD\" ]; then echo '기본 도메인(is_default_domain=Y)이 없음 — 라이믹스 관리자에서 도메인을 먼저 확인하세요'; exit 1; fi; \
+         if [ \"$OLD\" = \"$HM_NEWDOM\" ]; then echo \"이미 기본 도메인이 $HM_NEWDOM 입니다 (security 만 $HM_SEC 로 갱신)\"; \
+           MQ \"UPDATE $T SET security='$HM_SEC' WHERE is_default_domain='Y'\" || exit 1; \
+         elif [ \"$(MQ \"SELECT COUNT(*) FROM $T WHERE domain='$HM_NEWDOM'\")\" != \"0\" ]; then \
+           echo \"$HM_NEWDOM 이 이미 등록돼 있어 기본 도메인으로 지정합니다 ($OLD 은 보조 도메인으로 남음)\"; \
+           MQ \"UPDATE $T SET is_default_domain='N' WHERE is_default_domain='Y'; UPDATE $T SET is_default_domain='Y', security='$HM_SEC' WHERE domain='$HM_NEWDOM'\" || exit 1; \
+         else echo \"기본 도메인 교체: $OLD → $HM_NEWDOM (security=$HM_SEC)\"; \
+           MQ \"UPDATE $T SET domain='$HM_NEWDOM', security='$HM_SEC' WHERE is_default_domain='Y'\" || exit 1; fi; \
+         echo \"-- 교체 후 ($T) --\"; MQ \"SELECT domain, is_default_domain, security FROM $T\"; \
+         cp -a \"$CFG\" \"$CFG.hostmover.bak\" && echo \"config.php 백업: $CFG.hostmover.bak\"; \
+         sed -i \"s#'default' => 'https*://[^/']*\\(/[^']*\\)'#'default' => '${{HM_SCHEME}}://${{HM_NEWASCII}}\\1'#\" \"$CFG\"; \
+         echo \"config.php url.default: $(grep -o \"'default' => '[^']*'\" \"$CFG\" | head -1)\"; \
+         CT=$(sed -n \"/'cache' =>/,/)/p\" \"$CFG\" | grep -o \"'type' => '[^']*'\" | head -1); \
+         if [ -d \"$RX/files/cache\" ]; then rm -rf \"$RX/files/cache\"/* && echo \"캐시 삭제: $RX/files/cache/*\"; fi; \
+         case \"$CT\" in *apc*|*memcache*|*redis*) echo \"캐시 드라이버 $CT — 메모리 캐시라 관리자 > 캐시 재생성(또는 PHP 재시작)도 필요\";; esac; \
+         echo '완료 (문제 시 config.php.hostmover.bak 복구)'",
+        dom = sq(dom),
+        ascii = sq(ascii),
+        scheme = scheme,
+        sec = sec,
+        wr = wr_cands,
+        pw = sq(site.db_pw.trim()),
+        conn = mysql_conn(site.db_host_or_default(), site.db_port_or_default()),
+        user = sq(site.db_id.trim()),
+        db = sq(site.db_name.trim()),
+    )
+}
+
+/// 라이믹스 기본 도메인 교체 (신규 사이트).
+/// 이전 직후 신규 서버로 운영 도메인 접속 시 라이믹스가 "미등록 도메인" 이라며 옛 기본 도메인으로
+/// 301 을 보내는 문제(ModuleHandler 의 url.unregistered_domain_action=redirect_301) 를 푼다.
+/// 원격에서 ① `<prefix>domains` 의 기본 도메인(is_default_domain='Y') 을 운영 도메인으로 UPDATE
+/// (이미 등록돼 있으면 그 행을 기본으로 지정) ② files/config/config.php 의 url.default 교체(백업 후)
+/// ③ files/cache 삭제(도메인 정보가 만료 없이 캐시되므로 필수) 를 하고, 로컬에서 `curl --resolve` 로
+/// DNS 와 무관하게 신규 서버 응답(200 인지, 아직 Location 이 붙는지) 을 보여준다.
+fn build_rx_domain_job(site: &Site, domain_name: &str, use_root: bool) -> Result<Job, String> {
+    validate_site_ssh(site, use_root)?;
+    if site.db_name.trim().is_empty() { return Err("신규 사이트 DB 이름이 비어 있습니다 — 사이트 설정의 DB 항목(db_name)을 입력하세요".into()); }
+    if site.db_id.trim().is_empty() { return Err("신규 사이트 DB 계정이 비어 있습니다 — 사이트 설정의 DB 항목(db_id)을 입력하세요".into()); }
+    let (dom, ascii) = normalize_live_domain(&site.live_domain)?;
+    let (scheme, sec) = if site.live_https { ("https", "always") } else { ("http", "none") };
+    let remote = rx_domain_remote(site, &dom, &ascii, scheme, sec);
+    let ip = site.ip.trim();
+    let https_check = if site.live_https {
+        format!(
+            "curl -skI -m 15 --resolve {r443} https://{a}/ | grep -iE '^HTTP|^Location' || echo 'HTTPS 응답 없음 (SSL 미설치?)'\n",
+            r443 = sq(&format!("{ascii}:443:{ip}")),
+            a = ascii,
+        )
+    } else {
+        String::new()
+    };
+    let script = format!(
+        "set -o pipefail\n\
+         sshpass -e {ssh} {user}@{host} {remote} || exit 1\n\
+         echo '-- 신규 서버 직접 확인 (DNS 무관: --resolve) — 200 이면 끝, Location 이 남으면 캐시/도메인 재확인 --'\n\
+         curl -sI -m 15 --resolve {r80} http://{a}/ | grep -iE '^HTTP|^Location' || echo 'HTTP 응답 없음'\n\
+         {https_check}",
+        ssh = ssh_e(site),
+        user = sq(site.login_id(use_root)),
+        host = sq(ip),
+        remote = remote_cmd(&remote),
+        r80 = sq(&format!("{ascii}:80:{ip}")),
+        a = ascii,
+    );
+    Ok(Job {
+        title: format!("라이믹스 도메인 교체 (신규) : {domain_name}"),
+        script,
+        sshpass: site.login_pw(use_root).to_string(),
+        env: Vec::new(),
+        note: format!("기본 도메인 → {dom} ({scheme}) · config.php url.default 교체 · files/cache 삭제"),
+    })
+}
+
 fn build_setdb_job(site: &Site, label: &str, domain_name: &str, use_root: bool) -> Result<Job, String> {
     validate_site_ssh(site, use_root)?;
     let webroot = site.path.trim().trim_end_matches('/');
@@ -4421,6 +4532,7 @@ pub fn build(
         OpKind::FixHtaccessTobe => return build_fix_htaccess_job(tobe, "신규 사이트", domain_name, use_root),
         OpKind::SetDbAsis => return build_setdb_job(asis, "현재 사이트", domain_name, use_root),
         OpKind::SetDbTobe => return build_setdb_job(tobe, "신규 사이트", domain_name, use_root),
+        OpKind::RxDomainTobe => return build_rx_domain_job(tobe, domain_name, use_root),
         _ => {}
     }
 
@@ -4431,7 +4543,7 @@ pub fn build(
         OpKind::TestAsis | OpKind::TestTobe | OpKind::CertAsis | OpKind::CertTobe
         | OpKind::VerifyAsis | OpKind::VerifyTobe
         | OpKind::FixHtaccessAsis | OpKind::FixHtaccessTobe
-        | OpKind::SetDbAsis | OpKind::SetDbTobe => unreachable!(),
+        | OpKind::SetDbAsis | OpKind::SetDbTobe | OpKind::RxDomainTobe => unreachable!(),
         OpKind::DbBackup => {
             validate_site_ssh(asis, use_root)?;
             if asis.db_name.trim().is_empty() { return Err("현재 사이트 DB 이름이 비어 있습니다 — 사이트 설정의 DB 항목(db_name)을 입력하세요".into()); }
@@ -4951,6 +5063,94 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let got = String::from_utf8_lossy(&out.stdout);
         assert_eq!(got, "-- MariaDB dump 10.19\nINSERT INTO t VALUES ('/*!999999\\- enable the sandbox mode */');\n");
+    }
+
+    /// 라이믹스 도메인 교체: 입력 정리·검증, 스크립트 구성 요소, bash 구문.
+    #[test]
+    fn rx_domain_job_shape() {
+        std::env::set_var("HOME", std::env::temp_dir());
+        let mut tobe = sample_site();
+        assert!(build(OpKind::RxDomainTobe, "omg", "ex.com", &Site::default(), &tobe, None, false).is_err(), "운영 도메인 비면 실패해야");
+        tobe.live_domain = "x'; DROP TABLE rx_domains; --".into();
+        assert!(build(OpKind::RxDomainTobe, "omg", "ex.com", &Site::default(), &tobe, None, false).is_err(), "SQL 특수문자 거부해야");
+        tobe.live_domain = " HTTPS://890812.com/ ".into();
+        let j = build(OpKind::RxDomainTobe, "omg", "ex.com", &Site::default(), &tobe, None, false).unwrap();
+        assert!(j.script.contains("HM_NEWDOM='\\''890812.com'\\''"), "스킴/슬래시/대문자 정리:\n{}", j.script);
+        assert!(j.script.contains("HM_SEC=none") && j.script.contains("HM_SCHEME=http"));
+        assert!(j.script.contains("domains\"") && j.script.contains("is_default_domain"));
+        assert!(j.script.contains("files/config/config.php") && j.script.contains("files/cache"));
+        assert!(j.script.contains("--resolve '890812.com:80:1.2.3.4'"), "DNS 무관 검증 curl 누락");
+        assert!(!j.script.contains(":443:"), "https 꺼짐이면 https 검사 없음");
+        assert_eq!(j.sshpass, "ftppass");
+        assert_bash_syntax(&j.script, &j.title);
+
+        tobe.live_https = true;
+        let j = build(OpKind::RxDomainTobe, "omg", "ex.com", &Site::default(), &tobe, None, false).unwrap();
+        assert!(j.script.contains("HM_SEC=always") && j.script.contains("HM_SCHEME=https"));
+        assert!(j.script.contains("--resolve '890812.com:443:1.2.3.4'"));
+        assert_bash_syntax(&j.script, &j.title);
+
+        // 한글 도메인: DB 에는 유니코드, URL/curl 에는 퓨니코드
+        tobe.live_domain = "한글도메인.com".into();
+        let j = build(OpKind::RxDomainTobe, "omg", "ex.com", &Site::default(), &tobe, None, false).unwrap();
+        assert!(j.script.contains("HM_NEWDOM='\\''한글도메인.com'\\''"));
+        assert!(j.script.contains("HM_NEWASCII='\\''xn--"), "퓨니코드 변환 누락:\n{}", j.script);
+    }
+
+    /// 원격 스크립트 본문을 가짜 mysql 로 실제 실행 — 접두어 탐지, UPDATE 문, config.php sed, 캐시 삭제까지 검증.
+    #[test]
+    fn rx_domain_remote_dry_run() {
+        let dir = std::env::temp_dir().join(format!("hm-rx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let www = dir.join("www");
+        std::fs::create_dir_all(www.join("files/config")).unwrap();
+        std::fs::create_dir_all(www.join("files/cache/store")).unwrap();
+        std::fs::write(www.join("files/cache/store/x"), b"cached").unwrap();
+        std::fs::write(
+            www.join("files/config/config.php"),
+            "<?php return array(\n\t'db' => array(\n\t\t'master' => array(\n\t\t\t'prefix' => 'rx_',\n\t\t),\n\t),\n\t'cache' => array(\n\t\t'type' => 'redis',\n\t),\n\t'url' => array(\n\t\t'default' => 'https://dev.example.com/',\n\t\t'unregistered_domain_action' => 'redirect_301',\n\t),\n);\n",
+        ).unwrap();
+        // 가짜 mysql: -e 질의를 로그에 남기고 canned 결과를 돌려준다
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.join("mysql.log");
+        let stub = format!(
+            "#!/bin/sh\nq=''; while [ $# -gt 0 ]; do if [ \"$1\" = -e ]; then q=\"$2\"; shift; fi; shift; done\n\
+             printf '%s\\n' \"$q\" >> {log}\n\
+             case \"$q\" in\n\
+               *\"WHERE is_default_domain='Y' LIMIT 1\") echo dev.example.com;;\n\
+               *'COUNT(*)'*) echo 0;;\n\
+               'SELECT domain, is_default_domain'*) printf 'dev.example.com\\tY\\tnone\\n';;\n\
+             esac\n",
+            log = log.display()
+        );
+        std::fs::write(bin.join("mysql"), stub).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("mysql"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let site = Site { path: www.to_string_lossy().to_string(), ..sample_site() };
+        let remote = rx_domain_remote(&site, "890812.com", "890812.com", "http", "none");
+        // 구문 검사 (sh/bash)
+        for shell in ["sh", "bash"] {
+            let o = std::process::Command::new(shell).args(["-n", "-c", &remote]).output().unwrap();
+            assert!(o.status.success(), "{shell} -n 실패: {}", String::from_utf8_lossy(&o.stderr));
+        }
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let out = std::process::Command::new("sh").args(["-c", &remote]).env("PATH", path).env("HOME", &dir).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "드라이런 실패:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        let queries = std::fs::read_to_string(&log).unwrap();
+        assert!(queries.contains("UPDATE rx_domains SET domain='890812.com', security='none' WHERE is_default_domain='Y'"), "UPDATE 문 이상:\n{queries}");
+        assert!(stdout.contains("기본 도메인 교체: dev.example.com → 890812.com"), "{stdout}");
+        let cfg = std::fs::read_to_string(www.join("files/config/config.php")).unwrap();
+        assert!(cfg.contains("'default' => 'http://890812.com/'"), "config.php 치환 실패:\n{cfg}");
+        assert!(cfg.contains("'unregistered_domain_action' => 'redirect_301'"), "다른 키를 건드림");
+        assert!(www.join("files/config/config.php.hostmover.bak").exists(), "config 백업 없음");
+        assert!(!www.join("files/cache/store").exists(), "캐시 삭제 안 됨");
+        assert!(stdout.contains("캐시 드라이버 'type' => 'redis'"), "메모리 캐시 경고 누락:\n{stdout}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
